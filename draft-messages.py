@@ -299,8 +299,15 @@ async def main():
         return tpl_chat
 
     # название чата, где нашли человека, — для подстановки {chat}
-    chat_of = (tglib.chat_of_members()
-               if any("{chat}" in t for t in (tpl_chat or tpl, tpl_plain)) else {})
+    uses_chat = any("{chat}" in t for t in (tpl_chat or tpl, tpl_plain))
+    chat_of = tglib.chat_of_members() if uses_chat else {}
+    if uses_chat:
+        # лиды обогащения в members.csv не попадают — чат берём из их карточки
+        # (последний, где человек показал интерес)
+        for k, lead in tglib.lead_refs().items():
+            title = ((lead.get("chats") or [{}])[-1].get("title") or "").strip()
+            if title and not chat_of.get(k):
+                chat_of[k] = title
 
     # одному человеку пишем один раз — с любого из аккаунтов. Неудачные попытки
     # (ok=false) не считаются: до них дело не дошло, номер вернётся в очередь.

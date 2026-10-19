@@ -93,3 +93,6 @@ queue-first.txt
 
 # песочница: выдуманный профиль, пересобирается make_profile.py
 tests/sandbox/profile/
+
+# обогащение: очередь чатов, сырые сообщения, ключевики (enrich.py)
+enrich/

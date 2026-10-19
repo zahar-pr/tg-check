@@ -100,6 +100,7 @@ EXCLUDES=(
   './comments.csv' './comment-leads.csv' './comment-plan.json*' './comments-pending.json*' './comments-decisions.json*'
   './comment-persona.txt' './llm-usage.json'
   './tgapi.json' './personas'
+  './enrich'
   '*.xlsx' '*.session' './_backup_*' './_reset_backup_*' '.DS_Store' '.send-gap.*'
 )
 
@@ -120,6 +121,7 @@ DATA_GUARD=(
   comments.csv comment-leads.csv 'comment-plan.json*' 'comments-pending.json*' 'comments-decisions.json*' comment-persona.txt llm-usage.json
   tgapi.json personas
   'auto-run.paused-*.json' 'egrul-*.log'
+  keywords.json joins.json add-list.txt '*.jsonl'
 )
 
 TMP_ARCHIVE=""

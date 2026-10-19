@@ -339,5 +339,6 @@ export function makeEnrich({ DIR, CODE, accounts, running, launch, pythonCmd, pu
     return { ok: true };
   }
 
-  return { view, leadsCsv, leadKeys, setOn, setGoal, addChats, chatsCmd, makeKeywords, saveKeywords, find };
+  // tick — наружу только для песочницы (tests/sandbox/enrich_sched_test.mjs)
+  return { view, leadsCsv, leadKeys, setOn, setGoal, addChats, chatsCmd, makeKeywords, saveKeywords, find, tick };
 }

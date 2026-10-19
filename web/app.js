@@ -2658,6 +2658,8 @@ const LD_STATUS = {
   done: '✓ разобран', skipped: 'пропущен', error: 'ошибка',
 };
 let leadsAt = 0, leadsRaw = '', ld = null;
+// заметку модель пишет markdown-ом: заголовки и **жирное** показываем жирным, остальное как есть
+const mdLite = (t) => esc(t).replace(/^#{1,4} +(.+)$/gm, '<b>$1</b>').replace(/\*\*(.+?)\*\*/g, '<b>$1</b>');
 async function leadsView(force) {
   if (!force && Date.now() - leadsAt < 4000) return;
   leadsAt = Date.now();
@@ -2741,7 +2743,7 @@ async function leadsView(force) {
           <span class="tag">${esc(l.status)}</span>
           <span class="hint">${esc(l.chats.join(', '))}</span>
           <div class="hint">${esc(l.why)}</div></summary>
-        <div class="ld-note">${esc(l.note)}</div>
+        <div class="ld-note">${mdLite(l.note)}</div>
       </details>`).join('') : '<div class="hint">пока нет — лиды появятся по мере разбора чатов</div>';
   }
 }

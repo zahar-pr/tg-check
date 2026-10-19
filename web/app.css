@@ -315,7 +315,7 @@ button.big{padding:15px 26px;font-size:15px;width:100%;margin-top:4px}
 .cap-val.max{color:var(--ok)}
 
 textarea{font-family:-apple-system,system-ui,"Segoe UI",Roboto,Arial,sans-serif;letter-spacing:normal}
-#chatlist,#msg2{width:100%;background:rgba(8,16,40,.4);color:var(--ink);
+#chatlist,#msg2,#ld-kw,#ld-links{width:100%;background:rgba(8,16,40,.4);color:var(--ink);
   border:1px solid var(--line);border-radius:10px;padding:10px 12px;resize:vertical}
 
 /* ——— мобильный: сайдбар сверху ——— */
@@ -487,6 +487,10 @@ details.fieldset[open] > summary.fh::before{content:'▾'}
 .ld-lead>summary::-webkit-details-marker{display:none}
 .ld-lead>summary>div{flex-basis:100%}
 .ld-lead .tag{font-size:11px;color:var(--mut);border:1px solid var(--line);border-radius:999px;padding:1px 8px}
+.ld-row{flex-wrap:wrap}
+.ld-row input.ftext{min-width:0;flex:1 1 220px}
+@media (max-width:700px){.ld-row>span{flex-basis:100%;padding-top:0}}
+.ld-note b{color:var(--ink)}
 .ld-note{white-space:pre-wrap;margin:8px 0 4px;padding:10px 12px;border-radius:10px;background:rgba(120,164,255,.06);font-size:13px}
 #ld-counts{margin-top:4px}
 @media (max-width:700px){#ld-counts{grid-template-columns:repeat(3,1fr)}}
