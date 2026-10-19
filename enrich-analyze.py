@@ -153,29 +153,49 @@ def verdict(out):
             "why": str(found.get("why") or "")[:300], "note": str(found.get("note") or "")}
 
 
-BAD = "bad"     # модель ответила, но вердикта в ответе нет — это не сбой связи
+class Fail:
+    """
+    Вердикта нет. kind:
+      "out" — модель недоступна (сеть, перегрузка, деньги, ключ): повторим позже,
+              это не вина автора;
+      "bad" — ответила, но без вердикта и после повтора с запасом токенов;
+      "req" — отказала в самом запросе (400/413: длинно, не понравился текст —
+              или неверный ID модели, это решает проверка модели в main).
+    code — код сбоя от llm.chat (net, 402, 503…).
+    """
+
+    def __init__(self, kind, code=""):
+        self.kind, self.code = kind, code
+
+
+# коды, после которых модель недоступна ВСЕМ, а не одному автору: деньги, ключ,
+# доступ, перегрузка, ошибка без кода. Такие сбои авторам не засчитываем
+ACCOUNT_CODES = {"401", "402", "403", "429", ""}
 
 
 def ask(system, text):
-    """
-    Вердикт модели. None — модель недоступна (сеть, 5xx): повторим позже, это
-    не вина автора. BAD — ответила, но без вердикта и после повтора с запасом
-    токенов (ответ обрезан на длинной заметке).
-    """
+    """Вердикт модели по одному куску окон — или Fail."""
     for tokens in (900, 2000):
         info = {}
         out = llm.chat(system, text, max_tokens=tokens, temperature=0.2, info=info)
         if out is None:
-            # «Без вердикта» — только ошибка про САМ текст автора (400 — длинно или
-            # не понравился, 413 — слишком большой). Всё остальное — простой модели:
-            # сеть, перегрузка, кончились деньги (402), ключ (401/403), таймаут (408),
-            # строковые коды провайдера. Из-за простоя авторов не теряем
-            code = info.get("code", "")
-            return BAD if code in ("400", "413") else None
+            code = str(info.get("code", ""))
+            return Fail("req" if code in ("400", "413") else "out", code)
         v = verdict(out)
         if v:
             return v
-    return BAD
+    return Fail("bad")
+
+
+def model_alive():
+    """
+    Короткая проверка: жива ли модель вообще. Тот же запас токенов, что у
+    настоящих запросов: при почти пустом балансе OpenRouter пропускает
+    крошечный запрос и отказывает обычным (402 «можете позволить N токенов»).
+    """
+    info = {}
+    out = llm.chat("Ответь одним словом.", "ок", max_tokens=900, temperature=0, info=info)
+    return out is not None
 
 
 def judge(system, msgs, me):
@@ -184,7 +204,7 @@ def judge(system, msgs, me):
     verdicts = []
     for part in chunks(msgs, windows(pos, len(msgs)), me):
         v = ask(system, part)
-        if v is None or v == BAD:
+        if isinstance(v, Fail):
             return v
         verdicts.append(v)
     yes = [v for v in verdicts if v["lead"]]
@@ -262,25 +282,36 @@ def main():
         say(f"продолжаю: уже разобрано {len(progress)}, осталось {len(todo)}")
 
     lock = threading.Lock()
-    failed = []          # модель ответила, но без вердикта (BAD)
-    outage = []          # модель недоступна (None) — повторим, попытку не тратим
+    failed = []          # без вердикта (bad/req) — тратят попытку чата
+    rejected = set()     # из них — отказ в самом запросе (400/413)
+    outage = []          # (uid, код) — модель недоступна, попытку не тратим
     stats = {"done": 0, "leads": sum(1 for k, v in progress.items() if k != "_out" and v is True),
              "fails": 0, "stop": False}
+    # Авторы, на которых модель уже трижды «висла», к ней больше не идут — сразу
+    # «без вердикта». Иначе, когда их шестеро и больше, они подряд давали бы
+    # «модель недоступна» (FAILS_STOP), и чат крутился бы вечно
+    outs = progress.get("_out", {})
+    stuck_before = [uid for uid in todo if int(outs.get(str(uid), 0)) >= 3]
+    if stuck_before:
+        failed += stuck_before
+        todo = [uid for uid in todo if uid not in stuck_before]
 
     def one(uid):
         if stats["stop"]:
             return
         v = judge(system, msgs, uid)
         with lock:
-            if v is None:
-                outage.append(uid)
+            if isinstance(v, Fail) and v.kind == "out":
+                outage.append((uid, v.code))
                 stats["fails"] += 1
                 if stats["fails"] >= FAILS_STOP:
                     stats["stop"] = True
                 return
             stats["fails"] = 0
-            if v == BAD:
+            if isinstance(v, Fail):
                 failed.append(uid)
+                if v.kind == "req":
+                    rejected.add(uid)
                 return
             stats["done"] += 1
             a = authors[uid]
@@ -309,19 +340,26 @@ def main():
     # а на этих «не отвечает» — значит, дело в них (длинный текст не успевает за
     # таймаут и т.п.). Трижды так — считаем их «без вердикта», иначе один автор
     # держал бы чат и всю очередь. Лежит модель — ждём, авторов не трогаем
-    alive = bool(outage) and (stats["done"] > 0 or llm.chat(
-        "Ответь одним словом.", "ок", max_tokens=5, temperature=0) is not None)   # модель жива?
+    # Сбои уровня всей модели (деньги, ключ, перегрузка) авторам не засчитываем никогда
+    personal = [(u, c) for u, c in outage if c not in ACCOUNT_CODES]
+    alive = bool(personal) and len(personal) == len(outage) and (stats["done"] > 0 or model_alive())
     if alive:
         outs = progress.setdefault("_out", {})
         stuck = []
-        for uid in outage:
+        for uid, _ in personal:
             outs[str(uid)] = int(outs.get(str(uid), 0)) + 1
             if outs[str(uid)] >= 3:
                 stuck.append(uid)
         if not dry:
             enrich.write_json(prog_file, progress)
         failed += stuck
-        outage = [u for u in outage if u not in stuck]
+        outage = [(u, c) for u, c in outage if u not in stuck]
+    # Ни одного вердикта, и все отказы — в самом запросе (400): так выглядит не
+    # «трудный текст», а сломанная модель (неверный ID, удалили у провайдера).
+    # Проверяем: не отвечает и на «ок» — это простой, сырьё не трогаем
+    if failed and not stats["done"] and set(failed) <= rejected and not model_alive():
+        outage += [(u, "400") for u in failed]
+        failed = []
     # Модель недоступна (сеть, 5xx) — чат ждёт, попытка не считается: это не
     # вина авторов. Сырьё не удаляем, прогресс по разобранным сохранён.
     if stats["stop"] or outage:
@@ -337,7 +375,8 @@ def main():
     if failed and tries < 3:
         say(f"\nне разобрано авторов {len(failed)}: модель не дала вердикта — повторю (заход {tries} из 3)")
         if not dry and not sample:
-            enrich.set_chat(key, status="downloaded", tries=tries, err="модель не дала вердикта")
+            enrich.set_chat(key, status="downloaded", tries=tries,
+                            err=f"модель не дала вердикта{': ' + llm.LAST_ERR[:90] if llm.LAST_ERR else ''}")
         tglib.state(done=stats["done"], left=len(failed), stop="errors", cooldown=5 * 60)
         return
     gave_up = f"модель не разобрала авторов: {len(failed)}" if failed else ""

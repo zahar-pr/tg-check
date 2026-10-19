@@ -2521,8 +2521,9 @@ function showView(name) {
     useSet(set, true);              // и база с результатами — про эту же вкладку
     // у вкладки свои последние настройки запуска — показываем именно их
     restoreFormFor(set);
-    // снимка у вкладки ещё нет (ни разу не запускали) — то, что настроят здесь, и есть её настройки
-    if (!formBySet[set] && !formTouched) formShownSet = set;
+    // снимка у вкладки ещё нет (ни разу не запускали) — то, что в форме сейчас и
+    // что настроят здесь, и есть её настройки
+    if (!formBySet[set]) formShownSet = set;
   }
   if (location.hash !== '#' + name) history.replaceState(null, '', '#' + name);
   window.scrollTo(0, 0);

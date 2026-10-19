@@ -85,6 +85,15 @@ export function makeEnrich({ DIR, CODE, accounts, running, launch, pythonCmd, pu
     }
     return out || new Set();
   }
+  /** Все лиды, отложенные сегодня хоть кем-то, — короткий список для подсчётов прогона. */
+  function putOffAny() {
+    const day = new Date().toISOString().slice(0, 10);
+    const out = new Set();
+    for (const v of Object.values(read(path.join(ROOT, 'later.json'), {}))) {
+      if (v?.day === day) for (const k of v.keys || []) out.add(k);
+    }
+    return out;
+  }
   const keyOf = (l) => l.key || (l.username ? '@' + String(l.username).replace(/^@/, '') : `id:${l.uid}`);
 
   /** Python-помощник (enrich.py, enrich-find.py) без аккаунта: вернёт последнюю JSON-строку. */
@@ -395,6 +404,6 @@ export function makeEnrich({ DIR, CODE, accounts, running, launch, pythonCmd, pu
   }
 
   // tick — наружу только для песочницы (tests/sandbox/enrich_sched_test.mjs)
-  return { view, leadsCsv, leadKeys, putOffAll, setOn, setGoal, addChats, chatsCmd, makeKeywords, saveKeywords, find, tick, stop,
+  return { view, leadsCsv, leadKeys, putOffAll, putOffAny, setOn, setGoal, addChats, chatsCmd, makeKeywords, saveKeywords, find, tick, stop,
            status: () => ({ on: st.on, finding: st.finding }) };
 }

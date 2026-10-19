@@ -1066,10 +1066,18 @@ def is_frozen_error(e) -> bool:
     а не случайная строка со словом frozen (frozenset, frozen dataclass и т.п.).
     Замороженному аккаунту Telegram валит FROZEN_* почти на любой метод отправки.
     """
-    s = (str(e) + " " + type(e).__name__).upper()
-    # у известных ошибок Telethon в тексте описание, а не код — смотрим и имя класса
-    # (FrozenMethodInvalidError, FrozenParticipantMissingError…)
-    return "FROZEN_" in s or "FROZENMETHOD" in s or type(e).__name__.startswith("Frozen")
+    # Только ошибки Telegram: в тексте ValueError/SystemExit бывает чужой ник или
+    # ссылка («@frozen_food_ekb»), и здоровый аккаунт записали бы в замороженные.
+    # Код ошибки — в e.message (FROZEN_METHOD_INVALID), у известных Telethon —
+    # ещё и имя класса (FrozenMethodInvalidError, FrozenParticipantMissingError…)
+    try:
+        from telethon.errors import RPCError
+    except ImportError:
+        return False
+    if not isinstance(e, RPCError):
+        return False
+    return (type(e).__name__.startswith("Frozen")
+            or str(getattr(e, "message", "") or "").upper().startswith("FROZEN_"))
 
 
 def _until_left(acc, key) -> int:

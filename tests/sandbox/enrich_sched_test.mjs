@@ -122,6 +122,16 @@ check(L.find((l) => l.key === '@chmo')?.status === 'написали', 'стат
 check(L.find((l) => l.key === 'id:4')?.status === 'в очереди', 'лид без ника — «в очереди»');
 check(en.leadsCsv().includes('берёт новостройку'), 'CSV с причиной');
 
+console.log('\n▸ отложенные лиды — по каждому писателю');
+const today = new Date().toISOString().slice(0, 10);
+fs.writeFileSync(path.join(DIR, 'enrich', 'later.json'), JSON.stringify({
+  w1: { day: today, keys: ['id:42', 'id:43'] }, w2: { day: today, keys: ['id:43'] },
+  w3: { day: '2000-01-01', keys: ['id:44'] },
+}));
+check([...en.putOffAny()].sort().join() === 'id:42,id:43', 'putOffAny — только сегодняшние, от всех писателей');
+check([...en.putOffAll(['w1'])].sort().join() === 'id:42,id:43', 'putOffAll одного писателя — его собственные');
+check([...en.putOffAll(['w1', 'w2'])].join() === 'id:43', 'putOffAll нескольких — отложенные всеми');
+
 console.log('\n▸ потолок задач и осиротевший чат');
 slots = 0;
 launched.length = 0;

@@ -256,6 +256,29 @@ def main():
     check(ch["status"] == "downloaded" and not ch.get("tries") and enrich.raw_path(CHAT_ID).exists(),
           "кончились деньги (402) — три захода, ни попытки, ни потери сырья")
 
+    def wrong_model(system, user, info=None, **kw):
+        if info is not None:
+            info["code"] = "400"                      # «x is not a valid model ID» — и на проверку тоже
+        return None
+    llm.chat = wrong_model
+    for _ in range(3):
+        run_script("enrich-analyze.py")
+    ch = enrich.load_chats()["akadem_sosedi"]
+    check(ch["status"] == "downloaded" and not ch.get("tries") and enrich.raw_path(CHAT_ID).exists(),
+          "неверный ID модели (400 на всё) — простой, сырьё цело")
+
+    def poor(system, user, info=None, **kw):
+        if "(Вася)" in user.split("►", 1)[-1].split("\n", 1)[0]:
+            if info is not None:
+                info["code"] = "402"                  # денег хватило бы только на короткие
+            return None
+        return fake_llm(system, user)
+    llm.chat = poor
+    run_script("enrich-analyze.py")
+    prog = enrich.read_json(enrich.progress_path(CHAT_ID), {})
+    check("3" not in prog.get("_out", {}), "402 при живых соседях — не вина автора, счётчик «висит» не растёт")
+    enrich.progress_path(CHAT_ID).unlink(missing_ok=True)   # дальше — разбор с чистого листа
+
     print("\n▸ разбор: модель ответила без вердикта")
 
     def flaky(system, user, info=None, **kw):
@@ -266,7 +289,7 @@ def main():
     ch = enrich.load_chats()["akadem_sosedi"]
     check(ch["status"] == "downloaded" and ch.get("tries") == 1, f"чат ждёт повтора: {ch['status']}, tries {ch.get('tries')}")
     check(enrich.raw_path(CHAT_ID).exists(), "сырые сообщения не удалены, пока не разобраны все")
-    check("4" not in enrich.load_leads(), "Оля ещё не разобрана")
+    check("4" not in enrich.read_json(enrich.progress_path(CHAT_ID), {}), "Оля ещё не разобрана")
 
     print("\n▸ обрезанный ответ модели")
     ns_a = {"__name__": "analyze_test"}
@@ -296,6 +319,8 @@ def main():
     check(prog.get("_out", {}).get("4") == 3 and ch.get("tries", 0) >= 2,
           f"после трёх заходов «висящий» автор — без вердикта, чат не крутится вечно: tries {ch.get('tries')}")
     enrich.set_chat("akadem_sosedi", tries=0)
+    prog["_out"] = {}                                  # модель «починили» — Олю разбираем заново
+    enrich.write_json(enrich.progress_path(CHAT_ID), prog)
 
     print("\n▸ разбор по авторам")
     llm.chat = fake_llm
@@ -334,7 +359,7 @@ def main():
     row = next(r for r in rows if r["phone"] == "id:4")
     check(tglib.can_write(row, "w9"), "лида без ника может взять любой писатель")
     check(not tglib.can_write({"phone": "id:999", "by": "a1"}, "w9"), "чужой id:-человек без лида — нет")
-    src = (REPO / "draft-messages.py").read_text("utf-8").replace("asyncio.run(main())", "")
+    src = (REPO / "draft-messages.py").read_text("utf-8").rsplit("\ntry:\n    asyncio.run(main())", 1)[0]
     ns = {"__name__": "draft_test"}
     exec(compile(src, "draft-messages.py", "exec"), ns)
     c2 = Client()
@@ -347,6 +372,30 @@ def main():
     user = asyncio.run(ns["via_message"](c3, lead_ch, {"id": "w9", "title": "писатель"}))
     check(getattr(user, "id", None) == 4 and "GetFullChannelRequest" in c3.calls,
           "лид из комментариев канала — найден в группе обсуждения")
+
+    print("\n▸ разбор: семеро «висящих» авторов не крутят чат вечно")
+    stuck_id = 555
+    enrich.add_chats([{"ref": "t.me/stuck_chat", "chat_id": stuck_id, "title": "Висящие"}])
+    enrich.set_chat("stuck_chat", status="downloaded")
+    with enrich.raw_path(stuck_id).open("w", encoding="utf-8") as f:
+        for i in range(8):
+            f.write(json.dumps({"id": i + 1, "date": NOW.isoformat(), "uid": 900 + i, "un": f"u{i}",
+                                "name": f"Автор{i}", "text": "погода норм", "reply_to": None}) + "\n")
+    enrich.write_json(enrich.progress_path(stuck_id), {"_out": {str(900 + i): 3 for i in range(7)}})
+    calls = []
+
+    def counting(system, user, **kw):
+        calls.append(user)
+        return fake_llm(system, user)
+    llm.chat = counting
+    for _ in range(3):
+        run_script("enrich-analyze.py", "--chat", "stuck_chat")
+    ch = enrich.load_chats()["stuck_chat"]
+    check(ch["status"] == "done" and "7" in ch.get("err", ""), f"после трёх заходов чат закрыт: {ch['status']}, {ch.get('err')}")
+    check(not any("Автор0" in c.split("►", 1)[-1].split("\n", 1)[0] for c in calls),
+          "«висящих» авторов к модели больше не отправляли")
+    check(not tglib.is_frozen_error(ValueError('No user has "Frozen_Soul" as username')),
+          "ник с «frozen_» — не заморозка аккаунта")
 
     print("\n▸ поиск чатов: ключевики")
     llm.chat = lambda *a, **k: 'Вот список: ["ЖК Академ", "ипотека екб", "ЖК Академ", "новостройки екб"]'

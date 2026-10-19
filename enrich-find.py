@@ -97,10 +97,17 @@ def fit(topic, cands):
         return []
     items = "\n".join(f"{i}. {c['title']} ({'канал' if c['kind'] == 'channel' else 'группа'})"
                       for i, c in enumerate(cands))
+    info = {}
     out = llm.chat("Отвечай строго в формате, который просят.",
                    FIT_PROMPT.format(goal=enrich.goal(), topic=topic, items=items),
-                   max_tokens=400, temperature=0)
+                   max_tokens=400, temperature=0, info=info)
     if out is None:
+        # отказ из-за САМИХ названий (модерация, «Content Exists Risk», длинно)
+        # повторится — это как непонятный ответ: после двух раз ключевик пропустим
+        code = str(info.get("code", ""))
+        if code in ("400", "403", "413") or "content exists risk" in (llm.LAST_ERR or "").lower():
+            say(f"  модель отказалась оценить темы ({llm.LAST_ERR or code}) — ключевик повторю позже")
+            return None
         say(f"  модель недоступна ({llm.LAST_ERR or 'нет ответа'}) — ключевик подождёт")
         return DOWN
     nums = last_json(out, int)

@@ -146,9 +146,12 @@ def pick_chat(acc_id):
                 # запускает аккаунт дважды, значит тот заход умер (упал, убит)
                 if v.get("reader") == acc_id or not at or (now - at).total_seconds() > STALE_READING:
                     v["status"] = "new"
-        # свой недочитанный — первым (файл уже начат, продолжим с места)
-        mine = [k for k, v in data.items() if v.get("status") == "new" and v.get("reader") == acc_id]
-        free = [k for k, v in data.items() if v.get("status") == "new"]
+        # свой недочитанный — первым (файл уже начат, продолжим с места); чат, куда
+        # вступил другой читатель, — в конец: пусть дочитает (и выйдет из него) он
+        new = [(k, v) for k, v in data.items() if v.get("status") == "new"]
+        mine = [k for k, v in new if v.get("reader") == acc_id or v.get("joined_by") == acc_id]
+        free = ([k for k, v in new if not v.get("joined_by")]
+                + [k for k, v in new if v.get("joined_by") and v.get("joined_by") != acc_id])
         key = (mine or free or [None])[0]
         if key is None:
             return None, None

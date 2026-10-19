@@ -415,8 +415,15 @@ async def main():
     todo = [r for r in queue if r["phone"] in mine]
 
     atexit.register(lambda: claims.release_all(acc["id"], "draft"))
+    # Остановка из панели (SIGTERM) — отмена задачи, а не sys.exit: так Telethon
+    # ещё жив в finally и успевает выйти из закрытых чатов лидов. На Windows
+    # обработчиков сигналов у цикла нет — там по-старому
+    task = asyncio.current_task()
     for sig in (signal.SIGINT, signal.SIGTERM):
-        signal.signal(sig, lambda *_: sys.exit(1))
+        try:
+            asyncio.get_running_loop().add_signal_handler(sig, task.cancel)
+        except (NotImplementedError, RuntimeError):
+            signal.signal(sig, lambda *_: sys.exit(1))
 
     tglib.ensure_head(tglib.DRAFTS, tglib.DRAFTS_HEAD)
     say(f"черновиков к раскладке: {len(todo)}")
@@ -699,7 +706,8 @@ async def main():
     finally:
         # из закрытых чатов лидов выходим: доступ к людям уже есть, а сидеть
         # в чужих чатах незачем (потолок 500 чатов, лишние глаза модераторов)
-        await leave_joined(client)
+        with contextlib.suppress(Exception, asyncio.TimeoutError):
+            await asyncio.wait_for(leave_joined(client), 15)     # мёртвая связь не держит выход
         await tglib.aclose(client)
 
     if voice:
@@ -725,4 +733,7 @@ async def main():
     tglib.state(done=ok_n, left=left, stop=stop, cooldown=cooldown)
 
 
-asyncio.run(main())
+try:
+    asyncio.run(main())
+except (asyncio.CancelledError, KeyboardInterrupt):
+    sys.exit(1)             # остановили из панели — как раньше, код 1, без трассировки

@@ -1400,11 +1400,12 @@ function work(set = baseSet) {
   // «только лиды»: остальные люди из чатов этому режиму не работа
   const leadKeys = enrich.leadKeys();
   const onlyLeads = set === 'chats' && !!auto.opts.chats?.leadsOnly;
-  // лиды, которых сегодня отложили все писатели прогона, — работа на завтра
-  const later = set === 'chats' ? enrich.putOffAll(idsOfSet('chats')) : new Set();
+  // лиды, которых сегодня кто-то отложил (вступления кончились) — какому
+  // писателю они не работа, решают pickJob и проверка конца прогона
+  const offAny = set === 'chats' ? enrich.putOffAny() : new Set();
   const free = res.filter((r) => r.tg === 'true' && !written.has(r.phone)
     && (dtries[r.phone] || 0) < MAX_TRIES && !held.has(r.phone)
-    && (!onlyLeads || leadKeys.has(r.phone)) && !later.has(r.phone));
+    && (!onlyLeads || leadKeys.has(r.phone)));
 
   /**
    * Кому может написать любой аккаунт, а кому — только один.
@@ -1418,15 +1419,25 @@ function work(set = baseSet) {
   // kept=1 — человек лежит в контактах проверившего аккаунта: пишет только он
   const own = {};
   let shared = 0;
+  const offShared = new Set();      // общие лиды, которые кто-то сегодня отложил
   for (const r of free) {
     // лид обогащения без @username — общий: любой писатель найдёт его через
     // сохранённое сообщение в чате (draft-messages.find_member)
     const solo = String(r.phone).startsWith('id:') && !(r.by === 'lead' && leadKeys.has(r.phone));
     if (solo || r.kept === '1') own[r.by] = (own[r.by] || 0) + 1;
-    else shared++;
+    else { shared++; if (offAny.has(r.phone)) offShared.add(r.phone); }
   }
 
-  return { check, write: free.length, shared, own };
+  return { check, write: free.length, shared, own, offShared };
+}
+
+/** Сколько общих лидов этот писатель сам отложил сегодня (draft-messages.put_off). */
+function putOffBy(left, ids) {
+  if (!left.offShared?.size) return 0;
+  const off = enrich.putOffAll(ids);
+  let n = 0;
+  for (const k of left.offShared) if (off.has(k)) n++;
+  return n;
 }
 
 /** До начала следующих суток — столько ждёт аккаунт, выбравший дневной предел. */
@@ -1577,7 +1588,8 @@ function pickJob(left, id) {
 
   // сколько работы есть именно у этого аккаунта: общая очередь плюс его
   // собственные люди из чатов, которых больше никто написать не может
-  const canDo = left.shared + (left.own[id] || 0);
+  // отложенных им же сегодня лидов (вступления кончились) ему не даём
+  const canDo = left.shared - putOffBy(left, [id]) + (left.own[id] || 0);
   if (canWrite && canDo > 0) {
     // дневной предел один — из графика разгона с общим «максимумом в день»
     const capLeft = capLeftNow;
@@ -1797,9 +1809,28 @@ function autoTick() {
     const o = auto.opts[set] || auto;
     // работа, которую МОГУТ сделать оставшиеся: людей, доступных только
     // выбывшему аккаунту, ждать бессмысленно
-    const canWrite = l.shared + mine.reduce((n, id) => n + (l.own[id] || 0), 0);
+    // лиды, отложенные ВСЕМИ писателями, что ещё могут писать сегодня, — работа на завтра
+    const today = mine.filter((id) => {
+      const a = accounts.list().find((x) => x.id === id);
+      return a && !auto.per.get(id)?.stopped && accounts.inOutreach(a) && warm(a).left > 0;
+    });
+    const deferred = today.length ? putOffBy(l, today) : 0;
+    const canWrite = l.shared - deferred + mine.reduce((n, id) => n + (l.own[id] || 0), 0);
     const need = o.mode === 'check' ? l.check
                : o.mode === 'write' ? canWrite : l.check + canWrite;
+    if (!need && deferred) {
+      // писать некому только до полуночи UTC — там вступления снова есть.
+      // Прогон не заканчиваем («всем написано» было бы неправдой), а ждём
+      const at = Date.UTC(new Date().getUTCFullYear(), new Date().getUTCMonth(), new Date().getUTCDate() + 1) + 5 * 60_000;
+      for (const id of mine) {
+        const s = auto.per.get(id);
+        if (!s) continue;
+        s.nextAt = Math.max(s.nextAt || 0, at);
+        s.note = 'вступления на сегодня кончились';
+        if (notedOnce(s, 'joins')) push(`⏸ «${title(id)}»: лидов без @username сегодня не достать (кончились вступления в закрытые чаты) — вернётся после полуночи UTC`);
+      }
+      continue;
+    }
     if (!need) {
       finishSet(set, o.mode === 'check' ? 'база пройдена'
                    : o.mode === 'write' ? 'всем найденным написано'
