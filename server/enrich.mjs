@@ -22,7 +22,8 @@ const TICK = 15_000;
 const IN_WORK = ['reading', 'downloaded', 'analyzing'];
 
 export function makeEnrich({ DIR, CODE, accounts, running, launch, pythonCmd, push, note,
-                             busy, proxyDown, readRaw, resting = () => false, slots = () => Infinity }) {
+                             busy, proxyDown, readRaw, resting = () => false, slots = () => Infinity,
+                             readerCap = Infinity }) {
   const ROOT = path.join(DIR, 'enrich');
   const STATE = path.join(ROOT, 'state.json');
   const read = (f, d) => { try { return JSON.parse(fs.readFileSync(f, 'utf8')) ?? d; } catch { return d; } };
@@ -58,6 +59,7 @@ export function makeEnrich({ DIR, CODE, accounts, running, launch, pythonCmd, pu
       const list = Object.values(read(f, {}));
       const keys = new Set();
       for (const l of list) {
+        if (l.key) keys.add(l.key);                 // под этим ключом лид лежит в очереди
         if (l.username) keys.add('@' + String(l.username).replace(/^@/, ''));
         if (l.uid) keys.add(`id:${l.uid}`);
       }
@@ -66,7 +68,7 @@ export function makeEnrich({ DIR, CODE, accounts, running, launch, pythonCmd, pu
     return leadsCache;
   }
   const leadKeys = () => leads().keys;
-  const keyOf = (l) => (l.username ? '@' + String(l.username).replace(/^@/, '') : `id:${l.uid}`);
+  const keyOf = (l) => l.key || (l.username ? '@' + String(l.username).replace(/^@/, '') : `id:${l.uid}`);
 
   /** Python-помощник (enrich.py, enrich-find.py) без аккаунта: вернёт последнюю JSON-строку. */
   function py(args, onLine) {
@@ -101,7 +103,10 @@ export function makeEnrich({ DIR, CODE, accounts, running, launch, pythonCmd, pu
     const busyProxy = new Set([...running.keys()].map((id) =>
       accounts.list().find((a) => a.id === id)?.proxy || 'direct'));
     const out = [];
-    let room = slots();          // общий потолок задач панели (TG_MAX_PARALLEL)
+    // общий потолок задач панели (TG_MAX_PARALLEL), а читателям — не больше его
+    // половины: рассылке и прогреву места должно хватать всегда
+    const reading = [...running.values()].filter((r) => /^(Чтение чата|Поиск чатов)/.test(r.title || '')).length;
+    let room = Math.min(slots(), readerCap - reading);
     for (const a of readers()) {
       if (room <= 0) break;
       if (running.has(a.id) || busy(a.id) || proxyDown(a.proxy)) continue;
@@ -242,6 +247,7 @@ export function makeEnrich({ DIR, CODE, accounts, running, launch, pythonCmd, pu
       found: l.found_at || '', status: ls.get(keyOf(l)) || 'в очереди',
     })).sort((a, b) => String(b.found).localeCompare(String(a.found)));
     const now = Date.now();
+    const ready = new Set(readers().map((a) => a.id));     // один раз: отлёжка считается по журналу
     return {
       on: st.on, finding: st.finding, goal: st.goal, topic: st.topic || kw.topic || '',
       kwBusy: !!kwJob,
@@ -252,7 +258,7 @@ export function makeEnrich({ DIR, CODE, accounts, running, launch, pythonCmd, pu
         const p = per.get(a.id) || {};
         return { id: a.id, name: a.name || a.title, title: a.title,
                  busy: running.get(a.id)?.title || '',
-                 ready: readers().some((x) => x.id === a.id), resting: !!resting(a),
+                 ready: ready.has(a.id), resting: !ready.has(a.id) && !!resting(a),
                  rest: p.nextAt > now ? Math.round((p.nextAt - now) / 60_000) : 0, note: p.note || '' };
       }),
       leads: L.slice(0, 500), leadsTotal: L.length,
@@ -361,6 +367,9 @@ export function makeEnrich({ DIR, CODE, accounts, running, launch, pythonCmd, pu
     if (!on) { st.finding = false; save(); return { ok: true }; }
     if (!kwLeft()) return { ok: false, reason: 'непройденных ключевиков нет — сначала подбери ключевики по теме' };
     if (kwJob) return { ok: false, reason: 'ключевики ещё подбираются — подожди' };
+    if ([...running.values()].some((r) => /^Поиск чатов/.test(r.title || ''))) {
+      return { ok: false, reason: 'прошлый поиск ещё заканчивает ключевик — подожди минуту' };
+    }
     if (!readers().length) return { ok: false, reason: NO_READERS };
     st.finding = true; save();
     note('🔎', `поиск чатов по ключевикам: осталось ${kwLeft()}`);

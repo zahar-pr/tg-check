@@ -106,11 +106,16 @@ async def join(client, acc_id, joined, do):
     return entity
 
 
+class NeedsApproval(Exception):
+    """В чат пускают только по заявке, одобренной админом: заявку не шлём."""
+
+
 async def open_chat(client, ref, acc_id, joined):
     """
-    Сущность для чтения: группа как есть, у канала — его обсуждение.
-    Вступаем, только если не состоим, — и по ссылке-приглашению тоже: такое
+    Сущность для чтения: группа как есть, у канала — его обсуждение. Вступаем
+    здесь только по ссылке-приглашению (иначе внутрь не попасть): такое
     вступление считается в дневной предел, и из такого чата потом выходим.
+    В публичную группу вступает read_chat — уже после проверки на дубль.
     """
     from telethon import functions
     from telethon.tl.types import Channel, ChatInviteAlready, ChatInvitePeek
@@ -120,6 +125,9 @@ async def open_chat(client, ref, acc_id, joined):
         res = await client(functions.messages.CheckChatInviteRequest(invite))
         if isinstance(res, (ChatInviteAlready, ChatInvitePeek)):
             entity = res.chat
+        elif getattr(res, "request_needed", False):
+            # заявка ушла бы админам — подозрительно для аккаунта и бесполезно для нас
+            raise NeedsApproval()
         else:
             async def by_invite():
                 upd = await client(functions.messages.ImportChatInviteRequest(invite))
@@ -134,19 +142,14 @@ async def open_chat(client, ref, acc_id, joined):
         if not linked:
             return head, None
         entity = next((c for c in full.chats if c.id == linked), None) or await client.get_entity(linked)
-    # публичную группу можно читать и так, но читателю положено быть внутри —
-    # так видна вся история
-    if isinstance(entity, Channel) and getattr(entity, "left", False):
-        async def by_join(ent=entity):
-            await client(functions.channels.JoinChannelRequest(ent))
-            return ent
-        await join(client, acc_id, joined, by_join)
     return head, entity
 
 
 async def read_chat(client, acc, key, ch, days, joined):
     """Один чат: открыть, выкачать в jsonl, отметить. Возвращает отчёт: (done, сообщение)."""
+    from telethon import functions
     from telethon.errors import FloodWaitError
+    from telethon.tl.types import Channel
 
     say(f"\n▸ {ch.get('title') or ch['ref']}")
     head, entity = await open_chat(client, ch["ref"], acc["id"], joined)
@@ -163,6 +166,19 @@ async def read_chat(client, acc, key, ch, days, joined):
     # по нему писатель потом найдёт сообщение лида
     enrich.set_chat(key, title=title, chat_id=entity.id, username=getattr(head, "username", "") or "",
                     read_ref=("@" + entity.username) if getattr(entity, "username", None) else "")
+
+    # публичную группу можно читать и так, но читателю положено быть внутри —
+    # так видна вся история. Группу «по заявке» читаем снаружи: заявку не шлём
+    if isinstance(entity, Channel) and getattr(entity, "left", False) and not getattr(entity, "join_request", False):
+        async def by_join(ent=entity):
+            await client(functions.channels.JoinChannelRequest(ent))
+            return ent
+        await join(client, acc["id"], joined, by_join)
+    if joined:
+        # прошлый заход могли убить посреди чтения — выйти должен и тот, что дочитает
+        enrich.set_chat(key, joined_by=acc["id"])
+    elif ch.get("joined_by") == acc["id"] and isinstance(entity, Channel) and not getattr(entity, "left", True):
+        joined.append(entity)
 
     path = enrich.raw_path(entity.id)
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -203,6 +219,25 @@ async def read_chat(client, acc, key, ch, days, joined):
 
     enrich.set_chat(key, status="downloaded", msgs=n, read_at=enrich.now_iso())
     return 1, f"готово: сообщений за {days} дн. — {n}"
+
+
+# ошибки, после которых виноват аккаунт, а не чат: сколько ему отдыхать
+ACCOUNT_ERRORS = {
+    "ChannelsTooMuchError": 24 * 3600,          # 500 чатов — сам не рассосётся, нужен разбор руками
+    "AuthKeyUnregisteredError": 3600, "AuthKeyDuplicatedError": 3600,
+    "UserDeactivatedError": 24 * 3600, "UserDeactivatedBanError": 24 * 3600,
+    "SessionRevokedError": 24 * 3600, "UserRestrictedError": 6 * 3600,
+}
+
+
+def account_trouble(acc, e):
+    """(stop, cooldown) для отчёта, если ошибка — про аккаунт; ("", 0) — про чат."""
+    if tglib.is_frozen_error(e):
+        tglib.set_field(acc["id"], spamKind="frozen", spamOk=False, spamAt=tglib.now_iso(),
+                        spam=tglib.cell("заморожен — блокировка по жалобам (ToS)"))
+        return "quarantine", 0
+    cool = ACCOUNT_ERRORS.get(type(e).__name__)
+    return ("errors", cool) if cool else ("", 0)
 
 
 async def main():
@@ -250,12 +285,25 @@ async def main():
     except asyncio.CancelledError:
         enrich.set_chat(key, status="new")
         say("  остановлен из панели — чат вернул в очередь")
-    except (SystemExit, Exception) as e:
-        # закрытый чат, заявка на вступление, потолок 500 чатов, выгнал антиспам…
-        msg = str(e).splitlines()[0][:120] if str(e) else type(e).__name__
-        enrich.set_chat(key, status="error", err=msg)
-        say(f"  не вышло: {msg}")
+    except NeedsApproval:
+        enrich.set_chat(key, status="skipped", err="вступление только по заявке — не читаем")
+        say("  в чат пускают только по одобренной заявке — пропускаю, заявку не шлю")
         report = dict(done=0, left=left_q)
+    except (SystemExit, Exception) as e:
+        msg = str(e).splitlines()[0][:120] if str(e) else type(e).__name__
+        stop, cool = account_trouble(acc, e)
+        if stop:
+            # беда аккаунта, а не чата: чат ждёт другого читателя, этот — отдыхает
+            enrich.set_chat(key, status="new")
+            say(f"  не вышло: {msg} — это про аккаунт, чат вернул в очередь")
+            report = dict(done=0, left=left_q + 1, stop=stop, cooldown=cool)
+        else:
+            # закрытый чат, выгнал антиспам, удалённое приглашение — помечаем чат
+            if type(e).__name__ == "InviteRequestSentError":
+                enrich.note_join(acc["id"])          # заявка ушла — считаем как вступление
+            enrich.set_chat(key, status="error", err=msg)
+            say(f"  не вышло: {msg}")
+            report = dict(done=0, left=left_q)
     finally:
         for ent in joined:
             await leave(client, ent)

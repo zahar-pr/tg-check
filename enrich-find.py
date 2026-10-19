@@ -61,6 +61,8 @@ def last_json(out, kind):
             d = json.loads(m.group(0))
         except Exception:
             continue
+        if isinstance(d, list) and kind is int and all(isinstance(x, str) and x.strip().isdigit() for x in d):
+            d = [int(x) for x in d]             # ["0","2"] — те же номера строкой
         if isinstance(d, list) and all(isinstance(x, kind) for x in d):
             found = d
     return found
@@ -100,6 +102,27 @@ def fit(topic, cands):
         say(f"  модель не оценила темы ({llm.LAST_ERR or 'непонятный ответ'}) — этот ключевик повторю позже")
         return None
     return [cands[i] for i in nums if 0 <= i < len(cands)]
+
+
+def current(q, at0):
+    """Ключевик ещё в списке и не пройден? Список могли поправить в панели посреди поиска."""
+    cur = enrich.read_json(enrich.KEYWORDS, {})
+    if cur.get("at") != at0:
+        return None
+    return next((it for it in cur.get("items", []) if str(it.get("q", "")).lower() == q.lower()), None)
+
+
+def bump_fit_fail(q, at0):
+    """Модель не оценила темы по этому ключевику: после двух раз ключевик пропускаем."""
+    cur = enrich.read_json(enrich.KEYWORDS, {})
+    if cur.get("at") != at0:
+        return
+    for it in cur.get("items", []):
+        if str(it.get("q", "")).lower() == q.lower():
+            it["fit_fail"] = int(it.get("fit_fail") or 0) + 1
+            if it["fit_fail"] >= 2:
+                it.update(done=True, found=0)
+    enrich.write_json(enrich.KEYWORDS, cur)
 
 
 def mark_done(q, found, at0):
@@ -143,6 +166,13 @@ async def search(acc, per_run, dry):
             if not dry and not enrich.read_json(enrich.STATE, {}).get("finding"):
                 say("поиск остановлен в панели")
                 break
+            if not dry:
+                it = current(item["q"], at0)
+                if it is None and enrich.read_json(enrich.KEYWORDS, {}).get("at") != at0:
+                    say("ключевики подобраны заново — этот заход заканчиваю")
+                    break
+                if it is None or it.get("done"):
+                    continue                    # ключевик убрали из списка или его уже прошли
             try:
                 res = await client(functions.contacts.SearchRequest(q=item["q"], limit=50))
             except FloodWaitError as e:
@@ -153,18 +183,26 @@ async def search(acc, per_run, dry):
                 await asyncio.sleep(e.seconds)
                 continue
             except Exception as e:
-                # запрос не понравился Telegram (слишком короткий, странные символы) —
-                # этот ключевик пропускаем, остальные ищем дальше
-                say(f"«{item['q']}»: поиск не вышел ({str(e).splitlines()[0][:80] or type(e).__name__}) — пропускаю")
-                if not dry and not mark_done(item["q"], 0, at0):
-                    break
-                continue
+                msg = str(e).splitlines()[0][:80] if str(e) else type(e).__name__
+                if getattr(e, "code", None) == 400 and not tglib.is_frozen_error(e):
+                    # запрос не понравился Telegram (короткий, странные символы) —
+                    # этот ключевик пропускаем, остальные ищем дальше
+                    say(f"«{item['q']}»: Telegram не принял запрос ({msg}) — пропускаю")
+                    if not dry and not mark_done(item["q"], 0, at0):
+                        break
+                    continue
+                # связь, заморозка, сбой сервера — беда не ключевика: стоп, ключевики целы
+                say(f"«{item['q']}»: поиск не вышел ({msg}) — остановлюсь, продолжу позже")
+                stop = "errors"
+                break
             cands = []
             for c in res.chats:
                 if not isinstance(c, Channel) or not c.username or str(c.id) in known:
                     continue
                 if c.broadcast and not getattr(c, "has_link", False):
                     continue                       # канал без комментариев: людей не видно
+                if getattr(c, "join_request", False):
+                    continue                       # пускают по заявке админу — не наш случай
                 if (c.participants_count or MIN_MEMBERS) < MIN_MEMBERS:
                     continue
                 cands.append({"ref": "@" + c.username, "chat_id": c.id, "title": tglib.cell(c.title),
@@ -172,6 +210,9 @@ async def search(acc, per_run, dry):
                               "kind": "channel" if c.broadcast else "group"})
             good = fit(topic, cands)
             if good is None:
+                # модель сбилась на этом ключевике: дважды подряд — пропускаем его
+                if not dry:
+                    bump_fit_fail(item["q"], at0)
                 stop = "errors"
                 break
             for c in good:

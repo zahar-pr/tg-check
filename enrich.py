@@ -152,7 +152,8 @@ def pick_chat(acc_id):
         key = (mine or free or [None])[0]
         if key is None:
             return None, None
-        data[key].update(status="reading", reader=acc_id, at=now_iso())
+        # pid — чей процесс читает: панель вернёт чат в очередь, только если он мёртв
+        data[key].update(status="reading", reader=acc_id, pid=os.getpid(), at=now_iso())
         return key, dict(data[key])
     return _update(fn)
 
@@ -272,28 +273,42 @@ def remove(keys):
         n = 0
         for k in keys:
             if k in data and data[k].get("status") in ("new", "error", "skipped"):
-                # недочитанное сырьё убранного чата — личные сообщения людей, хранить незачем
+                # недочитанное сырьё убранного чата — личные сообщения людей, хранить
+                # незачем. Но у дубля тот же chat_id, что у живого чата: его файл не трогаем
                 cid = data[k].get("chat_id")
-                if cid:
+                del data[k]
+                if cid and not any(str(v.get("chat_id")) == str(cid) for v in data.values()):
                     raw_path(cid).unlink(missing_ok=True)
                     progress_path(cid).unlink(missing_ok=True)
-                del data[k]
                 n += 1
         return n
     return _update(fn)
 
 
+def _alive(pid):
+    """Жив ли процесс читателя (этой же машины)."""
+    try:
+        os.kill(int(pid), 0)
+    except (ProcessLookupError, ValueError, TypeError):
+        return False
+    except PermissionError:
+        return True
+    return True
+
+
 def release(pairs):
     """
     «Читается», а процесса читателя нет (упал, убит, сервер перезапускали) —
-    обратно в очередь. Зовёт панель: только она знает, чьи процессы живы.
-    pairs — [(ключ чата, читатель)]; чат, который уже взял другой, не трогаем.
+    обратно в очередь. pairs — [(ключ чата, читатель)] от панели; решает не она,
+    а pid в записи: панель могла как раз перезапустить этого же читателя, и он
+    уже снова взял свой чат — живой процесс не трогаем.
     """
     def fn(data):
         n = 0
         for k, reader in pairs:
             v = data.get(k)
-            if v and v.get("status") == "reading" and v.get("reader") == reader:
+            if (v and v.get("status") == "reading" and v.get("reader") == reader
+                    and not _alive(v.get("pid"))):
                 v["status"] = "new"
                 n += 1
         return n

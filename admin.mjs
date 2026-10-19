@@ -614,6 +614,7 @@ const enrich = makeEnrich({
   proxyDown: (proxy) => proxyGuard.down(proxy),
   resting: (a) => warm(a).resting,                           // первые сутки — отлёжка
   slots: () => MAX_RUNNING - running.size,                   // общий потолок задач
+  readerCap: Math.max(1, Math.floor(MAX_RUNNING / 2)),        // читателям — не больше половины
 });
 
 

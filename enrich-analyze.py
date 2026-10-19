@@ -97,7 +97,14 @@ def chunks(msgs, spans, me):
             ln = line(m, me)
             if cur and size + len(ln) + 1 > CHUNK:
                 blocks.append(cur)
-                cur, size = cur[-AROUND:], sum(len(x) + 1 for x in cur[-AROUND:])  # контекст на стыке
+                # контекст на стыке — последние строки куска, но не больше трети
+                # куска: иначе длинные сообщения дали бы запрос на каждую реплику
+                tail = []
+                for x in reversed(cur[-AROUND:]):
+                    if sum(len(y) + 1 for y in tail) + len(x) + 1 > CHUNK // 3:
+                        break
+                    tail.insert(0, x)
+                cur, size = tail, sum(len(y) + 1 for y in tail)
             cur.append(ln)
             size += len(ln) + 1
         if cur:
@@ -131,21 +138,39 @@ def verdict(out):
         if isinstance(d, dict) and "lead" in d:
             found = d
     if found is None:
-        return None
+        # ответ обрезан на длинной заметке: JSON не закрыт, но «lead» уже сказан
+        m = re.search(r'"lead"\s*:\s*(true|false)', out or "")
+        if not m:
+            return None
+        why = re.search(r'"why"\s*:\s*"((?:[^"\\]|\\.)*)', out)
+        note = re.search(r'"note"\s*:\s*"((?:[^"\\]|\\.)*)', out or "", re.S)
+        found = {"lead": m.group(1) == "true", "why": why.group(1) if why else "",
+                 "note": (note.group(1).replace("\\n", "\n") + " …") if note else ""}
     return {"lead": found.get("lead") is True or str(found.get("lead")).lower() == "true",
             "why": str(found.get("why") or "")[:300], "note": str(found.get("note") or "")}
 
 
+BAD = "bad"     # модель ответила, но вердикта в ответе нет — это не сбой связи
+
+
 def ask(system, text):
-    """Вердикт модели. None — модель не ответила толком (повторим позже)."""
-    for _ in range(2):
-        out = llm.chat(system, text, max_tokens=900, temperature=0.2)
+    """
+    Вердикт модели. None — модель недоступна (сеть, 5xx): повторим позже, это
+    не вина автора. BAD — ответила, но без вердикта и после повтора с запасом
+    токенов (ответ обрезан на длинной заметке).
+    """
+    for tokens in (900, 2000):
+        info = {}
+        out = llm.chat(system, text, max_tokens=tokens, temperature=0.2, info=info)
         if out is None:
-            return None
+            # сеть и перегрузка — пройдёт; ошибка самого запроса (400: длинно,
+            # модерация) повторится и завтра — это «без вердикта», а не простой
+            code = info.get("code", "")
+            return None if code in ("net", "", "429") or code.startswith("5") else BAD
         v = verdict(out)
         if v:
             return v
-    return None
+    return BAD
 
 
 def judge(system, msgs, me):
@@ -154,8 +179,8 @@ def judge(system, msgs, me):
     verdicts = []
     for part in chunks(msgs, windows(pos, len(msgs)), me):
         v = ask(system, part)
-        if v is None:
-            return None
+        if v is None or v == BAD:
+            return v
         verdicts.append(v)
     yes = [v for v in verdicts if v["lead"]]
     if not yes:
@@ -232,7 +257,8 @@ def main():
         say(f"продолжаю: уже разобрано {len(progress)}, осталось {len(todo)}")
 
     lock = threading.Lock()
-    failed = []
+    failed = []          # модель ответила, но без вердикта (BAD)
+    outage = []          # модель недоступна (None) — повторим, попытку не тратим
     stats = {"done": 0, "leads": sum(1 for v in progress.values() if v), "fails": 0, "stop": False}
 
     def one(uid):
@@ -241,12 +267,15 @@ def main():
         v = judge(system, msgs, uid)
         with lock:
             if v is None:
-                failed.append(uid)
+                outage.append(uid)
                 stats["fails"] += 1
                 if stats["fails"] >= FAILS_STOP:
                     stats["stop"] = True
                 return
             stats["fails"] = 0
+            if v == BAD:
+                failed.append(uid)
+                return
             stats["done"] += 1
             a = authors[uid]
             who = f"@{a['un']}" if a.get("un") else f"id{uid} ({a.get('name', '')})"
@@ -270,17 +299,23 @@ def main():
     with ThreadPoolExecutor(max_workers=workers) as pool:
         list(pool.map(one, todo))
 
-    # Модель не дала вердикта по части авторов — сырьё не удаляем: следующий
-    # заход разберёт только их (прогресс по остальным сохранён). После
-    # нескольких заходов сдаёмся, чтобы один «трудный» автор не держал очередь
-    tries = int(ch.get("tries") or 0) + 1
-    if stats["stop"] or (failed and tries < 3):
-        say(f"\nстоп: не разобрано авторов {len(todo) - stats['done']} "
-            f"({llm.LAST_ERR or 'модель не дала вердикта'}) — чат подождёт, разбор продолжится с этого места")
+    # Модель недоступна (сеть, 5xx) — чат ждёт, попытка не считается: это не
+    # вина авторов. Сырьё не удаляем, прогресс по разобранным сохранён.
+    if stats["stop"] or outage:
+        say(f"\nстоп: модель недоступна ({llm.LAST_ERR or 'пустой ответ'}) — не разобрано "
+            f"{len(todo) - stats['done'] - len(failed)}, чат подождёт и продолжит с этого места")
         if not dry and not sample:
-            enrich.set_chat(key, status="downloaded", tries=tries,
-                            err=f"модель: {(llm.LAST_ERR or 'нет вердикта')[:100]}")
+            enrich.set_chat(key, status="downloaded", err=f"модель: {(llm.LAST_ERR or 'не отвечает')[:100]}")
         tglib.state(done=stats["done"], left=len(todo) - stats["done"], stop="errors", cooldown=15 * 60)
+        return
+    # Модель отвечала, но без вердикта: ещё два захода, потом сдаёмся, чтобы
+    # один «трудный» автор не держал очередь вечно
+    tries = int(ch.get("tries") or 0) + (1 if failed else 0)
+    if failed and tries < 3:
+        say(f"\nне разобрано авторов {len(failed)}: модель не дала вердикта — повторю (заход {tries} из 3)")
+        if not dry and not sample:
+            enrich.set_chat(key, status="downloaded", tries=tries, err="модель не дала вердикта")
+        tglib.state(done=stats["done"], left=len(failed), stop="errors", cooldown=5 * 60)
         return
     gave_up = f"модель не разобрала авторов: {len(failed)}" if failed else ""
 

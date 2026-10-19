@@ -162,7 +162,7 @@ def run_script(name, *args, client=None):
     return out
 
 
-def fake_llm(system, user, max_tokens=400, temperature=0.8, tries=5, model=None):
+def fake_llm(system, user, max_tokens=400, temperature=0.8, tries=5, model=None, info=None):
     """
     «Модель» для песка: смотрит на реплики ЦЕЛИ (►) и на соседние строки. Лид —
     если цель сама говорит про покупку, или отвечает «да»/«и я тоже» сразу
@@ -224,20 +224,45 @@ def main():
     k2, ch2 = enrich.pick_chat("r2")
     check(k2 == "+Invite123", f"второй читатель получил другой чат: {k2}")
     # процесс r2 «умер»: панель возвращает его чат в очередь
+    enrich.set_chat(k2, pid=2 ** 22 + 12345)           # такого процесса нет
     res = subprocess.run([sys.executable, str(REPO / "enrich.py"), "release", k2, "r2"],
                          capture_output=True, text=True, env={**os.environ})
     check(enrich.load_chats()[k2]["status"] == "new" and '"n": 1' in res.stdout, "осиротевший чат вернулся в очередь")
+    k3, _ = enrich.pick_chat("r2")                     # этот процесс жив (pid — наш)
+    res = subprocess.run([sys.executable, str(REPO / "enrich.py"), "release", k3, "r2"],
+                         capture_output=True, text=True, env={**os.environ})
+    check(enrich.load_chats()[k3]["status"] == "reading", "чат живого читателя панель не трогает")
+    enrich.set_chat(k3, status="new", reader="")
 
-    print("\n▸ разбор: модель не ответила по автору")
+    print("\n▸ разбор: модель недоступна")
 
-    def flaky(system, user, **kw):
-        return None if "(Оля)" in user.split("►", 1)[-1].split("\n", 1)[0] else fake_llm(system, user)
+    def down(system, user, info=None, **kw):
+        if info is not None:
+            info["code"] = "net"
+        return None
+    llm.chat = down
+    run_script("enrich-analyze.py")
+    ch = enrich.load_chats()["akadem_sosedi"]
+    check(ch["status"] == "downloaded" and not ch.get("tries"), f"сеть легла — ждём, попытку не тратим: tries {ch.get('tries')}")
+
+    print("\n▸ разбор: модель ответила без вердикта")
+
+    def flaky(system, user, info=None, **kw):
+        olya = "(Оля)" in user.split("►", 1)[-1].split("\n", 1)[0]
+        return "не знаю, что сказать" if olya else fake_llm(system, user)
     llm.chat = flaky
     run_script("enrich-analyze.py")
     ch = enrich.load_chats()["akadem_sosedi"]
     check(ch["status"] == "downloaded" and ch.get("tries") == 1, f"чат ждёт повтора: {ch['status']}, tries {ch.get('tries')}")
     check(enrich.raw_path(CHAT_ID).exists(), "сырые сообщения не удалены, пока не разобраны все")
     check("4" not in enrich.load_leads(), "Оля ещё не разобрана")
+
+    print("\n▸ обрезанный ответ модели")
+    ns_a = {"__name__": "analyze_test"}
+    src_a = (REPO / "enrich-analyze.py").read_text("utf-8").rsplit("\nmain()", 1)[0]
+    exec(compile(src_a, "enrich-analyze.py", "exec"), ns_a)
+    v = ns_a["verdict"]('думаю {так}\n{"lead": true, "why": "берёт двушку", "note": "- **Район:** Академ\\n- бюджет до 7')
+    check(v and v["lead"] and "Академ" in v["note"], f"лид из обрезанного JSON: {v}")
 
     print("\n▸ разбор по авторам")
     llm.chat = fake_llm

@@ -30,6 +30,7 @@
 """
 import asyncio
 import atexit
+import contextlib
 import random
 import re
 import signal
@@ -124,6 +125,27 @@ class JoinQuota(Exception):
     """Лида не достать только из-за дневного предела вступлений — попыткой это не считается."""
 
 
+def put_off(acc_id, key=None):
+    """
+    Лиды, отложенные этим аккаунтом до завтра (enrich/later.json). С key —
+    отложить ещё одного. Возвращает множество отложенных на сегодня.
+    """
+    import enrich
+    from chatlib import locked
+    day = now_iso()[:10]
+    f = enrich.ROOT / "later.json"
+    if key is None:
+        got = enrich.read_json(f, {}).get(acc_id) or {}
+        return set(got.get("keys", [])) if got.get("day") == day else set()
+    enrich.ROOT.mkdir(parents=True, exist_ok=True)
+    with locked(f):
+        data = enrich.read_json(f, {})
+        got = data.get(acc_id) or {}
+        keys = set(got.get("keys", [])) if got.get("day") == day else set()
+        data[acc_id] = {"day": day, "keys": sorted(keys | {key})}
+        enrich.write_json(f, data)
+
+
 async def via_message(client, lead, acc):
     """
     Доступ к лиду через его сообщение в чате. Читатель видел человека, а
@@ -145,19 +167,23 @@ async def via_message(client, lead, acc):
         ids = [int(i) for i in (ch.get("msg_ids") or [])][-10:]
         if not ids or not ch.get("ref"):
             continue
+        joined = None            # вступили ради этого лида — выйдем, как только найдём
         try:
             ref, invite = chat_ref(ch["ref"])
             if invite:
                 res = await client(functions.messages.CheckChatInviteRequest(invite))
                 if isinstance(res, (ChatInviteAlready, ChatInvitePeek)):
                     entity = res.chat                     # уже внутри — вступление не тратим
+                elif getattr(res, "request_needed", False):
+                    why = "в чат лида пускают только по заявке — заявку не шлю"
+                    continue
                 elif enrich.joins_today(acc["id"]) >= WRITER_JOINS:
                     quota = True
                     why = f"чат лида закрытый, а вступлений на сегодня уже {WRITER_JOINS}"
                     continue
                 else:
                     upd = await client(functions.messages.ImportChatInviteRequest(invite))
-                    entity = upd.chats[0]
+                    entity = joined = upd.chats[0]
                     enrich.note_join(acc["id"])
             else:
                 entity = await client.get_entity(ref)
@@ -176,6 +202,10 @@ async def via_message(client, lead, acc):
                 got = await client(functions.users.GetUsersRequest(
                     [InputUserFromMessage(peer=peer, msg_id=m.id, user_id=uid)]))
                 if got and not isinstance(got[0], UserEmpty):
+                    if joined is not None:
+                        # доступ к человеку уже есть — сидеть в чужом закрытом чате незачем
+                        with contextlib.suppress(Exception):
+                            await client.delete_dialog(joined)
                     return got[0]
         except (FloodWaitError, PeerFloodError):
             raise                                       # это про аккаунт, а не про чат
@@ -254,6 +284,9 @@ async def main():
     send_gap = tglib.flag("send-gap")
     # «Написать лидам»: из очереди по чатам — только лиды обогащения (leads.json)
     leads_only = tglib.flag("leads-only")
+    # лиды, которых этому аккаунту сегодня не достать (вступления кончились) —
+    # до завтра не берём, иначе прогон звал бы его к ним каждую минуту
+    later = put_off(acc["id"])
 
     # отдых после заморозки — людям не пишем вовсе, даже если роль в панели
     # переключили обратно в рассылку. Ни подключения, ни брони адресатов
@@ -352,7 +385,8 @@ async def main():
              if r.get("tg") == "true" and r["phone"] not in already
              and tries.get(r["phone"], 0) < MAX_TRIES
              and tglib.can_write(r, acc["id"])
-             and (not leads_only or r["phone"] in tglib.lead_refs())]
+             and (not leads_only or r["phone"] in tglib.lead_refs())
+             and r["phone"] not in later]
     if leads_only:
         say(f"пишем только лидам: в очереди {len(queue)}")
     nothing = sum(1 for r in queue if not pick_tpl(r))
@@ -607,6 +641,7 @@ async def main():
             except JoinQuota as e:
                 # вступлений на сегодня хватит — лид дождётся завтра, попытка не считается
                 say(f"[{i + 1}/{len(todo)}] {phone} — {e}; завтра")
+                put_off(acc["id"], phone)
                 record = False
             except PeerFloodError:
                 say("\nстоп: аккаунт ограничен Telegram за рассылку (PEER_FLOOD).")
@@ -673,7 +708,8 @@ async def main():
                if r.get("tg") == "true" and r["phone"] not in already2
                and tries2.get(r["phone"], 0) < MAX_TRIES
                and tglib.can_write(r, acc["id"])
-               and (not leads_only or r["phone"] in tglib.lead_refs()))
+               and (not leads_only or r["phone"] in tglib.lead_refs())
+               and r["phone"] not in put_off(acc["id"]))
     tglib.state(done=ok_n, left=left, stop=stop, cooldown=cooldown)
 
 

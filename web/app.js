@@ -2816,10 +2816,20 @@ $('#ld-write')?.addEventListener('click', async () => {
     return;
   }
   // настройки и состав писателей — вкладки «Рассылка по чатам»
+  // Пишут лидам с настройками вкладки «Рассылка по чатам» (текст, паузы, лимиты,
+  // писатели). Ни разу её не запускали — снимка нет: в общей форме сейчас
+  // настройки «по номерам», с ними лидам писать нельзя. Отправляем настроить.
+  if (formShownSet !== 'chats' && !formBySet.chats) {
+    alert('Сначала настрой рассылку на вкладке «Рассылка по чатам»: текст, паузы, лимиты и кто пишет. ' +
+      'Лидам пишем с этими настройками.');
+    showView('chatsend');
+    return;
+  }
   const back = pickSet;
   useWork('chats');
-  // в общей форме запуска — снимок вкладки «по чатам», а не последней открытой
-  if (formBySet.chats) { applyForm(formBySet.chats); formShownSet = 'chats'; }
+  // в общей форме — снимок «по чатам»; если она уже показана, в ней могут быть
+  // свежие правки человека — их не затираем
+  if (formShownSet !== 'chats') { applyForm(formBySet.chats); formShownSet = 'chats'; }
   await startAuto('chats', { leads: true });
   if (activeView() === 'leads') useWork(back);
 });

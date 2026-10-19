@@ -47,9 +47,12 @@ def _cfg(k, d=""):
     return os.environ.get(k) or _ENV.get(k, d)
 
 
-def chat(system, user, max_tokens=400, temperature=0.8, tries=5, model=None):
+def chat(system, user, max_tokens=400, temperature=0.8, tries=5, model=None, info=None):
     """Один запрос к модели через curl (надёжно тоннелит HTTPS через прокси).
     Возвращает текст ответа или None (мягкий фейл, причина в LAST_ERR).
+    info — словарь, куда положить код сбоя: "net" (сеть, таймаут), "429"/"5xx"
+    (перегрузка — после всех повторов), иначе код ошибки запроса ("400"…).
+    Свой словарь на вызов: LAST_ERR общий и в потоках перемешивается.
     model — своя модель для задачи (комментарии); имя вида «провайдер/модель»
     понимает только агрегатор (OpenRouter), у прямого провайдера берём LLM_MODEL."""
     global LAST_ERR
@@ -81,6 +84,8 @@ def chat(system, user, max_tokens=400, temperature=0.8, tries=5, model=None):
             d = json.loads(out)
         except Exception as e:
             LAST_ERR = f"{type(e).__name__}: {str(e)[:120]}"
+            if info is not None:
+                info["code"] = "net"
             if i < tries - 1:
                 time.sleep(delay); delay *= 2; continue
             return None
@@ -89,6 +94,8 @@ def chat(system, user, max_tokens=400, temperature=0.8, tries=5, model=None):
         err = (d.get("error") or {}) if isinstance(d, dict) else {}
         code = err.get("code") or (err.get("metadata") or {}).get("provider_error_code")
         LAST_ERR = str(err.get("message") or d)[:180]
+        if info is not None:
+            info["code"] = str(code or "")
         if str(code) in ("429", "500", "502", "503") and i < tries - 1:
             time.sleep(delay); delay *= 2; continue
         return None
