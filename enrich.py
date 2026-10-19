@@ -1,0 +1,234 @@
+"""
+Обогащение: ищем в чатах людей, которые хотят квартиру, и копим о них заметки.
+
+Общие файлы и замки для трёх задач:
+  enrich-find.py     — ключевики по теме (LLM) и поиск чатов по ним;
+  enrich-read.py     — читатель: вступил, выкачал 90 дней, вышел;
+  enrich-analyze.py  — разбор по авторам моделью, лиды в leads.json.
+
+Файлы (папка профиля):
+  enrich/chats.json      очередь чатов и галочки: ключ -> запись (см. add_chats)
+  enrich/raw/<id>.jsonl  сырые сообщения чата, живут до конца разбора
+  enrich/progress/<id>.json  какие авторы уже разобраны (перезапуск не начинает заново)
+  enrich/keywords.json   тема и ключевики для поиска чатов
+  enrich/state.json      включён ли сбор и цель разбора (пишет панель)
+  enrich/joins.json      кто когда вступал — дневной предел вступлений
+  leads.json             лиды: uid -> карточка с заметкой
+
+Чат в очереди проходит статусы:
+  new -> reading -> downloaded -> analyzing -> done
+  и в сторону: skipped (нечего читать, дубль) и error (не открылся).
+Один чат берёт ровно один читатель: выбор идёт под замком файла, поэтому два
+аккаунта никогда не читают и не разбирают одно и то же.
+"""
+import json
+from datetime import datetime, timedelta, timezone
+
+import tglib
+from chatlib import chat_ref, locked
+
+ROOT = tglib.DIR / "enrich"
+CHATS = ROOT / "chats.json"
+RAW = ROOT / "raw"
+PROGRESS = ROOT / "progress"
+KEYWORDS = ROOT / "keywords.json"
+STATE = ROOT / "state.json"
+JOINS = ROOT / "joins.json"
+LEADS = tglib.DIR / "leads.json"
+
+DAYS = 90                    # столько истории читаем
+STALE_READING = 3 * 3600     # читатель пропал дольше — чат возвращается в очередь
+GOAL_DEFAULT = ("хочет купить квартиру или другое жильё (новостройку, вторичку, "
+                "дом), в том числе в ипотеку")
+
+
+def now_iso():
+    return tglib.now_iso()
+
+
+def _parse(s):
+    try:
+        return datetime.fromisoformat(str(s).replace("Z", "+00:00"))
+    except Exception:
+        return None
+
+
+def read_json(path, default):
+    try:
+        data = json.loads(path.read_text("utf-8"))
+        return data if isinstance(data, type(default)) else default
+    except Exception:
+        return default
+
+
+def write_json(path, data):
+    """Атомарно: панель читает эти файлы в любой момент."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    tmp.write_text(json.dumps(data, ensure_ascii=False, indent=1) + "\n", "utf-8")
+    tmp.replace(path)
+
+
+def goal():
+    """Что ищем — цель разбора; её задаёт панель, по умолчанию — покупка жилья."""
+    return str(read_json(STATE, {}).get("goal") or "").strip() or GOAL_DEFAULT
+
+
+# ------------------------------------------------------------------ чаты
+
+def ref_key(ref):
+    """Одинаковый ключ для одной ссылки в разной записи: t.me/x, @x, x."""
+    try:
+        r, invite = chat_ref(ref)
+    except SystemExit:
+        return ""
+    return f"+{invite}" if invite else str(r).lower()
+
+
+def load_chats():
+    return read_json(CHATS, {})
+
+
+def _update(fn):
+    """Прочитать-поправить-записать очередь под замком; fn правит словарь на месте."""
+    ROOT.mkdir(parents=True, exist_ok=True)
+    with locked(CHATS):
+        data = load_chats()
+        out = fn(data)
+        write_json(CHATS, data)
+        return out
+
+
+def add_chats(items, source=""):
+    """
+    Чаты в очередь. items — строки-ссылки или словари {ref, chat_id, title, n}.
+    Дубль отсекаем и по ссылке, и по chat_id: одна группа под двумя ссылками
+    второй раз в очередь не встанет. Возвращает, сколько добавлено.
+    """
+    def fn(data):
+        refs = {ref_key(v.get("ref")) for v in data.values()}
+        ids = {str(v.get("chat_id")) for v in data.values() if v.get("chat_id")}
+        added = 0
+        for it in items:
+            it = {"ref": it} if isinstance(it, str) else dict(it)
+            ref = str(it.get("ref") or "").strip()
+            k = ref_key(ref)
+            cid = str(it.get("chat_id") or "")
+            if not k or k in refs or (cid and cid in ids):
+                continue
+            refs.add(k)
+            if cid:
+                ids.add(cid)
+            data[k] = {"ref": ref, "chat_id": it.get("chat_id") or "",
+                       "title": tglib.cell(it.get("title") or ""), "n": it.get("n") or "",
+                       "status": "new", "source": source, "added": now_iso()}
+            added += 1
+        return added
+    return _update(fn)
+
+
+def pick_chat(acc_id):
+    """
+    Следующий чат этому читателю. Под замком: чат, отданный одному, другой уже
+    не увидит. Чат, у которого читатель пропал (упал процесс, ушёл сервер),
+    через STALE_READING возвращается в очередь — дочитает любой.
+    """
+    def fn(data):
+        now = datetime.now(timezone.utc)
+        for v in data.values():
+            if v.get("status") == "reading":
+                at = _parse(v.get("at"))
+                if not at or (now - at).total_seconds() > STALE_READING:
+                    v["status"] = "new"
+        # свой недочитанный — первым (файл уже начат, продолжим с места)
+        mine = [k for k, v in data.items() if v.get("status") == "new" and v.get("reader") == acc_id]
+        free = [k for k, v in data.items() if v.get("status") == "new"]
+        key = (mine or free or [None])[0]
+        if key is None:
+            return None, None
+        data[key].update(status="reading", reader=acc_id, at=now_iso())
+        return key, dict(data[key])
+    return _update(fn)
+
+
+def set_chat(key, **fields):
+    def fn(data):
+        if key in data:
+            data[key].update(fields, at=now_iso())
+    _update(fn)
+
+
+def duplicate_of(key, chat_id):
+    """Тот же chat_id уже есть под другим ключом — значит этот чат уже в работе."""
+    for k, v in load_chats().items():
+        if k != key and str(v.get("chat_id")) == str(chat_id) and v.get("status") != "skipped":
+            return k
+    return ""
+
+
+def raw_path(chat_id):
+    return RAW / f"{chat_id}.jsonl"
+
+
+def progress_path(chat_id):
+    return PROGRESS / f"{chat_id}.json"
+
+
+# ------------------------------------------------------------- вступления
+
+def joins_today(acc_id):
+    day = datetime.now(timezone.utc).date()
+    return sum(1 for at in read_json(JOINS, {}).get(acc_id, [])
+               if (_parse(at) or datetime.min.replace(tzinfo=timezone.utc)).date() == day)
+
+
+def note_join(acc_id):
+    with locked(JOINS):
+        data = read_json(JOINS, {})
+        week = datetime.now(timezone.utc) - timedelta(days=7)
+        keep = [a for a in data.get(acc_id, []) if (_parse(a) or week) > week]
+        data[acc_id] = keep + [now_iso()]
+        write_json(JOINS, data)
+
+
+# ------------------------------------------------------------------ лиды
+
+def load_leads():
+    return read_json(LEADS, {})
+
+
+def add_lead(uid, username, name, chat, msg_ids, why, note, quotes):
+    """
+    Лид в leads.json. Один человек — одна карточка, сколько бы чатов его ни
+    показали: заметка по новому чату дописывается, ссылки на сообщения копятся.
+    Заодно кладём его в очередь рассылки «по чатам» — писать ему будет
+    обычная рассылка (by=lead: писать может любой аккаунт, см. tglib.can_write).
+    """
+    with locked(LEADS):
+        data = load_leads()
+        k = str(uid)
+        lead = data.get(k) or {"uid": uid, "found_at": now_iso(), "chats": [], "note": ""}
+        lead.update(username=username or lead.get("username", ""), name=name or lead.get("name", ""),
+                    updated_at=now_iso())
+        title = chat.get("title") or chat.get("ref") or ""
+        lead["chats"] = [c for c in lead["chats"] if str(c.get("chat_id")) != str(chat.get("chat_id"))]
+        lead["chats"].append({"chat_id": chat.get("chat_id"), "ref": chat.get("ref", ""), "title": title,
+                              "msg_ids": list(msg_ids)[-20:], "why": why, "quotes": quotes[:5],
+                              "at": now_iso()})
+        block = f"### {title}\n{note.strip()}"
+        if block not in lead["note"]:
+            lead["note"] = (lead["note"].rstrip() + "\n\n" + block).strip()
+        data[k] = lead
+        write_json(LEADS, data)
+    tglib.add_recipients([{"username": username, "user_id": uid, "name": name}], by="lead")
+
+
+def lead_refs():
+    """Ключ получателя -> лид: по нему писатель найдёт человека без @username."""
+    out = {}
+    for lead in load_leads().values():
+        k = tglib.member_key(lead.get("username"), lead.get("uid"))
+        if k:
+            out[k] = lead
+            out[f"id:{lead.get('uid')}"] = lead
+    return out
