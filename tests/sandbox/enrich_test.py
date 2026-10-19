@@ -88,6 +88,15 @@ class Msg:
 MSGS = [Msg(i + 1, uid, text, days) for i, (uid, text, days, _) in enumerate(SCRIPT)]
 GROUP = types.Channel(id=CHAT_ID, title="ЖК Академ — соседи", photo=types.ChatPhotoEmpty(),
                       date=NOW, megagroup=True, username="akadem_sosedi", left=True, access_hash=5)
+# канал застройщика, чья группа обсуждения — та же GROUP: лиды «из комментариев»
+CHANNEL = types.Channel(id=888, title="Академ — новости", photo=types.ChatPhotoEmpty(),
+                        date=NOW, broadcast=True, username="akadem_news", left=True, access_hash=6)
+
+
+class Full:
+    def __init__(self):
+        self.full_chat = type("F", (), {"linked_chat_id": CHAT_ID})()
+        self.chats = [CHANNEL, GROUP]
 
 
 class Client:
@@ -99,6 +108,8 @@ class Client:
     async def get_entity(self, ref):
         if ref in ("akadem_sosedi", CHAT_ID):
             return GROUP
+        if ref == "akadem_news":
+            return CHANNEL
         raise ValueError(f"Could not find the input entity for {ref}")
 
     async def get_input_entity(self, ent):
@@ -113,6 +124,8 @@ class Client:
 
     async def __call__(self, req):
         self.calls.append(type(req).__name__)
+        if isinstance(req, functions.channels.GetFullChannelRequest):
+            return Full()
         if isinstance(req, functions.users.GetUsersRequest):
             iu = req.id[0]
             assert isinstance(iu, types.InputUserFromMessage)
@@ -184,6 +197,17 @@ def main():
     n = enrich.add_chats(["t.me/akadem_sosedi", "@AKADEM_SOSEDI", "t.me/+Invite123"])
     check(n == 2, f"дубль по ссылке отсечён (добавлено {n} из 3)")
 
+    print("\n▸ читатель: сбой подключения")
+    real_connect = tglib.connect
+
+    async def broken(acc, **kw):
+        raise SystemExit("выход прокси не из Казахстана")
+    tglib.connect = broken
+    run_script("enrich-read.py", "--account", "r1")
+    tglib.connect = real_connect
+    ch = enrich.load_chats()["akadem_sosedi"]
+    check(ch["status"] == "new" and ch["reader"] == "r1", f"не подключился — чат вернулся в очередь: {ch['status']}")
+
     print("\n▸ читатель")
     c = Client()
     out = run_script("enrich-read.py", "--account", "r1", client=c)
@@ -199,7 +223,21 @@ def main():
     # второй читатель возьмёт уже другой чат — не тот же
     k2, ch2 = enrich.pick_chat("r2")
     check(k2 == "+Invite123", f"второй читатель получил другой чат: {k2}")
-    enrich.set_chat(k2, status="new", reader="")
+    # процесс r2 «умер»: панель возвращает его чат в очередь
+    res = subprocess.run([sys.executable, str(REPO / "enrich.py"), "release", k2, "r2"],
+                         capture_output=True, text=True, env={**os.environ})
+    check(enrich.load_chats()[k2]["status"] == "new" and '"n": 1' in res.stdout, "осиротевший чат вернулся в очередь")
+
+    print("\n▸ разбор: модель не ответила по автору")
+
+    def flaky(system, user, **kw):
+        return None if "(Оля)" in user.split("►", 1)[-1].split("\n", 1)[0] else fake_llm(system, user)
+    llm.chat = flaky
+    run_script("enrich-analyze.py")
+    ch = enrich.load_chats()["akadem_sosedi"]
+    check(ch["status"] == "downloaded" and ch.get("tries") == 1, f"чат ждёт повтора: {ch['status']}, tries {ch.get('tries')}")
+    check(enrich.raw_path(CHAT_ID).exists(), "сырые сообщения не удалены, пока не разобраны все")
+    check("4" not in enrich.load_leads(), "Оля ещё не разобрана")
 
     print("\n▸ разбор по авторам")
     llm.chat = fake_llm
@@ -221,6 +259,19 @@ def main():
     out = run_script("enrich-analyze.py")
     check(any("разбирать нечего" in o for o in out), "повторный разбор не трогает готовый чат")
 
+    print("\n▸ один человек — один ключ в очереди")
+    enrich.add_lead(4, "olya_new", "Оля", {"chat_id": 999, "ref": "t.me/other", "title": "Другой чат"},
+                    [5], "ещё ищет", "- снова про ипотеку", [])
+    keys2 = [r["phone"] for r in tglib.read_csv(tglib.CHAT_RESULTS)]
+    check("@olya_new" not in keys2 and keys2.count("id:4") == 1, "появился ник — второго ключа нет")
+    check(enrich.load_leads()["4"]["key"] == "id:4" and "id:4" in tglib.lead_refs(), "карточка помнит ключ очереди")
+    tglib.add_recipients([{"username": "", "user_id": 77, "name": "Сборщиков"}], by="a1")
+    enrich.add_lead(77, "", "Сборщиков", {"chat_id": CHAT_ID, "ref": "t.me/akadem_sosedi", "title": "ЖК"},
+                    [5], "ищет", "-", [])
+    row77 = next(r for r in tglib.read_csv(tglib.CHAT_RESULTS) if r["phone"] == "id:77")
+    check(not tglib.can_write(row77, "w9") and tglib.can_write(row77, "a1"),
+          "человека, собранного разбором участников, пишет его сборщик")
+
     print("\n▸ писатель и лид без @username")
     row = next(r for r in rows if r["phone"] == "id:4")
     check(tglib.can_write(row, "w9"), "лида без ника может взять любой писатель")
@@ -232,6 +283,12 @@ def main():
     user = asyncio.run(ns["find_member"](c2, "id:4", {"id": "w9", "title": "писатель"}))
     check(getattr(user, "id", None) == 4, "писатель нашёл лида через сообщение в чате")
     check("GetUsersRequest" in c2.calls, "профиль взят через InputUserFromMessage")
+    olya_msg = next(m.id for m in MSGS if m.sender_id == 4)
+    lead_ch = {"uid": 4, "chats": [{"chat_id": CHAT_ID, "ref": "@akadem_news", "msg_ids": [olya_msg]}]}
+    c3 = Client()
+    user = asyncio.run(ns["via_message"](c3, lead_ch, {"id": "w9", "title": "писатель"}))
+    check(getattr(user, "id", None) == 4 and "GetFullChannelRequest" in c3.calls,
+          "лид из комментариев канала — найден в группе обсуждения")
 
     print("\n▸ поиск чатов: ключевики")
     llm.chat = lambda *a, **k: 'Вот список: ["ЖК Академ", "ипотека екб", "ЖК Академ", "новостройки екб"]'

@@ -22,7 +22,7 @@ const TICK = 15_000;
 const IN_WORK = ['reading', 'downloaded', 'analyzing'];
 
 export function makeEnrich({ DIR, CODE, accounts, running, launch, pythonCmd, push, note,
-                             busy, proxyDown, readRaw }) {
+                             busy, proxyDown, readRaw, resting = () => false, slots = () => Infinity }) {
   const ROOT = path.join(DIR, 'enrich');
   const STATE = path.join(ROOT, 'state.json');
   const read = (f, d) => { try { return JSON.parse(fs.readFileSync(f, 'utf8')) ?? d; } catch { return d; } };
@@ -31,14 +31,16 @@ export function makeEnrich({ DIR, CODE, accounts, running, launch, pythonCmd, pu
   const st = { on: false, finding: false, goal: '', topic: '', ...read(STATE, {}) };
   const save = () => {
     fs.mkdirSync(ROOT, { recursive: true });
-    fs.writeFileSync(STATE + '.tmp', JSON.stringify(st, null, 1) + '\n');
-    fs.renameSync(STATE + '.tmp', STATE);
+    const tmp = `${STATE}.${process.pid}.tmp`;
+    fs.writeFileSync(tmp, JSON.stringify(st, null, 1) + '\n');
+    fs.renameSync(tmp, STATE);
   };
 
   const per = new Map();          // id читателя -> { nextAt, note }
   let analyzer = null;            // { child, key, title, since }
   let analyzeHold = 0;            // модель не отвечала — разбор ждёт до этого времени
   let kwJob = null;               // идёт подбор ключевиков моделью
+  let releasing = false;          // панель возвращает в очередь чаты упавших читателей
 
   const chats = () => read(path.join(ROOT, 'chats.json'), {});
   const keywords = () => read(path.join(ROOT, 'keywords.json'), {});
@@ -47,7 +49,9 @@ export function makeEnrich({ DIR, CODE, accounts, running, launch, pythonCmd, pu
   /** Лиды по ключу получателя (@ник и id:<id>) — тот же расклад, что в enrich.lead_refs. */
   let leadsCache = { mtime: -1, list: [], keys: new Set() };
   function leads() {
-    const f = path.join(DIR, 'leads.json');
+    // свой файл в enrich/: в корне бывает leads.json убранного поиска горячих
+    // лидов — те же id, другая форма записей
+    const f = path.join(ROOT, 'leads.json');
     let mtime = 0;
     try { mtime = fs.statSync(f).mtimeMs; } catch { return leadsCache = { mtime: 0, list: [], keys: new Set() }; }
     if (mtime !== leadsCache.mtime) {
@@ -88,14 +92,18 @@ export function makeEnrich({ DIR, CODE, accounts, running, launch, pythonCmd, pu
   function readers() {
     return accounts.list().filter((a) => a.role === 'read' && !a.reserve && !a.retired
       && accounts.hasSession(a) && accounts.isAuthed(a)
-      && !accounts.fullRestLeft(a) && a.spamKind !== 'frozen' && a.spamKind !== 'perm');
+      && !accounts.fullRestLeft(a) && a.spamKind !== 'frozen' && a.spamKind !== 'perm'
+      // первые сутки свежий аккаунт не трогаем вовсе — как и в остальной панели
+      && !resting(a));
   }
   function freeReaders() {
     const now = Date.now();
     const busyProxy = new Set([...running.keys()].map((id) =>
       accounts.list().find((a) => a.id === id)?.proxy || 'direct'));
     const out = [];
+    let room = slots();          // общий потолок задач панели (TG_MAX_PARALLEL)
     for (const a of readers()) {
+      if (room <= 0) break;
       if (running.has(a.id) || busy(a.id) || proxyDown(a.proxy)) continue;
       if ((per.get(a.id)?.nextAt || 0) > now) continue;
       // один аккаунт на адрес за раз — как в разборе чатов (parseCrew)
@@ -103,6 +111,7 @@ export function makeEnrich({ DIR, CODE, accounts, running, launch, pythonCmd, pu
       if (busyProxy.has(k)) continue;
       busyProxy.add(k);
       out.push(a);
+      room--;
     }
     return out;
   }
@@ -173,18 +182,28 @@ export function makeEnrich({ DIR, CODE, accounts, running, launch, pythonCmd, pu
       }
     }
 
-    // чтение: не больше «читатели + 1» чатов в работе — остальные ждут разбора
+    // чтение: не больше «читатели + 1» чатов в работе — остальные ждут разбора.
+    // «Читается» без живого процесса читателя не в счёт: упавший заход не
+    // должен держать место (сам чат вернётся в очередь при следующем заходе)
     if (!st.on) return;
     let fresh = count('new');
-    let inWork = all.filter((v) => IN_WORK.includes(v.status)).length;
+    const live = (v) => (v.status === 'reading' ? running.has(v.reader) : IN_WORK.includes(v.status));
+    let inWork = all.filter(live).length;
+    const orphans = Object.entries(chats()).filter(([, v]) => v.status === 'reading' && !running.has(v.reader));
+    if (orphans.length && !releasing) {
+      releasing = true;
+      py(['enrich.py', 'release', ...orphans.flatMap(([k, v]) => [k, v.reader || ''])])
+        .finally(() => { releasing = false; });
+    }
     const cap = readers().length + 1;
     for (const a of free) {
       if (!fresh || inWork >= cap) break;
       const r = launch('enrichRead', { account: a.id }, after(a.id, 'чтение'));
       if (r.ok) { fresh--; inWork++; }
     }
-    // очередь пуста и всё разобрано — выключаемся сами, чтобы не крутиться вхолостую
-    if (!fresh && !all.some((v) => IN_WORK.includes(v.status)) && !st.finding && !analyzer) {
+    // очередь пуста и всё разобрано — выключаемся сами, чтобы не крутиться вхолостую.
+    // inWork — уже после раздачи этого захода: последний чат только что ушёл читателю
+    if (!fresh && !inWork && !orphans.length && !st.finding && !analyzer) {
       st.on = false; save();
       note('✅', 'сбор лидов: все чаты из очереди разобраны');
     }
@@ -233,7 +252,7 @@ export function makeEnrich({ DIR, CODE, accounts, running, launch, pythonCmd, pu
         const p = per.get(a.id) || {};
         return { id: a.id, name: a.name || a.title, title: a.title,
                  busy: running.get(a.id)?.title || '',
-                 ready: readers().some((x) => x.id === a.id),
+                 ready: readers().some((x) => x.id === a.id), resting: !!resting(a),
                  rest: p.nextAt > now ? Math.round((p.nextAt - now) / 60_000) : 0, note: p.note || '' };
       }),
       leads: L.slice(0, 500), leadsTotal: L.length,
@@ -254,10 +273,19 @@ export function makeEnrich({ DIR, CODE, accounts, running, launch, pythonCmd, pu
 
   /* ───────── действия кнопок ───────── */
 
+  /** Остановить всё обогащение: общая кнопка «Остановить», полная чистка. */
+  function stop(why) {
+    const was = st.on || st.finding;
+    st.on = false; st.finding = false; save();
+    if (analyzer) { try { analyzer.child.kill('SIGTERM'); } catch {} }
+    if (was) note('⏸', `сбор лидов и поиск чатов остановлены${why ? ' — ' + why : ''}`);
+  }
+
+  const NO_READERS = 'нет готовых читателей: отметь их в шаге 1 на этой вкладке ' +
+    '(вошедшие аккаунты, свежим нужны сутки отлёжки)';
+
   function setOn(on) {
-    if (on && !readers().length) {
-      return { ok: false, reason: 'нет читателей: на вкладке «Аккаунты» переведи хотя бы один вошедший аккаунт в роль «читатель»' };
-    }
+    if (on && !readers().length) return { ok: false, reason: NO_READERS };
     if (on && !Object.values(chats()).some((v) => ['new', ...IN_WORK].includes(v.status))) {
       return { ok: false, reason: 'очередь чатов пуста — добавь ссылки или найди чаты по ключевикам' };
     }
@@ -322,17 +350,18 @@ export function makeEnrich({ DIR, CODE, accounts, running, launch, pythonCmd, pu
     }
     fs.mkdirSync(ROOT, { recursive: true });
     const f = path.join(ROOT, 'keywords.json');
-    fs.writeFileSync(f + '.tmp', JSON.stringify({ ...old, topic: old.topic || st.topic, items }, null, 1) + '\n');
-    fs.renameSync(f + '.tmp', f);
+    // своё имя временного файла: тот же файл в это время может писать enrich-find
+    const tmp = `${f}.${process.pid}.tmp`;
+    fs.writeFileSync(tmp, JSON.stringify({ ...old, topic: old.topic || st.topic, items }, null, 1) + '\n');
+    fs.renameSync(tmp, f);
     return { ok: true, total: items.length, left: items.filter((i) => !i.done).length };
   }
 
   function find(on) {
     if (!on) { st.finding = false; save(); return { ok: true }; }
     if (!kwLeft()) return { ok: false, reason: 'непройденных ключевиков нет — сначала подбери ключевики по теме' };
-    if (!readers().length) {
-      return { ok: false, reason: 'нет читателей: искать чаты будет аккаунт в роли «читатель» (вкладка «Аккаунты»)' };
-    }
+    if (kwJob) return { ok: false, reason: 'ключевики ещё подбираются — подожди' };
+    if (!readers().length) return { ok: false, reason: NO_READERS };
     st.finding = true; save();
     note('🔎', `поиск чатов по ключевикам: осталось ${kwLeft()}`);
     setTimeout(tick, 500);
@@ -340,5 +369,6 @@ export function makeEnrich({ DIR, CODE, accounts, running, launch, pythonCmd, pu
   }
 
   // tick — наружу только для песочницы (tests/sandbox/enrich_sched_test.mjs)
-  return { view, leadsCsv, leadKeys, setOn, setGoal, addChats, chatsCmd, makeKeywords, saveKeywords, find, tick };
+  return { view, leadsCsv, leadKeys, setOn, setGoal, addChats, chatsCmd, makeKeywords, saveKeywords, find, tick, stop,
+           status: () => ({ on: st.on, finding: st.finding }) };
 }

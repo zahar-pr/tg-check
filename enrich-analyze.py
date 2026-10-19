@@ -84,16 +84,32 @@ def windows(pos, total):
 
 
 def chunks(msgs, spans, me):
-    """Отрезки -> тексты для модели не длиннее CHUNK; разрыв между отрезками — «…»."""
-    parts, cur = [], []
-    size = 0
+    """
+    Отрезки -> тексты для модели не длиннее CHUNK; разрыв между отрезками — «…».
+    Автор, который пишет часто, сливает окна в один длинный отрезок — его режем
+    по строкам, а не обрезаем: иначе свежие реплики самых активных людей до
+    модели не доходили бы вовсе. Кусок без единой реплики автора не нужен.
+    """
+    blocks = []
     for a, b in spans:
-        block = [line(m, me) for m in msgs[a:b + 1]]
-        text = "\n".join(block)
+        cur, size = [], 0
+        for m in msgs[a:b + 1]:
+            ln = line(m, me)
+            if cur and size + len(ln) + 1 > CHUNK:
+                blocks.append(cur)
+                cur, size = cur[-AROUND:], sum(len(x) + 1 for x in cur[-AROUND:])  # контекст на стыке
+            cur.append(ln)
+            size += len(ln) + 1
+        if cur:
+            blocks.append(cur)
+    blocks = [bl for bl in blocks if any(x.startswith("►") for x in bl)]
+    parts, cur, size = [], [], 0
+    for bl in blocks:
+        text = "\n".join(bl)
         if cur and size + len(text) > CHUNK:
             parts.append("\n…\n".join(cur))
             cur, size = [], 0
-        cur.append(text[:CHUNK * 2])
+        cur.append(text)
         size += len(text)
     if cur:
         parts.append("\n…\n".join(cur))
@@ -216,6 +232,7 @@ def main():
         say(f"продолжаю: уже разобрано {len(progress)}, осталось {len(todo)}")
 
     lock = threading.Lock()
+    failed = []
     stats = {"done": 0, "leads": sum(1 for v in progress.values() if v), "fails": 0, "stop": False}
 
     def one(uid):
@@ -224,6 +241,7 @@ def main():
         v = judge(system, msgs, uid)
         with lock:
             if v is None:
+                failed.append(uid)
                 stats["fails"] += 1
                 if stats["fails"] >= FAILS_STOP:
                     stats["stop"] = True
@@ -238,8 +256,10 @@ def main():
                 if dry:
                     say("    " + v["note"].replace("\n", "\n    "))
                 else:
+                    # read_ref — где сообщения лежат на самом деле (у канала — обсуждение)
                     enrich.add_lead(uid, a.get("un", ""), a.get("name", ""),
-                                    {"chat_id": ch.get("chat_id"), "ref": ch.get("ref", ""), "title": title},
+                                    {"chat_id": ch.get("chat_id"), "ref": ch.get("read_ref") or ch.get("ref", ""),
+                                     "title": title},
                                     v["msg_ids"], v["why"], v["note"], v["quotes"])
             if not dry:
                 progress[str(uid)] = bool(v["lead"])
@@ -250,13 +270,19 @@ def main():
     with ThreadPoolExecutor(max_workers=workers) as pool:
         list(pool.map(one, todo))
 
-    if stats["stop"]:
-        say(f"\nстоп: модель не отвечает ({llm.LAST_ERR or 'пустой ответ'}) — чат подождёт, "
-            "разбор продолжится с этого места")
+    # Модель не дала вердикта по части авторов — сырьё не удаляем: следующий
+    # заход разберёт только их (прогресс по остальным сохранён). После
+    # нескольких заходов сдаёмся, чтобы один «трудный» автор не держал очередь
+    tries = int(ch.get("tries") or 0) + 1
+    if stats["stop"] or (failed and tries < 3):
+        say(f"\nстоп: не разобрано авторов {len(todo) - stats['done']} "
+            f"({llm.LAST_ERR or 'модель не дала вердикта'}) — чат подождёт, разбор продолжится с этого места")
         if not dry and not sample:
-            enrich.set_chat(key, status="downloaded", err=f"модель: {llm.LAST_ERR[:100]}")
+            enrich.set_chat(key, status="downloaded", tries=tries,
+                            err=f"модель: {(llm.LAST_ERR or 'нет вердикта')[:100]}")
         tglib.state(done=stats["done"], left=len(todo) - stats["done"], stop="errors", cooldown=15 * 60)
         return
+    gave_up = f"модель не разобрала авторов: {len(failed)}" if failed else ""
 
     say(f"\nитого: авторов {len(authors)} · лидов {stats['leads']}")
     if not dry and not sample:
@@ -264,7 +290,7 @@ def main():
         path.unlink(missing_ok=True)
         prog_file.unlink(missing_ok=True)
         enrich.set_chat(key, status="done", done_at=enrich.now_iso(), msgs=len(msgs),
-                        authors=len(authors), leads=stats["leads"], err="")
+                        authors=len(authors), leads=stats["leads"], err=gave_up)
     left = sum(1 for v in enrich.load_chats().values() if v.get("status") in ("downloaded", "analyzing"))
     tglib.state(done=stats["leads"], left=left)
 

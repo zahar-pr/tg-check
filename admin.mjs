@@ -545,7 +545,7 @@ function wipeAll() {
   for (const f of ['numbers.csv', 'base.json', 'results.csv', 'drafts.csv', 'members.csv',
                    'chats.json', 'warmup.csv', 'warmup.json', 'followup.csv', 'mirror.json',
                    'accounts.json', 'sessions', 'uploads', 'voice.ogg', 'voice.json', 'replies.json',
-                   'chats', 'base-set.json']) {
+                   'chats', 'base-set.json', 'enrich']) {
     if (move(f)) saved++;
   }
   for (const f of ['tg-profile', 'accounts', 'qr', 'claims.json', 'desktop']) wipe(f);
@@ -612,6 +612,8 @@ const enrich = makeEnrich({
   note: (icon, text) => events.note(icon, text),
   busy: (id) => accessBusy.has(id),
   proxyDown: (proxy) => proxyGuard.down(proxy),
+  resting: (a) => warm(a).resting,                           // первые сутки — отлёжка
+  slots: () => MAX_RUNNING - running.size,                   // общий потолок задач
 });
 
 
@@ -1416,7 +1418,7 @@ function work(set = baseSet) {
   for (const r of free) {
     // лид обогащения без @username — общий: любой писатель найдёт его через
     // сохранённое сообщение в чате (draft-messages.find_member)
-    const solo = String(r.phone).startsWith('id:') && !leadKeys.has(r.phone);
+    const solo = String(r.phone).startsWith('id:') && !(r.by === 'lead' && leadKeys.has(r.phone));
     if (solo || r.kept === '1') own[r.by] = (own[r.by] || 0) + 1;
     else shared++;
   }
@@ -3805,6 +3807,7 @@ async function handler(req, res) {
        */
       if (auto.on) autoStop('идёт полная чистка');
       if (warmup.on) warmStop('идёт полная чистка');
+      enrich.stop('идёт полная чистка');
       if (mirror.on) mirrorStop();
       // отвязать все субдомены проекта (режим api) — чтобы кабинет Vercel
       // не копил мусор; в wildcard отвязывать нечего
@@ -3862,6 +3865,7 @@ async function handler(req, res) {
         proxy: proxyGuard.summary(),
         auto: autoView(),
         warmup: warmup.on,
+        enrich: enrich.status(),
         mirror: mirror.on,
         logLen: log.length,
         // чей это профиль — панель за привратником показывает его в углу
@@ -4354,7 +4358,7 @@ async function handler(req, res) {
       const { account } = await body(req);
       // «Остановить» без уточнения — значит всё: не выключив автопрогон,
       // мы бы убили процессы, а он через секунду запустил бы их снова
-      if (!account) autoStop('остановлено вручную');
+      if (!account) { autoStop('остановлено вручную'); enrich.stop('остановлено вручную'); }
       else if (auto.on && auto.per.has(account)) {
         auto.per.get(account).stopped = true;
         auto.per.get(account).note = 'снят вручную';

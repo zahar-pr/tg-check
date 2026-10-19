@@ -1412,8 +1412,10 @@ def can_write(row, acc_id) -> bool:
         return True
     # лид обогащения: у него сохранено сообщение в чате (chat_id + msg_id).
     # Любой писатель откроет это сообщение и получит СВОЙ доступ к человеку
-    # (draft-messages.find_member), поэтому лид без @username — общий
-    return key in lead_refs()
+    # (draft-messages.find_member), поэтому лид без @username — общий. Но только
+    # строка, которую положил сам разбор (by=lead): человека, собранного раньше
+    # parse-chat, по-прежнему пишет его сборщик — у того доступ уже есть
+    return row.get("by", "") == "lead" and key in lead_refs()
 
 
 _LEADS_CACHE = {"mtime": None, "refs": {}}
@@ -1421,7 +1423,7 @@ _LEADS_CACHE = {"mtime": None, "refs": {}}
 
 def lead_refs():
     """Ключ получателя -> карточка лида (leads.json); перечитываем при правке файла."""
-    f = DIR / "leads.json"
+    f = DIR / "enrich" / "leads.json"
     try:
         mtime = f.stat().st_mtime
     except OSError:

@@ -39,6 +39,7 @@ const accs = [
   { id: 'r2', title: 'r2', role: 'read', proxy: 'A' },     // тот же адрес, что у r1
   { id: 'r3', title: 'r3', role: 'read', proxy: 'B' },
   { id: 'w1', title: 'w1', role: 'send', proxy: 'C' },
+  { id: 'r4', title: 'r4', role: 'read', proxy: 'D', fresh: true },   // первые сутки — отлёжка
 ];
 const accounts = { list: () => accs, hasSession: () => true, isAuthed: () => true, fullRestLeft: () => 0 };
 const running = new Map();
@@ -59,7 +60,9 @@ const en = makeEnrich({
     return { ok: true };
   },
   note: (i, t) => notes.push(t), busy: () => false, proxyDown: () => false,
+  resting: (a) => !!a.fresh, slots: () => slots,
 });
+let slots = 6;
 const finish = (id, code, st) => { running.delete(id); done.get(id)?.(code, st); };
 
 console.log('\n▸ включение');
@@ -74,13 +77,18 @@ en.tick();
 const who = launched.map((x) => x[1]).sort();
 check(JSON.stringify(who) === '["r1","r3"]', `по одному на прокси: ${who}`);
 check(!launched.some((x) => x[1] === 'w1'), 'писатель не читает');
+check(!launched.some((x) => x[1] === 'r4'), 'свежий читатель на отлёжке не читает');
 
 console.log('\n▸ предел «читатели + 1»');
 launched.length = 0;
 finish('r1', 0, { done: 1 });
 finish('r3', 0, { done: 1 });
-writeChats(chatsOf([['c1', 'reading'], ['c2', 'reading'], ['c3', 'downloaded'], ['c4', 'downloaded'], ['c5', 'new']]));
+const inWorkChats = chatsOf([['c1', 'reading'], ['c2', 'reading'], ['c3', 'downloaded'], ['c4', 'downloaded'], ['c5', 'new']]);
+inWorkChats.c1.reader = 'x1'; inWorkChats.c2.reader = 'x2';      // их читатели живы (идут процессы)
+writeChats(inWorkChats);
 running.clear();
+running.set('x1', { title: 'Чтение чата — x1' });
+running.set('x2', { title: 'Чтение чата — x2' });
 // отдых после захода (20–60 с) снимаем, чтобы проверить именно предел
 for (const id of ['r1', 'r3']) finish(id, 0, { cooldown: 0.001 });
 await sleep(20);
@@ -90,6 +98,7 @@ await sleep(300);
 check(pushes.some((l) => l.includes('▶ Разбор лидов')) && pushes.some((l) => l.includes('[лиды] разбираю')),
   'на выкачанный чат позван разбор, его вывод — в журнале');
 
+running.delete('x1'); running.delete('x2');
 console.log('\n▸ флуд-пауза');
 writeChats(chatsOf([['c1', 'new'], ['c2', 'new']]));
 launched.length = 0;
@@ -101,7 +110,7 @@ check(r1.rest >= 9 && !launched.some((x) => x[1] === 'r1'), `r1 отдыхает
 check(launched.some((x) => x[1] === 'r2') || launched.some((x) => x[1] === 'r3'), 'вместо него позван другой читатель');
 
 console.log('\n▸ лиды');
-fs.writeFileSync(path.join(DIR, 'leads.json'), JSON.stringify({
+fs.writeFileSync(path.join(DIR, 'enrich', 'leads.json'), JSON.stringify({
   1: { uid: 1, username: 'chmo', name: 'Иван', chats: [{ title: 'ЖК', why: 'берёт новостройку' }], note: 'ипотека', found_at: '2026-10-19' },
   4: { uid: 4, username: '', name: 'Оля', chats: [{ title: 'ЖК', why: 'да на вопрос' }], note: '', found_at: '2026-10-18' },
 }));
@@ -113,12 +122,40 @@ check(L.find((l) => l.key === '@chmo')?.status === 'написали', 'стат
 check(L.find((l) => l.key === 'id:4')?.status === 'в очереди', 'лид без ника — «в очереди»');
 check(en.leadsCsv().includes('берёт новостройку'), 'CSV с причиной');
 
+console.log('\n▸ потолок задач и осиротевший чат');
+slots = 0;
+launched.length = 0;
+writeChats(chatsOf([['c1', 'new']]));
+running.clear();
+for (const id of ['r1', 'r2', 'r3']) finish(id, 0, { cooldown: 0.001 });
+await sleep(20);
+en.tick();
+check(!launched.length, 'общий потолок задач выбран — читателей не зовём');
+slots = 6;
+writeChats({ c9: { ref: 'c9', status: 'reading', reader: 'r2', chat_id: 9 } });
+en.tick();
+await sleep(1500);
+const c9 = JSON.parse(fs.readFileSync(path.join(DIR, 'enrich', 'chats.json'), 'utf8')).c9;
+check(c9.status === 'new', `«читается» без живого читателя вернулся в очередь: ${c9.status}`);
+
 console.log('\n▸ авто-выключение');
 writeChats(chatsOf([['c1', 'done'], ['c2', 'error']]));
 running.clear();
 await sleep(600);       // разбор-заглушка мог ещё идти
 en.tick();
 check(!en.view().on, 'очередь пуста и всё разобрано — сбор выключился сам');
+
+console.log('\n▸ последний чат не теряется');
+writeChats(chatsOf([['c1', 'new']]));
+en.setOn(true);
+launched.length = 0;
+for (const id of ['r1', 'r2', 'r3']) finish(id, 0, { cooldown: 0.001 });
+running.clear();
+await sleep(20);
+en.tick();
+check(launched.length === 1 && en.view().on, 'отдал последний чат — сбор не выключился в тот же миг');
+en.stop('проверка');
+check(!en.view().on && !en.view().finding, 'общая остановка гасит сбор и поиск');
 
 console.log(`\n${fails ? 'ПРОВАЛЕНО: ' + fails : 'ВСЁ ХОРОШО'}`);
 fs.rmSync(DIR, { recursive: true, force: true });

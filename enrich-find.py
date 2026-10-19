@@ -85,7 +85,9 @@ def make_keywords(topic):
 
 
 def fit(topic, cands):
-    """Модель отсеивает чужие темы по названию. Не ответила — берём всех."""
+    """Модель отсеивает чужие темы по названию. None — модель не ответила:
+    ключевик тогда не считаем пройденным, повторим позже (а не сваливаем в
+    очередь всё подряд — каждый лишний чат стоит читателю вступления)."""
     if not cands:
         return []
     items = "\n".join(f"{i}. {c['title']} ({'канал' if c['kind'] == 'channel' else 'группа'})"
@@ -95,9 +97,25 @@ def fit(topic, cands):
                    max_tokens=400, temperature=0)
     nums = last_json(out, int)
     if nums is None:
-        say(f"  модель не оценила темы ({llm.LAST_ERR or 'непонятный ответ'}) — беру всех")
-        return cands
+        say(f"  модель не оценила темы ({llm.LAST_ERR or 'непонятный ответ'}) — этот ключевик повторю позже")
+        return None
     return [cands[i] for i in nums if 0 <= i < len(cands)]
+
+
+def mark_done(q, found, at0):
+    """
+    Отметить ключевик пройденным в СВЕЖЕМ файле: пока шёл поиск, список могли
+    поправить в панели — свою старую копию поверх не пишем. Подобрали
+    ключевики заново (другое «at») — этот заход больше не нужен: False.
+    """
+    cur = enrich.read_json(enrich.KEYWORDS, {})
+    if cur.get("at") != at0:
+        return False
+    for it in cur.get("items", []):
+        if str(it.get("q", "")).lower() == q.lower():
+            it.update(done=True, found=found)
+    enrich.write_json(enrich.KEYWORDS, cur)
+    return True
 
 
 async def search(acc, per_run, dry):
@@ -106,6 +124,7 @@ async def search(acc, per_run, dry):
     from telethon.tl.types import Channel
 
     kw = enrich.read_json(enrich.KEYWORDS, {})
+    at0 = kw.get("at")
     topic = kw.get("topic") or ""
     todo = [i for i in kw.get("items", []) if not i.get("done")]
     if not todo:
@@ -117,8 +136,13 @@ async def search(acc, per_run, dry):
     client = await tglib.connect(acc)
     known = {str(v.get("chat_id")) for v in enrich.load_chats().values() if v.get("chat_id")}
     added = wait = 0
+    stop = ""
     try:
         for n, item in enumerate(todo[:per_run]):
+            # «Остановить поиск» в панели: заканчиваем на этом ключевике, а не через 40
+            if not dry and not enrich.read_json(enrich.STATE, {}).get("finding"):
+                say("поиск остановлен в панели")
+                break
             try:
                 res = await client(functions.contacts.SearchRequest(q=item["q"], limit=50))
             except FloodWaitError as e:
@@ -127,6 +151,13 @@ async def search(acc, per_run, dry):
                     wait = e.seconds
                     break
                 await asyncio.sleep(e.seconds)
+                continue
+            except Exception as e:
+                # запрос не понравился Telegram (слишком короткий, странные символы) —
+                # этот ключевик пропускаем, остальные ищем дальше
+                say(f"«{item['q']}»: поиск не вышел ({str(e).splitlines()[0][:80] or type(e).__name__}) — пропускаю")
+                if not dry and not mark_done(item["q"], 0, at0):
+                    break
                 continue
             cands = []
             for c in res.chats:
@@ -140,6 +171,9 @@ async def search(acc, per_run, dry):
                               "n": c.participants_count or "",
                               "kind": "channel" if c.broadcast else "group"})
             good = fit(topic, cands)
+            if good is None:
+                stop = "errors"
+                break
             for c in good:
                 known.add(str(c["chat_id"]))
             got = 0 if dry else enrich.add_chats(
@@ -148,16 +182,20 @@ async def search(acc, per_run, dry):
             say(f"«{item['q']}»: найдено {len(cands)}, по теме {len(good)}"
                 + ("" if dry else f", новых в очереди {got}")
                 + ("".join(f"\n    {c['ref']} — {c['title']}" for c in good) if dry else ""))
-            if not dry:
-                item.update(done=True, found=len(good))
-                enrich.write_json(enrich.KEYWORDS, kw)
+            if not dry and not mark_done(item["q"], len(good), at0):
+                say("ключевики подобраны заново — этот заход заканчиваю")
+                break
             if n < min(per_run, len(todo)) - 1:
                 await asyncio.sleep(random.uniform(*PAUSE))
     finally:
         await tglib.aclose(client)
-    left = sum(1 for i in kw.get("items", []) if not i.get("done"))
+    left = sum(1 for i in enrich.read_json(enrich.KEYWORDS, {}).get("items", []) if not i.get("done"))
     say(f"\nитого: в очередь добавлено чатов {added}, ключевиков осталось {left}")
-    tglib.state(done=added, left=left, stop="flood" if wait else "", cooldown=wait)
+    if wait:
+        tglib.state(done=added, left=left, stop="flood", cooldown=wait)
+    else:
+        # модель не отвечает — не дёргаем поиск каждую минуту
+        tglib.state(done=added, left=left, stop=stop, cooldown=15 * 60 if stop else 0)
 
 
 def main():

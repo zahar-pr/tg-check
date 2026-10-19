@@ -4,7 +4,7 @@
 Общие файлы и замки для трёх задач:
   enrich-find.py     — ключевики по теме (LLM) и поиск чатов по ним;
   enrich-read.py     — читатель: вступил, выкачал 90 дней, вышел;
-  enrich-analyze.py  — разбор по авторам моделью, лиды в leads.json.
+  enrich-analyze.py  — разбор по авторам моделью, лиды в enrich/leads.json.
 
 Файлы (папка профиля):
   enrich/chats.json      очередь чатов и галочки: ключ -> запись (см. add_chats)
@@ -13,7 +13,8 @@
   enrich/keywords.json   тема и ключевики для поиска чатов
   enrich/state.json      включён ли сбор и цель разбора (пишет панель)
   enrich/joins.json      кто когда вступал — дневной предел вступлений
-  leads.json             лиды: uid -> карточка с заметкой
+  enrich/leads.json      лиды: uid -> карточка с заметкой (не путать со старым
+                         leads.json в корне — его вёл убранный поиск горячих лидов)
 
 Чат в очереди проходит статусы:
   new -> reading -> downloaded -> analyzing -> done
@@ -22,6 +23,7 @@
 аккаунта никогда не читают и не разбирают одно и то же.
 """
 import json
+import os
 from datetime import datetime, timedelta, timezone
 
 import tglib
@@ -34,7 +36,7 @@ PROGRESS = ROOT / "progress"
 KEYWORDS = ROOT / "keywords.json"
 STATE = ROOT / "state.json"
 JOINS = ROOT / "joins.json"
-LEADS = tglib.DIR / "leads.json"
+LEADS = ROOT / "leads.json"
 
 DAYS = 90                    # столько истории читаем
 STALE_READING = 3 * 3600     # читатель пропал дольше — чат возвращается в очередь
@@ -64,7 +66,9 @@ def read_json(path, default):
 def write_json(path, data):
     """Атомарно: панель читает эти файлы в любой момент."""
     path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_suffix(path.suffix + ".tmp")
+    # своё имя временного файла у каждого процесса: читатель, разбор и панель
+    # пишут одни и те же файлы, общий .tmp они делили бы между собой
+    tmp = path.with_suffix(f"{path.suffix}.{os.getpid()}.tmp")
     tmp.write_text(json.dumps(data, ensure_ascii=False, indent=1) + "\n", "utf-8")
     tmp.replace(path)
 
@@ -138,7 +142,9 @@ def pick_chat(acc_id):
         for v in data.values():
             if v.get("status") == "reading":
                 at = _parse(v.get("at"))
-                if not at or (now - at).total_seconds() > STALE_READING:
+                # свой «читается» — от прошлого захода этого же аккаунта: панель не
+                # запускает аккаунт дважды, значит тот заход умер (упал, убит)
+                if v.get("reader") == acc_id or not at or (now - at).total_seconds() > STALE_READING:
                     v["status"] = "new"
         # свой недочитанный — первым (файл уже начат, продолжим с места)
         mine = [k for k, v in data.items() if v.get("status") == "new" and v.get("reader") == acc_id]
@@ -204,10 +210,23 @@ def add_lead(uid, username, name, chat, msg_ids, why, note, quotes):
     Заодно кладём его в очередь рассылки «по чатам» — писать ему будет
     обычная рассылка (by=lead: писать может любой аккаунт, см. tglib.can_write).
     """
+    ROOT.mkdir(parents=True, exist_ok=True)
     with locked(LEADS):
         data = load_leads()
         k = str(uid)
         lead = data.get(k) or {"uid": uid, "found_at": now_iso(), "chats": [], "note": ""}
+        for f, d in (("uid", uid), ("chats", []), ("note", "")):
+            lead.setdefault(f, d)
+        # В очереди рассылки человек лежит под ОДНИМ ключом. Ник мог появиться,
+        # смениться или пропасть между чатами — второй ключ (@ник рядом с id:)
+        # дал бы ему второе письмо, а то и от двух писателей сразу
+        queued = lead.get("key")
+        if not queued:
+            have = {r.get("phone", "") for r in tglib.read_csv(tglib.CHAT_RESULTS)}
+            queued = next((a for a in (tglib.member_key(lead.get("username"), uid), f"id:{uid}",
+                                       tglib.member_key(username, uid)) if a and a in have), "")
+        new = not queued
+        lead["key"] = queued or tglib.member_key(username, uid)
         lead.update(username=username or lead.get("username", ""), name=name or lead.get("name", ""),
                     updated_at=now_iso())
         title = chat.get("title") or chat.get("ref") or ""
@@ -220,17 +239,18 @@ def add_lead(uid, username, name, chat, msg_ids, why, note, quotes):
             lead["note"] = (lead["note"].rstrip() + "\n\n" + block).strip()
         data[k] = lead
         write_json(LEADS, data)
-    tglib.add_recipients([{"username": username, "user_id": uid, "name": name}], by="lead")
+    if new:
+        tglib.add_recipients([{"username": username, "user_id": uid, "name": name}], by="lead")
 
 
 def lead_refs():
     """Ключ получателя -> лид: по нему писатель найдёт человека без @username."""
     out = {}
     for lead in load_leads().values():
-        k = tglib.member_key(lead.get("username"), lead.get("uid"))
-        if k:
-            out[k] = lead
-            out[f"id:{lead.get('uid')}"] = lead
+        for k in {lead.get("key"), tglib.member_key(lead.get("username"), lead.get("uid")),
+                  f"id:{lead.get('uid')}"}:
+            if k and k != "id:None":
+                out[k] = lead
     return out
 
 
@@ -252,7 +272,29 @@ def remove(keys):
         n = 0
         for k in keys:
             if k in data and data[k].get("status") in ("new", "error", "skipped"):
+                # недочитанное сырьё убранного чата — личные сообщения людей, хранить незачем
+                cid = data[k].get("chat_id")
+                if cid:
+                    raw_path(cid).unlink(missing_ok=True)
+                    progress_path(cid).unlink(missing_ok=True)
                 del data[k]
+                n += 1
+        return n
+    return _update(fn)
+
+
+def release(pairs):
+    """
+    «Читается», а процесса читателя нет (упал, убит, сервер перезапускали) —
+    обратно в очередь. Зовёт панель: только она знает, чьи процессы живы.
+    pairs — [(ключ чата, читатель)]; чат, который уже взял другой, не трогаем.
+    """
+    def fn(data):
+        n = 0
+        for k, reader in pairs:
+            v = data.get(k)
+            if v and v.get("status") == "reading" and v.get("reader") == reader:
+                v["status"] = "new"
                 n += 1
         return n
     return _update(fn)
@@ -264,6 +306,7 @@ if __name__ == "__main__":
     #   python enrich.py add <файл со ссылками>
     #   python enrich.py retry <ключ> [ключ…]
     #   python enrich.py remove <ключ> [ключ…]
+    #   python enrich.py release <ключ> <читатель> [ключ читатель…]
     import sys
     cmd, rest = (sys.argv[1] if len(sys.argv) > 1 else ""), sys.argv[2:]
     if cmd == "add" and rest:
@@ -274,5 +317,7 @@ if __name__ == "__main__":
         print(json.dumps({"ok": True, "n": retry(rest)}))
     elif cmd == "remove":
         print(json.dumps({"ok": True, "n": remove(rest)}))
+    elif cmd == "release":
+        print(json.dumps({"ok": True, "n": release(list(zip(rest[::2], rest[1::2])))}))
     else:
         print(json.dumps({"ok": False, "reason": "команды: add <файл> | retry <ключи> | remove <ключи>"}))

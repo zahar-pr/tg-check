@@ -466,7 +466,7 @@ function paintAccounts() {
 
   const ready = accs.filter(accReady);
   const inP = accs.filter(x => x.run === 'phones'), inC = accs.filter(x => x.run === 'chats');
-  const free = ready.filter(x => !x.run && x.role !== 'warm');
+  const free = ready.filter(x => !x.run && x.role !== 'warm' && x.role !== 'read');
   $('#acct').innerHTML = ready.length
     ? `Вошли: <b style="color:var(--ok)">${ready.map(x => esc(x.title)).join(', ')}</b>`
     : '<b style="color:var(--no)">ни один аккаунт не вошёл</b>';
@@ -516,7 +516,8 @@ const accounts = async () => {
     // запуске панель спросила бы «взять его в рассылку?» — одно «ОК», и
     // отдыхающий аккаунт снова пишет людям
     for (const a of accs) {
-      if (a.role === 'warm' && wasRole.has(a.id) && wasRole.get(a.id) !== 'warm') {
+      // читатель (вкладка «Лиды») людям не пишет — из составов рассылки тоже долой
+      if ((a.role === 'warm' || a.role === 'read') && wasRole.has(a.id) && wasRole.get(a.id) !== a.role) {
         for (const s of ['phones', 'chats']) if (crew[s]) crew[s].delete(a.id);
       }
     }
@@ -687,6 +688,8 @@ function navLamp(view, on) {
 
 function paintRunState(s) {
   const auto = s.auto || {};
+  // лампочка «Лиды» горит с любой вкладки, а не только пока она открыта
+  if (s.enrich) navLamp('leads', !!(s.enrich.on || s.enrich.finding));
   const runs = auto.runs || {};
   // Каждая вкладка говорит только про СВОЙ режим: по номерам и по чатам
   // работают разные аккаунты и останавливаются они независимо.
@@ -1267,13 +1270,13 @@ let pickSet = 'phones';
 // сервер — иначе снятая вернулась бы обратно на ближайшей перерисовке.
 const crewDirty = {phones: false, chats: false};
 /** Можно ли вообще брать этот аккаунт в рассылку. */
-const canPick = (a) => accReady(a) && a.role !== 'warm';
+const canPick = (a) => accReady(a) && a.role !== 'warm' && a.role !== 'read';
 /** Чем отмеченный состав отличается от того, что работает прямо сейчас. */
 function crewDiff(set, run) {
   const sel = crew[set] || new Set();
   const cur = new Set(run.ids || []);
   // прогревной тоже считается: при запуске панель переведёт его в рассылку
-  const free = (id) => { const a = accs.find(x => x.id === id); return a && accReady(a) && (!a.run || a.run === set); };
+  const free = (id) => { const a = accs.find(x => x.id === id); return a && accReady(a) && a.role !== 'read' && (!a.run || a.run === set); };
   return {
     add: [...sel].filter(id => !cur.has(id) && free(id)),
     drop: [...cur].filter(id => !sel.has(id)),
@@ -1391,7 +1394,7 @@ function paintAuto(a) {
   $('#cs-funnel').disabled = onC;
   // кнопка каждой вкладки живёт своей жизнью: выбор — её галочки, а блокировка
   // — её собственный режим
-  const ready = (set) => accs.filter(x => crew[set] && crew[set].has(x.id) && accReady(x) && !x.run);
+  const ready = (set) => accs.filter(x => crew[set] && crew[set].has(x.id) && accReady(x) && x.role !== 'read' && !x.run);
 
   // Строки «кто чем занят» — у каждой вкладки СВОИ: показываем только те
   // аккаунты, что работают в её режиме. Проверок бывает больше лимита — это
@@ -2686,7 +2689,8 @@ async function leadsView(force) {
     const list = accs.filter(accReady);
     rd.innerHTML = list.map((a) => {
       const r = d.readers.find((x) => x.id === a.id);
-      const why = a.run ? 'в рассылке' : r?.busy ? 'читает' : r?.rest ? `отдых ${r.rest} мин` : '';
+      const why = a.run ? 'в рассылке' : r?.busy ? 'читает' : r?.resting ? 'отлёжка первых суток'
+        : r?.rest ? `отдых ${r.rest} мин` : '';
       return `<label class="crew-i" title="${esc(r?.note || '')}">
         <input type="checkbox" data-reader="${esc(a.id)}" ${a.role === 'read' ? 'checked' : ''} ${a.run ? 'disabled' : ''}>
         <span>${esc(a.name || a.title)}${why ? ` <span class="hint">· ${esc(why)}</span>` : ''}</span></label>`;
@@ -2700,8 +2704,9 @@ async function leadsView(force) {
   const kw = $('#ld-kw');
   if (free(kw) && !kw.dataset.touched) kw.value = d.keywords.list.join('\n');
   const kn = $('#ld-kw-note');
-  if (kn && d.kwBusy) kn.textContent = 'модель подбирает ключевики — это минута-две…';
-  else if (kn && d.keywords.total) kn.textContent = `ключевиков ${d.keywords.total}, не пройдено ${d.keywords.left}. Список можно поправить — по строке на запрос.`;
+  if (kn) kn.textContent = d.kwBusy ? 'модель подбирает ключевики — это минута-две…'
+    : d.keywords.total ? `ключевиков ${d.keywords.total}, не пройдено ${d.keywords.left}. Список можно поправить — по строке на запрос.`
+    : 'Модель предложит сотни запросов: застройщики, ЖК, районы, «ипотека екб»… Список можно поправить — по строке на запрос.';
   $('#ld-kw-make').disabled = !!d.kwBusy;
   const fb = $('#ld-find');
   fb.textContent = d.finding ? 'Остановить поиск' : 'Найти чаты';
@@ -2813,6 +2818,8 @@ $('#ld-write')?.addEventListener('click', async () => {
   // настройки и состав писателей — вкладки «Рассылка по чатам»
   const back = pickSet;
   useWork('chats');
+  // в общей форме запуска — снимок вкладки «по чатам», а не последней открытой
+  if (formBySet.chats) { applyForm(formBySet.chats); formShownSet = 'chats'; }
   await startAuto('chats', { leads: true });
   if (activeView() === 'leads') useWork(back);
 });
@@ -2897,7 +2904,7 @@ function effCapDay(a, outreachDay, maxCap) {
   if (maxCap > 0) caps.push(maxCap);
   return Math.min(...caps);
 }
-const isReady = (a) => a.session && a.authed && a.role !== 'warm' && !(a.warm && a.warm.resting) && !a.quarantine;
+const isReady = (a) => a.session && a.authed && a.role !== 'warm' && a.role !== 'read' && !(a.warm && a.warm.resting) && !a.quarantine;
 
 function paintDash() {
   const total = accs.length;
