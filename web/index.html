@@ -2,7 +2,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>Telegram — панель</title>
-<link rel="stylesheet" href="/app.css?v=r100">
+<link rel="stylesheet" href="/app.css?v=r101">
 <div class="app">
 
   <!-- ЛЕВАЯ ПАНЕЛЬ РЕЖИМОВ -->
@@ -18,6 +18,7 @@
       <a class="nav-i" data-view="chatsend"><span class="ni step">4</span> Рассылка по чатам</a>
       <a class="nav-i" data-view="results"><span class="ni">▦</span> Результаты</a>
       <div class="nav-sep">Отдельно</div>
+      <a class="nav-i" data-view="leads"><span class="ni">🎯</span> Лиды</a>
       <a class="nav-i" data-view="organic"><span class="ni">💬</span> Органика</a>
       <a class="nav-i" data-view="tools"><span class="ni">⚙</span> Обслуживание</a>
     </nav>
@@ -212,6 +213,71 @@
     </section>
 
     <!-- ═══════════ ОРГАНИКА (коммент-движок) ═══════════ -->
+    <!-- ═══════════ ЛИДЫ: обогащение ═══════════ -->
+    <section class="view" data-view="leads">
+      <div class="card">
+        <div class="cardtitle">Как это работает</div>
+        <p class="hint" style="margin:0">Читатели вступают в чаты, выкачивают историю за 90 дней и выходят. Модель разбирает
+          каждого автора: все его сообщения и по 10 соседних, даже чужих. Так «да» в ответ на «хату берёшь?» тоже
+          считается. В лиды попадают только те, кто ищет жильё, с заметкой обо всём, что о них видно. Сырые сообщения
+          после разбора удаляются. Пишут лидам писатели — обычной рассылкой по чатам.</p>
+        <div id="ld-runbar" style="margin-top:12px"></div>
+      </div>
+
+      <div class="card" style="margin-top:14px">
+        <div class="cardtitle">1. Читатели</div>
+        <p class="hint" style="margin:0 0 8px">Отметь аккаунты, которые только читают чаты: не греются и никому не пишут.
+          Подойдут старые и дешёвые. Писатели и читатели — разные аккаунты.</p>
+        <div id="ld-readers" class="crewgrid"></div>
+      </div>
+
+      <div class="card" style="margin-top:14px">
+        <div class="cardtitle">2. Что ищем и где</div>
+        <div class="frow"><span style="min-width:130px">Кого ищем</span>
+          <input id="ld-goal" class="ftext" placeholder="хочет купить квартиру или другое жильё (новостройку, вторичку, дом), в том числе в ипотеку">
+          <button class="ghost" id="ld-goal-save">Сохранить</button></div>
+        <div class="frow"><span style="min-width:130px">Тема для поиска чатов</span>
+          <input id="ld-topic" class="ftext" placeholder="Квартиры в Екатеринбурге">
+          <button class="primary" id="ld-kw-make">Подобрать ключевики</button></div>
+        <p class="hint" id="ld-kw-note" style="margin:6px 0">Модель предложит сотни запросов: застройщики, ЖК, районы, «ипотека екб»… Список можно поправить — по строке на запрос.</p>
+        <textarea id="ld-kw" spellcheck="false" style="min-height:120px" placeholder="ключевики появятся здесь"></textarea>
+        <div class="msgbar">
+          <button class="ghost" id="ld-kw-save">Сохранить список</button>
+          <button class="primary" id="ld-find">Найти чаты</button>
+          <span id="ld-find-note" class="hint"></span>
+        </div>
+        <div class="fh" style="margin-top:14px">Или ссылками</div>
+        <textarea id="ld-links" spellcheck="false" style="min-height:70px"
+                  placeholder="t.me/chat_one&#10;@chat_two&#10;https://t.me/+AbCdEf"></textarea>
+        <div class="msgbar">
+          <button class="ghost" id="ld-links-add">Добавить в очередь</button>
+          <span id="ld-links-note" class="hint"></span>
+        </div>
+      </div>
+
+      <div class="card" style="margin-top:14px">
+        <div class="cardtitle">3. Собрать лидов</div>
+        <div class="nums" id="ld-counts"></div>
+        <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin-top:12px">
+          <button class="primary" id="ld-run">Собрать лидов</button>
+          <span id="ld-run-note" class="hint"></span>
+        </div>
+        <div class="tblwrap" style="margin-top:12px"><table id="ld-chats"></table></div>
+      </div>
+
+      <div class="card" style="margin-top:14px">
+        <div class="cardtitle">4. Лиды</div>
+        <p class="hint" style="margin:0 0 10px">Пишут им писатели, отмеченные на вкладке «Рассылка по чатам», — тем же текстом,
+          с теми же паузами, лимитами и проверкой SpamBot. Людям без @username писатель напишет через их сообщение в чате.</p>
+        <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap">
+          <button class="primary" id="ld-write">Написать лидам</button>
+          <button class="ghost" id="ld-csv">Скачать CSV</button>
+          <span id="ld-leads-note" class="hint"></span>
+        </div>
+        <div id="ld-leads" style="margin-top:12px"></div>
+      </div>
+    </section>
+
     <section class="view" data-view="organic">
       <div class="card">
         <div class="cardtitle">Комментинг</div>
@@ -757,4 +823,4 @@
 
   </main>
 </div>
-<script src="/app.js?v=r100"></script>
+<script src="/app.js?v=r101"></script>

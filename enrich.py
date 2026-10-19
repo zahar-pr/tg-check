@@ -232,3 +232,47 @@ def lead_refs():
             out[k] = lead
             out[f"id:{lead.get('uid')}"] = lead
     return out
+
+
+def retry(keys):
+    """Чаты с ошибкой или пропущенные — снова в очередь (кнопка «перечитать»)."""
+    def fn(data):
+        n = 0
+        for k in keys:
+            if k in data and data[k].get("status") in ("error", "skipped"):
+                data[k].update(status="new", err="", reader="")
+                n += 1
+        return n
+    return _update(fn)
+
+
+def remove(keys):
+    """Убрать чаты из очереди (те, что ещё не в работе)."""
+    def fn(data):
+        n = 0
+        for k in keys:
+            if k in data and data[k].get("status") in ("new", "error", "skipped"):
+                del data[k]
+                n += 1
+        return n
+    return _update(fn)
+
+
+if __name__ == "__main__":
+    # Панель пишет в очередь только через эти команды: замок на файл — здесь,
+    # и задачи-читатели не потеряют свою правку из-за записи панели.
+    #   python enrich.py add <файл со ссылками>
+    #   python enrich.py retry <ключ> [ключ…]
+    #   python enrich.py remove <ключ> [ключ…]
+    import sys
+    cmd, rest = (sys.argv[1] if len(sys.argv) > 1 else ""), sys.argv[2:]
+    if cmd == "add" and rest:
+        lines = open(rest[0], encoding="utf-8").read().splitlines()
+        refs = [ln.strip() for ln in lines if ln.strip() and not ln.strip().startswith("#")]
+        print(json.dumps({"ok": True, "added": add_chats(refs, source="вручную"), "given": len(refs)}))
+    elif cmd == "retry":
+        print(json.dumps({"ok": True, "n": retry(rest)}))
+    elif cmd == "remove":
+        print(json.dumps({"ok": True, "n": remove(rest)}))
+    else:
+        print(json.dumps({"ok": False, "reason": "команды: add <файл> | retry <ключи> | remove <ключи>"}))

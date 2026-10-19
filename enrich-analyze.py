@@ -100,22 +100,35 @@ def chunks(msgs, spans, me):
     return parts
 
 
+def verdict(out):
+    """
+    JSON-вердикт из ответа модели. Модели с рассуждениями пишут ход мыслей
+    прямо в ответ (TECH-BASE.md, §8), и фигурные скобки бывают и там — поэтому
+    берём ПОСЛЕДНИЙ объект с полем lead, а не первый попавшийся.
+    """
+    found = None
+    for m in re.finditer(r"\{[^{}]*\"lead\"[^{}]*\}", out or "", re.S):
+        try:
+            d = json.loads(m.group(0))
+        except Exception:
+            continue
+        if isinstance(d, dict) and "lead" in d:
+            found = d
+    if found is None:
+        return None
+    return {"lead": found.get("lead") is True or str(found.get("lead")).lower() == "true",
+            "why": str(found.get("why") or "")[:300], "note": str(found.get("note") or "")}
+
+
 def ask(system, text):
     """Вердикт модели. None — модель не ответила толком (повторим позже)."""
     for _ in range(2):
         out = llm.chat(system, text, max_tokens=900, temperature=0.2)
         if out is None:
             return None
-        m = re.search(r"\{.*\}", out, re.S)
-        if not m:
-            continue
-        try:
-            d = json.loads(m.group(0))
-        except Exception:
-            continue
-        if isinstance(d, dict) and "lead" in d:
-            return {"lead": d.get("lead") is True or str(d.get("lead")).lower() == "true",
-                    "why": str(d.get("why") or "")[:300], "note": str(d.get("note") or "")}
+        v = verdict(out)
+        if v:
+            return v
     return None
 
 

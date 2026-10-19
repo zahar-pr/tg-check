@@ -92,21 +92,72 @@ def compose(tpl, row, extras=None, extra_cols=None):
     return out
 
 
-async def find_member(client, key):
+async def find_member(client, key, acc):
     """
     Человек из разбора чата. @username Telegram развернёт кому угодно, а голый
     id — только тому аккаунту, который этого человека уже видел: access_hash
     лежит в его сессии. Поэтому у собранных без @username получатель ровно
     один — аккаунт-сборщик, и об этом надо сказать словами, а не молчаливым
     «не найден».
+
+    Исключение — лид обогащения: у него сохранены чат и сообщения. Не вышло по
+    ключу (нет ника, ник сменили) — идём через сообщение (via_message).
     """
-    if key.startswith("@"):
-        return await client.get_entity(key)
+    lead = tglib.lead_refs().get(key)
     try:
+        if key.startswith("@"):
+            return await client.get_entity(key)
         return await client.get_entity(int(key[3:]))
     except ValueError:
+        if lead:
+            return await via_message(client, lead, acc)
         raise ValueError("у человека нет @username — писать ему может только "
                          "тот аккаунт, который разбирал чат")
+
+
+WRITER_JOINS = 3     # вступлений в закрытые чаты лидов в сутки на писателя
+
+
+async def via_message(client, lead, acc):
+    """
+    Доступ к лиду через его сообщение в чате. Читатель видел человека, а
+    писатель — нет: access_hash у каждого аккаунта свой. Поэтому писатель
+    открывает тот же чат (публичный — без вступления), находит сообщение лида
+    и спрашивает человека «из этого сообщения» (InputUserFromMessage) — так
+    Telegram отдаёт полноценный профиль, которому можно писать.
+    """
+    import enrich
+    from chatlib import chat_ref, resolve_chat
+    from telethon import functions
+    from telethon.tl.types import InputUserFromMessage, UserEmpty
+
+    uid = int(lead.get("uid"))
+    why = "сообщений лида в чатах больше нет"
+    for ch in reversed(lead.get("chats") or []):          # свежий чат — первым
+        ids = [int(i) for i in (ch.get("msg_ids") or [])][-10:]
+        if not ids or not ch.get("ref"):
+            continue
+        try:
+            ref, invite = chat_ref(ch["ref"])
+            if invite:
+                if enrich.joins_today(acc["id"]) >= WRITER_JOINS:
+                    why = f"чат лида закрытый, а вступлений на сегодня уже {WRITER_JOINS}"
+                    continue
+                entity = await resolve_chat(client, None, invite, join=True)
+                enrich.note_join(acc["id"])
+            else:
+                entity = await client.get_entity(ref)
+            peer = await client.get_input_entity(entity)
+            for m in await client.get_messages(entity, ids=ids):
+                if m is None or m.sender_id != uid:
+                    continue
+                got = await client(functions.users.GetUsersRequest(
+                    [InputUserFromMessage(peer=peer, msg_id=m.id, user_id=uid)]))
+                if got and not isinstance(got[0], UserEmpty):
+                    return got[0]
+        except (ValueError, SystemExit) as e:
+            why = str(e).splitlines()[0][:100] or why
+    raise ValueError(f"не вышло найти лида через его сообщение: {why}")
 
 
 CONTACT_LABEL = re.compile(r"^\d{10}$")
@@ -172,6 +223,8 @@ async def main():
     # панель ставит, когда аккаунты пишут параллельно с одного IP: тогда письма
     # разных аккаунтов разводим по времени (tglib.wait_send_gap)
     send_gap = tglib.flag("send-gap")
+    # «Написать лидам»: из очереди по чатам — только лиды обогащения (leads.json)
+    leads_only = tglib.flag("leads-only")
 
     # отдых после заморозки — людям не пишем вовсе, даже если роль в панели
     # переключили обратно в рассылку. Ни подключения, ни брони адресатов
@@ -262,7 +315,10 @@ async def main():
     queue = [r for r in tglib.read_csv(tglib.RESULTS)
              if r.get("tg") == "true" and r["phone"] not in already
              and tries.get(r["phone"], 0) < MAX_TRIES
-             and tglib.can_write(r, acc["id"])]
+             and tglib.can_write(r, acc["id"])
+             and (not leads_only or r["phone"] in tglib.lead_refs())]
+    if leads_only:
+        say(f"пишем только лидам: в очереди {len(queue)}")
     nothing = sum(1 for r in queue if not pick_tpl(r))
     if nothing:
         say(f"без текста (нет бренда и нет запасного текста для чатов): {nothing} — им не пишу")
@@ -377,7 +433,7 @@ async def main():
             try:
                 if not tglib.is_phone(phone):
                     # человек из разбора чата: адресная книга не нужна вовсе
-                    user = await find_member(client, phone)
+                    user = await find_member(client, phone, acc)
                     quota_miss = 0
                 elif digits(phone) in saved:
                     # проверка этого же аккаунта оставила его в контактах:
@@ -576,7 +632,8 @@ async def main():
     left = sum(1 for r in tglib.read_csv(tglib.RESULTS)
                if r.get("tg") == "true" and r["phone"] not in already2
                and tries2.get(r["phone"], 0) < MAX_TRIES
-               and tglib.can_write(r, acc["id"]))
+               and tglib.can_write(r, acc["id"])
+               and (not leads_only or r["phone"] in tglib.lead_refs()))
     tglib.state(done=ok_n, left=left, stop=stop, cooldown=cooldown)
 
 

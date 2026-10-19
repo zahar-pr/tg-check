@@ -479,3 +479,14 @@ details.fieldset[open] > summary.fh::before{content:'▾'}
 .crewgrid{display:grid;grid-template-columns:repeat(auto-fill,minmax(180px,1fr));gap:4px 12px}
 .crewitem{display:flex;align-items:center;gap:7px;font-size:14px;cursor:pointer;padding:3px 0}
 .crewitem input{margin:0}
+
+/* ——— Лиды (обогащение) ——— */
+.rolepill.read{background:rgba(90,162,255,.14);color:var(--acc)}
+.ld-lead{border-bottom:1px solid var(--line);padding:8px 2px}
+.ld-lead>summary{cursor:pointer;list-style:none;display:flex;flex-wrap:wrap;gap:4px 10px;align-items:baseline}
+.ld-lead>summary::-webkit-details-marker{display:none}
+.ld-lead>summary>div{flex-basis:100%}
+.ld-lead .tag{font-size:11px;color:var(--mut);border:1px solid var(--line);border-radius:999px;padding:1px 8px}
+.ld-note{white-space:pre-wrap;margin:8px 0 4px;padding:10px 12px;border-radius:10px;background:rgba(120,164,255,.06);font-size:13px}
+#ld-counts{margin-top:4px}
+@media (max-width:700px){#ld-counts{grid-template-columns:repeat(3,1fr)}}

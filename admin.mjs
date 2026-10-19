@@ -55,6 +55,7 @@ import { buildKit, buildPult, kitProxy } from './server/kit.mjs';
 import { makeAsocks, ASOCKS_EVERY } from './server/asocks.mjs';
 import { makeOwnProxy, ASOCKS_GATEWAY, OWN_COUNTRY } from './server/ownproxy.mjs';
 import { makeLlmUsage, LLM_EVERY } from './server/llmusage.mjs';
+import { makeEnrich } from './server/enrich.mjs';
 import * as vercel from './server/vercel.mjs';
 
 // Код один на всех, данные у каждого профиля свои.
@@ -405,6 +406,7 @@ setInterval(() => {
 const TRAFFIC_TASK = {
   'draft-messages': 'рассылка', 'warmup-activity': 'прогрев', followup: 'смотрит ответы',
   'check-batch': 'проверка номеров', 'parse-chat': 'разбор чатов',
+  'enrich-read': 'лиды: чтение чатов', 'enrich-find': 'лиды: поиск чатов',
   profile: 'профиль', stats: 'сводка', 'cleanup-contacts': 'уборка контактов',
 };
 function trafficView(read = readRaw) {
@@ -465,6 +467,10 @@ const TASKS = {
   // по сути это «заглянуть, кто ответил»: пишет задача, только если ответили «да»
   follow: { title: 'Смотрит ответы',   cmd: ['followup.py'],        py: true,
             opts: true, send: true },
+  // обогащение: читатель выкачивает один чат из очереди (server/enrich.mjs)
+  enrichRead: { title: 'Чтение чата',  cmd: ['enrich-read.py'],     py: true },
+  // поиск чатов по ключевикам — порция запросов за заход
+  enrichFind: { title: 'Поиск чатов',  cmd: ['enrich-find.py'],     py: true },
 };
 
 /**
@@ -591,6 +597,23 @@ function manualHold() {
 }
 /* ═══════════ ЗАПУСК ЗАДАЧ — порождение процесса и разбор его вывода ═══════════ */
 
+/**
+ * Обогащение — поиск лидов «хочет квартиру» по чатам (server/enrich.mjs).
+ * Читатели берут чаты по одному, разбор идёт следом; задачи запускаем как
+ * автоматику (launchedBy = 'auto'), иначе каждый заход читателя ставил бы
+ * автопрогон рассылки на ручную паузу.
+ */
+const enrich = makeEnrich({
+  DIR, CODE, accounts, running, pythonCmd, push, readRaw,
+  launch: (name, opts, onDone) => {
+    launchedBy = 'auto';
+    try { return start(name, opts, onDone); } finally { launchedBy = 'manual'; }
+  },
+  note: (icon, text) => events.note(icon, text),
+  busy: (id) => accessBusy.has(id),
+  proxyDown: (proxy) => proxyGuard.down(proxy),
+});
+
 
 function run(key, tag, title, cmd, args, onDone, set = baseSet) {
   // Python-задаче говорим, с каким набором получателей работать (tglib.py)
@@ -638,7 +661,7 @@ function start(name, opts, onDone) {
 
   // задачи, которым нужна живая сессия: без входа запускать бессмысленно —
   // раньше это молча падало «нет сессии» и путало (проверка/рассылка вхолостую)
-  const NEEDS_SESSION = ['check', 'drafts', 'stats', 'clean', 'parse', 'follow'];
+  const NEEDS_SESSION = ['check', 'drafts', 'stats', 'clean', 'parse', 'follow', 'enrichRead', 'enrichFind'];
   if (NEEDS_SESSION.includes(name) && !accounts.hasSession(acc)) {
     return { ok: false, reason: `«${acc.title}» не вошёл — сначала войди по QR или залей сессию (шаг 1)` };
   }
@@ -754,6 +777,8 @@ function start(name, opts, onDone) {
   else if (t.send && send) args.push('--send');
   // параллель на общем IP — письма разных аккаунтов разводятся по времени
   if (t.send && opts.sendGap) args.push('--send-gap');
+  // «Написать лидам»: из очереди по чатам — только лиды обогащения
+  if (name === 'drafts' && opts.leadsOnly) args.push('--leads-only');
   // догрев между пачками рассылки — свои, лёгкие действия
   if (name === 'warmup' && opts.between) args.push('--between');
   // «живой день»: аккаунт из рассылки греется весь день по потолку «между пачками»
@@ -994,7 +1019,7 @@ function warmTick() {
    * себя не ведёт.
    */
   const live = accounts.list().filter((a) => accounts.hasSession(a) && accounts.isAuthed(a)
-    && !a.reserve && !a.retired
+    && !a.reserve && !a.retired && !accounts.isReader(a)     // читатель не греется: он только читает
     && (!warmup.only.length || warmup.only.includes(a.id)));
   const rank = (a) => (warmup.pending === a.id ? 0 : (warmOf(a.id).left ? 1 : 2));
   const order = [...live].sort((x, y) => rank(x) - rank(y));
@@ -1369,8 +1394,12 @@ function work(set = baseSet) {
   const written = new Set(log.filter((r) => r.ok === 'true' || r.ok === 'skip' || r.sent === 'true').map((r) => r.phone));
   const dtries = {};
   for (const r of log) if (!written.has(r.phone)) dtries[r.phone] = (dtries[r.phone] || 0) + 1;
+  // «только лиды»: остальные люди из чатов этому режиму не работа
+  const leadKeys = enrich.leadKeys();
+  const onlyLeads = set === 'chats' && !!auto.opts.chats?.leadsOnly;
   const free = res.filter((r) => r.tg === 'true' && !written.has(r.phone)
-    && (dtries[r.phone] || 0) < MAX_TRIES && !held.has(r.phone));
+    && (dtries[r.phone] || 0) < MAX_TRIES && !held.has(r.phone)
+    && (!onlyLeads || leadKeys.has(r.phone)));
 
   /**
    * Кому может написать любой аккаунт, а кому — только один.
@@ -1385,7 +1414,10 @@ function work(set = baseSet) {
   const own = {};
   let shared = 0;
   for (const r of free) {
-    if (String(r.phone).startsWith('id:') || r.kept === '1') own[r.by] = (own[r.by] || 0) + 1;
+    // лид обогащения без @username — общий: любой писатель найдёт его через
+    // сохранённое сообщение в чате (draft-messages.find_member)
+    const solo = String(r.phone).startsWith('id:') && !leadKeys.has(r.phone);
+    if (solo || r.kept === '1') own[r.by] = (own[r.by] || 0) + 1;
     else shared++;
   }
 
@@ -1882,6 +1914,7 @@ function autoTick() {
       send: o.send && !o.voice && (job.name === 'drafts'
         || (job.name === 'follow' && o.funnel && !s.stopped && !accounts.sendHoldLeft(byId.get(id)))),
       voice: job.name === 'drafts' && o.voice,
+      leadsOnly: job.name === 'drafts' && set === 'chats' && !!o.leadsOnly,
     }, (code, st) => autoAfter(id, code, st));
     launchedBy = 'manual';
 
@@ -2177,7 +2210,7 @@ function autoStart(o) {
   const set = SETS.includes(o.set) ? o.set : baseSet;
   if (auto.live[set]) return { ok: false, reason: `рассылка ${setWord(set)} уже идёт` };
   const entered = accounts.list().filter((a) => accounts.hasSession(a) && accounts.isAuthed(a)
-    && !a.reserve && !a.retired);
+    && !a.reserve && !a.retired && !accounts.isReader(a));
   // аккаунты «только прогрев» в рассылку не идут, даже если их отметили
   const ready = entered.filter(accounts.inOutreach);
   const held = ready.filter(inQuarantine);
@@ -2265,6 +2298,8 @@ function autoStart(o) {
   auto.opts[set] = {
     mode, voice,
     funnel: !!o.funnel,
+    // «Написать лидам» (вкладка «Лиды»): по чатам пишем только лидам обогащения
+    leadsOnly: set === 'chats' && !!o.leadsOnly,
     // «беречь новые аккаунты» — настройка РЕЖИМА, а не панели: иначе снятая
     // галочка на одной вкладке снимала отлёжку и у второго, уже идущего режима
     // (было `auto.warm && o.warm !== false` — общий тумблер на оба прогона)
@@ -2538,6 +2573,7 @@ function autoView() {
     return [set, {
       on: !!auto.live[set],
       mode: o?.mode || 'full', send: !!o?.send, voice: !!o?.voice,
+      leadsOnly: !!o?.leadsOnly,
       pause: o?.pause || 0, since: o?.since || 0,
       ids: idsOfSet(set),
       form: autoLastForm(set),
@@ -2971,7 +3007,7 @@ async function handler(req, res) {
         held: held.filter((h) => h.account === a.id).reduce((s, h) => s + h.n, 0),
         warm: accounts.hasSession(a) ? warm(a, today.get(a.id) || 0) : null,
         dailyCap: Number(a.dailyCap) || 0,   // ручной предел на аккаунт (0 — авто)
-        role: accounts.inOutreach(a) ? 'send' : 'warm',
+        role: accounts.isReader(a) ? 'read' : accounts.inOutreach(a) ? 'send' : 'warm',
         // в каком режиме аккаунт сейчас занят: по нему вкладки показывают,
         // кто свободен, а кого брать нельзя
         run: auto.on && auto.ids.includes(a.id) ? setOf(a.id) : '',
@@ -4026,6 +4062,18 @@ async function handler(req, res) {
       const { id, role, set: want } = await body(req);
       const acc = accounts.list().find((a) => a.id === id);
       if (!acc) return json(res, 200, { ok: false, reason: 'аккаунт не найден' });
+      // читатель (обогащение): только читает чаты — не греется, не пишет людям.
+      // Из идущей рассылки уходит сразу, иначе прогон звал бы его к письмам
+      if (role === 'read') {
+        accounts.setField(id, { role: 'read' });
+        if (auto.ids.includes(id)) {
+          auto.ids = auto.ids.filter((x) => x !== id);
+          auto.sets.delete(id);
+          auto.per.delete(id);
+        }
+        events.note('📖', 'стал читателем: читает чаты для поиска лидов, людям не пишет', acc.title);
+        return json(res, 200, { ok: true });
+      }
       const send = role === 'send';
       // на отдыхе после заморозки в рассылку не переводим — ни кнопкой, ни
       // вопросом «взять в рассылку?» при запуске (так a1 вернулся 15.10)
@@ -4133,6 +4181,39 @@ async function handler(req, res) {
       warmSave();
       push(`\n🌱 прогрев: ${warmup.only.length ? 'только ' + warmup.only.length + ' выбранных' : 'все аккаунты'}`);
       return json(res, 200, { ok: true, only: warmup.only });
+    }
+
+    // ─── Лиды: обогащение — поиск чатов, сбор лидов, письма им ─────────────
+    if (u.pathname === '/api/enrich' && req.method !== 'POST') return json(res, 200, enrich.view());
+    if (u.pathname === '/api/enrich/leads.csv') {
+      res.writeHead(200, {
+        'content-type': 'text/csv; charset=utf-8',
+        'content-disposition': 'attachment; filename="leads.csv"',
+        'cache-control': 'no-store',
+      });
+      return res.end(enrich.leadsCsv());
+    }
+    if (u.pathname.startsWith('/api/enrich/') && req.method === 'POST') {
+      const o = await body(req);
+      const what = u.pathname.slice('/api/enrich/'.length);
+      if (what === 'keywords') return json(res, 200, enrich.makeKeywords(o.topic));
+      if (what === 'keywords-save') return json(res, 200, enrich.saveKeywords(o.list));
+      if (what === 'find') return json(res, 200, enrich.find(o.on !== false));
+      if (what === 'chats') return json(res, 200, await enrich.addChats(o.list));
+      if (what === 'chats-cmd') return json(res, 200, await enrich.chatsCmd(o.cmd, o.keys));
+      if (what === 'goal') return json(res, 200, enrich.setGoal(o.goal));
+      if (what === 'run') return json(res, 200, enrich.setOn(o.on !== false));
+      // «Написать лидам» — обычный автопрогон по чатам, только по лидам.
+      // Настройки (тексты, паузы, лимиты, кто пишет) — с вкладки «Рассылка по чатам»
+      if (what === 'write') {
+        if (!enrich.leadKeys().size) return json(res, 200, { ok: false, reason: 'лидов пока нет — сначала собери их' });
+        if (auto.live.chats) {
+          return json(res, 200, { ok: false, reason: auto.opts.chats?.leadsOnly
+            ? 'рассылка лидам уже идёт' : 'сейчас идёт рассылка по чатам — останови её на вкладке «Рассылка по чатам», потом пиши лидам' });
+        }
+        return json(res, 200, autoStart({ ...o, set: 'chats', leadsOnly: true }));
+      }
+      return json(res, 200, { ok: false, reason: 'нет такого действия' });
     }
 
     // ─── Органика: вкладка управления коммент-движком ───────────────────────

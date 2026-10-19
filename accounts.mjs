@@ -143,7 +143,10 @@ const untilLeft = (acc, key) => {
 export const fullRestLeft = (acc) => untilLeft(acc, 'fullRestUntil');
 export const sendHoldLeft = (acc) => Math.max(untilLeft(acc, 'sendHoldUntil'), fullRestLeft(acc));
 
-export const inOutreach = (acc) => acc.role !== 'warm' && !sendHoldLeft(acc);
+/** Читатель (обогащение): только читает чаты — не греется и людям не пишет. */
+export const isReader = (acc) => acc?.role === 'read';
+
+export const inOutreach = (acc) => acc.role !== 'warm' && !isReader(acc) && !sendHoldLeft(acc);
 
 /** id -> аккаунт. Без id берём первый: так старые запуски из терминала работают как раньше. */
 export function resolve(id) {

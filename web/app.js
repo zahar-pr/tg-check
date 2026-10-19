@@ -157,7 +157,9 @@ function paintAccounts() {
   if (work === null) useWork(pickSet);
   // роль: прогрев идёт у всех, в рассылку попадают только отмеченные ✉️
   // роль — переключатель: прогрев идёт у всех, в рассылку попадают только ✉️
-  const rolePill = (a) => a.role === 'warm'
+  const rolePill = (a) => a.role === 'read'
+    ? `<span class="daypill rolepill read" data-role="${a.id}" title="Читатель: читает чаты для поиска лидов, людям не пишет и не греется. Нажми — вернуть в прогрев">📖 читатель</span>`
+    : a.role === 'warm'
     ? `<span class="daypill rolepill warm" data-role="${a.id}" title="Только греется. Нажми — взять в рассылку">🌱 только прогрев</span>`
     : `<span class="daypill rolepill" data-role="${a.id}" title="Греется и пишет людям. Нажми — оставить только прогрев">✉️ рассылка</span>`;
   // где аккаунт сейчас занят — чтобы не искать его по вкладкам
@@ -241,6 +243,13 @@ function paintAccounts() {
   document.querySelectorAll('[data-role]').forEach(b => b.onclick = async (e) => {
     e.preventDefault();
     const a = accs.find(x => x.id === b.dataset.role);
+    if (a.role === 'read') {
+      if (!confirm(`«${a.name || a.title}» сейчас читатель. Вернуть его в прогрев? Читать чаты для лидов он перестанет.`)) return;
+      const r = await post('/api/accounts/role', {id: a.id, role: 'warm'});
+      if (r && r.ok === false) alert(r.reason || 'не получилось');
+      loop();
+      return;
+    }
     const toSend = a.role === 'warm';
     if (toSend && a.warm && !a.warm.atMax &&
         !confirm(`«${a.name || a.title}» ещё не прогрет (день ${a.warm.day} из ${a.warm.fullDay}). Всё равно перевести в рассылку?`)) return;
@@ -596,7 +605,8 @@ function runbar(id, on, title, why) {
 function paintAccRun(id, set) {
   const el = $(id);
   if (!el) return;
-  const list = accs.filter(accReady);
+  // читатели (вкладка «Лиды») людям не пишут — в составах рассылки их нет
+  const list = accs.filter((a) => accReady(a) && a.role !== 'read');
   if (!list.length) { el.innerHTML = ''; return; }
   const other = set === 'chats' ? 'phones' : 'chats';
   const run = (lastState && lastState.auto && lastState.auto.runs || {})[set] || {};
@@ -684,7 +694,7 @@ function paintRunState(s) {
     const r = runs[set] || {};
     const n = (r.ids || []).length;
     runbar(el, !!r.on,
-      r.on ? `<b>Рассылка ${word} идёт</b>` : `<b>Рассылка ${word} выключена</b>`,
+      r.on ? `<b>Рассылка ${word}${r.leadsOnly ? ' — только лидам' : ''} идёт</b>` : `<b>Рассылка ${word} выключена</b>`,
       r.on ? `${n} аккаунт(ов) · режим: ${
         r.mode === 'check' ? 'только проверка' : r.mode === 'write' ? 'только письма' : 'проверка и письма'}`
         : 'отметь аккаунты и нажми «Запустить»');
@@ -1552,7 +1562,7 @@ async function takeWarmIntoRun(set) {
   return true;
 }
 
-async function startAuto(set) {
+async function startAuto(set, extra = {}) {
   const run = ((lastState && lastState.auto && lastState.auto.runs) || {})[set] || {};
   if (run.on) {
     // состав поменяли галочками — встраиваем новых в идущий поток, а снятых
@@ -1579,8 +1589,12 @@ async function startAuto(set) {
   const mode = $('#amode').value;
   const voice = mode !== 'check' && $('#voicemode').checked;
   const send = mode !== 'check' && !voice && $('#send').checked;
-  const who = accs.filter(x => work.has(x.id) && accReady(x)).map(x => x.title);
-  if (!who.length) { alert('Отметь хотя бы один вошедший аккаунт'); return; }
+  const who = accs.filter(x => work.has(x.id) && accReady(x) && x.role !== 'read').map(x => x.title);
+  if (!who.length) {
+    alert(extra.leads ? 'Отметь писателей на вкладке «Рассылка по чатам» — лидам пишут они, с теми же текстами и паузами'
+      : 'Отметь хотя бы один вошедший аккаунт');
+    return;
+  }
   const cap = Math.max(1, parseInt($('#daycap').value) || 15);
   const wantFunnel = set === 'chats' ? $('#cs-funnel').checked : $('#funnel').checked;
   if (wantFunnel && !$('#msg2').value.trim()) {
@@ -1588,20 +1602,20 @@ async function startAuto(set) {
     return;
   }
   if ((send || voice) && !confirm(
-      `Запустить автопрогон от: ${who.join(', ')}?\n\n` +
+      `Запустить ${extra.leads ? 'рассылку ЛИДАМ' : 'автопрогон'} от: ${who.join(', ')}?\n\n` +
       `Панель будет САМА ${voice ? 'отправлять голосовые' : 'отправлять сообщения'} людям, ` +
       `пачка за пачкой, пока база не кончится.\n` +
       `Не больше ${cap} в сутки на аккаунт (новые — меньше, по графику разгона).\n` +
       `\nОтозвать отправленное нельзя. Продолжить?`)) return;
-  const r = await post('/api/auto', {
-    on: true, set, mode, send, voice, warm: $('#warmon').checked,
+  const r = await post(extra.leads ? '/api/enrich/write' : '/api/auto', {
+    on: true, set, mode, send, voice, warm: $('#warmon').checked, leadsOnly: !!extra.leads,
     funnel: set === 'chats' ? $('#cs-funnel').checked : $('#funnel').checked,
     // параллель (все сразу) — у каждой вкладки своя галочка; на одном IP сервер предупредит
     serial: !$(set === 'chats' ? '#cs-parallel' : '#p-parallel').checked,
     rotate: $('#rotate').value.trim(),
     parallel: $(set === 'chats' ? '#cs-parallel' : '#p-parallel').checked,
     rotateWait: +$('#rotwait').value || 10,
-    accounts: [...work].filter(id => accReady(accs.find(a => a.id === id) || {})),
+    accounts: [...work].filter(id => { const a = accs.find(x => x.id === id) || {}; return accReady(a) && a.role !== 'read'; }),
     pause: (+$('#apause').value || 40) * 60,     // поле в минутах, серверу — секунды
     checkLimit: $('#limit').value, checkDelay: $('#delay').value,
     writeLimit: $('#dlimit').value, writeDelay: $('#ddelay').value,
@@ -2465,6 +2479,7 @@ const loop = async () => {
   await base(); await repliesList(); await warmup(); await funnel(); await mirror();
   await traffic();
   if (activeView() === 'organic') { await organicView(); await commentsView(); }
+  if (activeView() === 'leads') await leadsView();
   if (activeView() === 'chatsend') await members();
   if (activeView() === 'results') await resultsView();
 };
@@ -2474,6 +2489,7 @@ loop(); setInterval(loop, 2000);
 const VIEW_TITLE = {
   overview: 'Обзор', accounts: 'Аккаунты', warmup: 'Прогрев', send: 'Рассылка по номерам',
   results: 'Результаты', chatsend: 'Рассылка по чатам', organic: 'Органика', tools: 'Обслуживание',
+  leads: 'Лиды',
 };
 // по какому набору пойдут ручные заходы из «Обслуживания» — словами, а не молча
 function paintToolsSet() {
@@ -2634,6 +2650,170 @@ async function runDiscover(dry) {
 }
 $('#org-disc-dry')?.addEventListener('click', () => runDiscover(true));
 $('#org-disc-run')?.addEventListener('click', () => runDiscover(false));
+
+/* ═══════════ ЛИДЫ — обогащение: чаты → разбор по авторам → лиды ═══════════ */
+
+const LD_STATUS = {
+  new: 'в очереди', reading: 'читается', downloaded: 'ждёт разбора', analyzing: 'разбирается',
+  done: '✓ разобран', skipped: 'пропущен', error: 'ошибка',
+};
+let leadsAt = 0, leadsRaw = '', ld = null;
+async function leadsView(force) {
+  if (!force && Date.now() - leadsAt < 4000) return;
+  leadsAt = Date.now();
+  let d;
+  try { d = await (await fetch('/api/enrich')).json(); } catch { return; }
+  const raw = JSON.stringify([d, accs.map((a) => [a.id, a.role, a.run, accReady(a)])]);
+  if (raw === leadsRaw) return;
+  leadsRaw = raw;
+  ld = d;
+  const free = (el) => el && !el.contains(document.activeElement);
+
+  // что сейчас происходит — одной строкой сверху
+  const busy = d.readers.filter((r) => r.busy).map((r) => `${esc(r.name)}: ${esc(r.busy.replace(/ — .*/, ''))}`);
+  runbar('#ld-runbar', d.on || d.finding,
+    d.on ? '<b>Сбор лидов идёт</b>' : d.finding ? '<b>Идёт поиск чатов</b>' : '<b>Сбор лидов выключен</b>',
+    [d.analyzer ? `разбирает «${esc(d.analyzer.title)}»` : '', ...busy,
+     d.finding ? `ключевиков осталось ${d.keywords.left}` : ''].filter(Boolean).join(' · ')
+      || (d.on ? 'ждёт свободного читателя' : 'добавь чаты и нажми «Собрать лидов»'));
+  navLamp('leads', d.on || d.finding);
+
+  // читатели — галочки по всем вошедшим; занятые рассылкой не отмечаются
+  const rd = $('#ld-readers');
+  if (free(rd)) {
+    const list = accs.filter(accReady);
+    rd.innerHTML = list.map((a) => {
+      const r = d.readers.find((x) => x.id === a.id);
+      const why = a.run ? 'в рассылке' : r?.busy ? 'читает' : r?.rest ? `отдых ${r.rest} мин` : '';
+      return `<label class="crew-i" title="${esc(r?.note || '')}">
+        <input type="checkbox" data-reader="${esc(a.id)}" ${a.role === 'read' ? 'checked' : ''} ${a.run ? 'disabled' : ''}>
+        <span>${esc(a.name || a.title)}${why ? ` <span class="hint">· ${esc(why)}</span>` : ''}</span></label>`;
+    }).join('') || '<div class="hint">нет вошедших аккаунтов — подключи их на вкладке «Аккаунты»</div>';
+  }
+
+  const goal = $('#ld-goal');
+  if (free(goal) && !goal.dataset.touched) goal.value = d.goal || '';
+  const topic = $('#ld-topic');
+  if (free(topic) && !topic.dataset.touched) topic.value = d.topic || '';
+  const kw = $('#ld-kw');
+  if (free(kw) && !kw.dataset.touched) kw.value = d.keywords.list.join('\n');
+  const kn = $('#ld-kw-note');
+  if (kn && d.kwBusy) kn.textContent = 'модель подбирает ключевики — это минута-две…';
+  else if (kn && d.keywords.total) kn.textContent = `ключевиков ${d.keywords.total}, не пройдено ${d.keywords.left}. Список можно поправить — по строке на запрос.`;
+  $('#ld-kw-make').disabled = !!d.kwBusy;
+  const fb = $('#ld-find');
+  fb.textContent = d.finding ? 'Остановить поиск' : 'Найти чаты';
+  fb.classList.toggle('danger', !!d.finding);
+
+  const c = d.counts || {};
+  $('#ld-counts').innerHTML = [
+    [c.new || 0, 'в очереди'], [(c.reading || 0) + (c.downloaded || 0) + (c.analyzing || 0), 'в работе'],
+    [c.done || 0, 'разобрано'], [(c.error || 0) + (c.skipped || 0), 'пропущено'], [d.leadsTotal, 'лидов'],
+  ].map(([n, t]) => `<div><b>${n}</b><span>${t}</span></div>`).join('');
+  const rb = $('#ld-run');
+  rb.textContent = d.on ? 'Остановить сбор' : 'Собрать лидов';
+  rb.classList.toggle('danger', !!d.on);
+  $('#ld-run-note').textContent = d.readers.length ? `читателей: ${d.readers.length}` : 'сначала отметь читателей (шаг 1)';
+
+  const tbl = $('#ld-chats');
+  if (tbl) {
+    tbl.innerHTML = d.chats.length ? '<tr><th>Чат</th><th>Статус</th><th>Сообщ.</th><th>Авторов</th><th>Лидов</th><th></th></tr>' +
+      d.chats.map((x) => {
+        const act = ['error', 'skipped'].includes(x.status)
+          ? `<button class="ghost mini" data-ldcmd="retry" data-key="${esc(x.key)}">перечитать</button>` : '';
+        const del = ['new', 'error', 'skipped'].includes(x.status)
+          ? `<button class="ghost mini" data-ldcmd="remove" data-key="${esc(x.key)}">убрать</button>` : '';
+        return `<tr><td>${esc(x.title || x.ref)}<div class="hint">${esc(x.ref)}${x.source ? ' · ' + esc(x.source) : ''}</div></td>
+          <td>${esc(LD_STATUS[x.status] || x.status)}${x.err ? `<div class="hint">${esc(x.err)}</div>` : ''}</td>
+          <td>${x.msgs ?? ''}</td><td>${x.authors ?? ''}</td><td>${x.leads ?? ''}</td><td>${act} ${del}</td></tr>`;
+      }).join('') + (d.chatsTotal > d.chats.length ? `<tr><td colspan="6" class="hint">и ещё ${d.chatsTotal - d.chats.length}</td></tr>` : '')
+      : '<tr><td class="hint">очередь пуста — найди чаты по ключевикам или добавь ссылками</td></tr>';
+  }
+
+  $('#ld-leads-note').textContent = d.leadsTotal ? `лидов ${d.leadsTotal}, ещё не написали ${d.leadsLeft}` : '';
+  const lb = $('#ld-leads');
+  if (free(lb)) {
+    const open = new Set([...lb.querySelectorAll('details[open]')].map((x) => x.dataset.key));
+    lb.innerHTML = d.leads.length ? d.leads.map((l) => `
+      <details class="ld-lead" data-key="${esc(l.key)}" ${open.has(l.key) ? 'open' : ''}>
+        <summary><b>${l.username ? '@' + esc(l.username) : esc(l.name || 'id ' + l.uid)}</b>
+          ${l.username && l.name ? `<span class="hint">${esc(l.name)}</span>` : ''}
+          <span class="tag">${esc(l.status)}</span>
+          <span class="hint">${esc(l.chats.join(', '))}</span>
+          <div class="hint">${esc(l.why)}</div></summary>
+        <div class="ld-note">${esc(l.note)}</div>
+      </details>`).join('') : '<div class="hint">пока нет — лиды появятся по мере разбора чатов</div>';
+  }
+}
+
+['#ld-goal', '#ld-topic', '#ld-kw'].forEach((id) => $(id)?.addEventListener('input', (e) => { e.target.dataset.touched = '1'; }));
+const ldDo = async (url, data, note) => {
+  let r;
+  try { r = await post(url, data); } catch (err) { alert(err.message); return null; }
+  if (r && r.ok === false) alert(r.reason || 'не получилось');
+  else if (note && $(note)) $(note).textContent = '';
+  leadsRaw = ''; await leadsView(true);
+  return r;
+};
+$('#ld-readers')?.addEventListener('change', async (e) => {
+  const id = e.target.dataset.reader; if (!id) return;
+  const a = accs.find((x) => x.id === id) || {};
+  if (e.target.checked && a.role === 'send' && !confirm(`«${a.name || a.title}» сейчас в рассылке. Сделать читателем? Людям он писать перестанет.`)) {
+    e.target.checked = false; return;
+  }
+  await post('/api/accounts/role', { id, role: e.target.checked ? 'read' : 'warm' });
+  await loop(); leadsRaw = ''; await leadsView(true);
+});
+$('#ld-goal-save')?.addEventListener('click', async () => {
+  const g = $('#ld-goal'); await ldDo('/api/enrich/goal', { goal: g.value }); delete g.dataset.touched;
+});
+$('#ld-kw-make')?.addEventListener('click', async () => {
+  const t = $('#ld-topic');
+  if (!t.value.trim()) { alert('Напиши тему, например «Квартиры в Екатеринбурге»'); return; }
+  const kw = $('#ld-kw');
+  if (kw.value.trim() && !confirm('Подобрать ключевики заново? Текущий список заменится новым.')) return;
+  delete t.dataset.touched; delete kw.dataset.touched;
+  await ldDo('/api/enrich/keywords', { topic: t.value });
+});
+$('#ld-kw-save')?.addEventListener('click', async () => {
+  const kw = $('#ld-kw');
+  const r = await ldDo('/api/enrich/keywords-save', { list: kw.value });
+  if (r?.ok) { delete kw.dataset.touched; $('#ld-find-note').textContent = `сохранено: ${r.total}, не пройдено ${r.left}`; }
+});
+$('#ld-find')?.addEventListener('click', async () => {
+  const kw = $('#ld-kw');
+  if (!ld?.finding && kw.dataset.touched) {
+    const r = await post('/api/enrich/keywords-save', { list: kw.value });
+    if (r && r.ok === false) { alert(r.reason); return; }
+    delete kw.dataset.touched;
+  }
+  await ldDo('/api/enrich/find', { on: !ld?.finding });
+});
+$('#ld-links-add')?.addEventListener('click', async () => {
+  const t = $('#ld-links');
+  const r = await ldDo('/api/enrich/chats', { list: t.value });
+  if (r?.ok) { $('#ld-links-note').textContent = `добавлено ${r.added} из ${r.given}` + (r.given > r.added ? ' (остальные уже в очереди)' : ''); t.value = ''; }
+});
+$('#ld-run')?.addEventListener('click', () => ldDo('/api/enrich/run', { on: !ld?.on }));
+$('#ld-chats')?.addEventListener('click', (e) => {
+  const b = e.target.closest('[data-ldcmd]'); if (!b) return;
+  ldDo('/api/enrich/chats-cmd', { cmd: b.dataset.ldcmd, keys: [b.dataset.key] });
+});
+$('#ld-csv')?.addEventListener('click', () => { location.href = '/api/enrich/leads.csv'; });
+$('#ld-write')?.addEventListener('click', async () => {
+  if (!ld?.leadsTotal) { alert('Лидов пока нет — сначала собери их'); return; }
+  const run = ((lastState && lastState.auto && lastState.auto.runs) || {}).chats || {};
+  if (run.on) {
+    alert(run.leadsOnly ? 'Рассылка лидам уже идёт. Остановить её можно на вкладке «Рассылка по чатам».'
+      : 'Сейчас идёт рассылка по чатам. Останови её на вкладке «Рассылка по чатам», потом пиши лидам.');
+    return;
+  }
+  // настройки и состав писателей — вкладки «Рассылка по чатам»
+  const back = pickSet;
+  useWork('chats');
+  await startAuto('chats', { leads: true });
+  if (activeView() === 'leads') useWork(back);
+});
 
 let trafficAt = 0;
 const fmtBytes = (b) => (b >= 1e9 ? (b / 1e9).toFixed(2) + ' ГБ'
