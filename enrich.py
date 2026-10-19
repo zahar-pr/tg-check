@@ -288,8 +288,23 @@ def remove(keys):
 def _alive(pid):
     """Жив ли процесс читателя (этой же машины)."""
     try:
-        os.kill(int(pid), 0)
-    except (ProcessLookupError, ValueError, TypeError):
+        pid = int(pid)
+    except (ValueError, TypeError):
+        return False
+    if os.name == "nt":
+        # на Windows os.kill(pid, 0) — это Ctrl+C всей консоли панели, не проверка
+        import ctypes
+        k = ctypes.windll.kernel32
+        h = k.OpenProcess(0x1000, False, pid)          # PROCESS_QUERY_LIMITED_INFORMATION
+        if not h:
+            return k.GetLastError() == 5               # ERROR_ACCESS_DENIED — процесс есть
+        code = ctypes.c_ulong()
+        ok = k.GetExitCodeProcess(h, ctypes.byref(code))
+        k.CloseHandle(h)
+        return bool(ok) and code.value == 259          # STILL_ACTIVE
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
         return False
     except PermissionError:
         return True

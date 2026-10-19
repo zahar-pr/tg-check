@@ -1400,9 +1400,11 @@ function work(set = baseSet) {
   // «только лиды»: остальные люди из чатов этому режиму не работа
   const leadKeys = enrich.leadKeys();
   const onlyLeads = set === 'chats' && !!auto.opts.chats?.leadsOnly;
+  // лиды, которых сегодня отложили все писатели прогона, — работа на завтра
+  const later = set === 'chats' ? enrich.putOffAll(idsOfSet('chats')) : new Set();
   const free = res.filter((r) => r.tg === 'true' && !written.has(r.phone)
     && (dtries[r.phone] || 0) < MAX_TRIES && !held.has(r.phone)
-    && (!onlyLeads || leadKeys.has(r.phone)));
+    && (!onlyLeads || leadKeys.has(r.phone)) && !later.has(r.phone));
 
   /**
    * Кому может написать любой аккаунт, а кому — только один.

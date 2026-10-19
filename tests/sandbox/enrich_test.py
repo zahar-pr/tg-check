@@ -245,6 +245,17 @@ def main():
     ch = enrich.load_chats()["akadem_sosedi"]
     check(ch["status"] == "downloaded" and not ch.get("tries"), f"сеть легла — ждём, попытку не тратим: tries {ch.get('tries')}")
 
+    def broke(system, user, info=None, **kw):
+        if info is not None:
+            info["code"] = "402"                      # кончились деньги на OpenRouter
+        return None
+    llm.chat = broke
+    for _ in range(3):
+        run_script("enrich-analyze.py")
+    ch = enrich.load_chats()["akadem_sosedi"]
+    check(ch["status"] == "downloaded" and not ch.get("tries") and enrich.raw_path(CHAT_ID).exists(),
+          "кончились деньги (402) — три захода, ни попытки, ни потери сырья")
+
     print("\n▸ разбор: модель ответила без вердикта")
 
     def flaky(system, user, info=None, **kw):
@@ -263,6 +274,28 @@ def main():
     exec(compile(src_a, "enrich-analyze.py", "exec"), ns_a)
     v = ns_a["verdict"]('думаю {так}\n{"lead": true, "why": "берёт двушку", "note": "- **Район:** Академ\\n- бюджет до 7')
     check(v and v["lead"] and "Академ" in v["note"], f"лид из обрезанного JSON: {v}")
+    v = ns_a["verdict"]('Формат: {"lead": true|false, "why": "фраза"}. Тут «Продаю двушку» — это риелтор.\n'
+                        '{"lead": false, "why": "продаёт", "note": "')
+    check(v and v["lead"] is False and v["why"] == "продаёт", f"строка формата из промпта не делает лида: {v}")
+    v = ns_a["verdict"]('Формат: {"lead": true|false}. Обрезано на рассуждениях')
+    check(v is None, "без настоящего вердикта — None, а не «лид»")
+
+    print("\n▸ разбор: модель «висит» только на одном авторе")
+
+    def slow_one(system, user, info=None, **kw):
+        if "(Оля)" in user.split("►", 1)[-1].split("\n", 1)[0]:     # остался последним
+            if info is not None:
+                info["code"] = "net"                  # таймаут curl на длинном тексте
+            return None
+        return fake_llm(system, user)
+    llm.chat = slow_one
+    for _ in range(3):
+        run_script("enrich-analyze.py")
+    prog = enrich.read_json(enrich.progress_path(CHAT_ID), {})
+    ch = enrich.load_chats()["akadem_sosedi"]
+    check(prog.get("_out", {}).get("4") == 3 and ch.get("tries", 0) >= 2,
+          f"после трёх заходов «висящий» автор — без вердикта, чат не крутится вечно: tries {ch.get('tries')}")
+    enrich.set_chat("akadem_sosedi", tries=0)
 
     print("\n▸ разбор по авторам")
     llm.chat = fake_llm

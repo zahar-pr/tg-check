@@ -1067,7 +1067,9 @@ def is_frozen_error(e) -> bool:
     Замороженному аккаунту Telegram валит FROZEN_* почти на любой метод отправки.
     """
     s = (str(e) + " " + type(e).__name__).upper()
-    return "FROZEN_" in s or "FROZENMETHOD" in s
+    # у известных ошибок Telethon в тексте описание, а не код — смотрим и имя класса
+    # (FrozenMethodInvalidError, FrozenParticipantMissingError…)
+    return "FROZEN_" in s or "FROZENMETHOD" in s or type(e).__name__.startswith("Frozen")
 
 
 def _until_left(acc, key) -> int:

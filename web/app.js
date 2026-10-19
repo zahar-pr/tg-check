@@ -1468,7 +1468,13 @@ function paintAuto(a) {
     const el = $(id);
     if (el && !el.dataset.formWatch) {
       el.dataset.formWatch = '1';
-      const mark = () => { formTouched = true; };
+      // чья правка: форма общая на обе вкладки рассылки — запоминаем, с какой правили
+      const mark = () => {
+        formTouched = true;
+        const v = activeView();
+        if (v === 'chatsend') formShownSet = 'chats';
+        else if (v === 'send') formShownSet = 'phones';
+      };
       el.addEventListener('input', mark);
       el.addEventListener('change', mark);
     }
@@ -1627,7 +1633,7 @@ async function startAuto(set, extra = {}) {
   if (!r.ok && r.reason) alert(r.reason);
   // запустились — значит в полях ровно снимок этого запуска: правок «на будущее»
   // в форме больше нет, и переход на другую вкладку снова может показать её снимок
-  if (r.ok) formTouched = false;
+  if (r.ok) { formTouched = false; formShownSet = set; }
   state();
 }
 /* ═══════════ ЗАПУСК РАССЫЛКИ ═══════════ */
@@ -2515,6 +2521,8 @@ function showView(name) {
     useSet(set, true);              // и база с результатами — про эту же вкладку
     // у вкладки свои последние настройки запуска — показываем именно их
     restoreFormFor(set);
+    // снимка у вкладки ещё нет (ни разу не запускали) — то, что настроят здесь, и есть её настройки
+    if (!formBySet[set] && !formTouched) formShownSet = set;
   }
   if (location.hash !== '#' + name) history.replaceState(null, '', '#' + name);
   window.scrollTo(0, 0);
@@ -2819,17 +2827,21 @@ $('#ld-write')?.addEventListener('click', async () => {
   // Пишут лидам с настройками вкладки «Рассылка по чатам» (текст, паузы, лимиты,
   // писатели). Ни разу её не запускали — снимка нет: в общей форме сейчас
   // настройки «по номерам», с ними лидам писать нельзя. Отправляем настроить.
-  if (formShownSet !== 'chats' && !formBySet.chats) {
-    alert('Сначала настрой рассылку на вкладке «Рассылка по чатам»: текст, паузы, лимиты и кто пишет. ' +
-      'Лидам пишем с этими настройками.');
-    showView('chatsend');
-    return;
+  // В общей форме — настройки «по чатам»: правленые там (formShownSet) берём как
+  // есть, иначе — снимок прошлого запуска по чатам. Нет ни того, ни другого —
+  // отправляем на вкладку: там настроят, и следующее нажатие возьмёт это
+  if (formShownSet !== 'chats') {
+    if (!formBySet.chats) {
+      alert('Сначала открой вкладку «Рассылка по чатам» и проверь там текст, паузы, лимиты и кто пишет. ' +
+        'Лидам пишем с этими настройками — потом вернись и нажми «Написать лидам».');
+      showView('chatsend');
+      return;
+    }
+    applyForm(formBySet.chats);
+    formShownSet = 'chats';
   }
   const back = pickSet;
   useWork('chats');
-  // в общей форме — снимок «по чатам»; если она уже показана, в ней могут быть
-  // свежие правки человека — их не затираем
-  if (formShownSet !== 'chats') { applyForm(formBySet.chats); formShownSet = 'chats'; }
   await startAuto('chats', { leads: true });
   if (activeView() === 'leads') useWork(back);
 });

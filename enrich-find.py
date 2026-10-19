@@ -86,6 +86,9 @@ def make_keywords(topic):
     tglib.state(done=len(items), left=0)
 
 
+DOWN = "down"       # модель недоступна (сеть, деньги, ключ) — ключевик тут ни при чём
+
+
 def fit(topic, cands):
     """Модель отсеивает чужие темы по названию. None — модель не ответила:
     ключевик тогда не считаем пройденным, повторим позже (а не сваливаем в
@@ -97,6 +100,9 @@ def fit(topic, cands):
     out = llm.chat("Отвечай строго в формате, который просят.",
                    FIT_PROMPT.format(goal=enrich.goal(), topic=topic, items=items),
                    max_tokens=400, temperature=0)
+    if out is None:
+        say(f"  модель недоступна ({llm.LAST_ERR or 'нет ответа'}) — ключевик подождёт")
+        return DOWN
     nums = last_json(out, int)
     if nums is None:
         say(f"  модель не оценила темы ({llm.LAST_ERR or 'непонятный ответ'}) — этот ключевик повторю позже")
@@ -209,9 +215,10 @@ async def search(acc, per_run, dry):
                               "n": c.participants_count or "",
                               "kind": "channel" if c.broadcast else "group"})
             good = fit(topic, cands)
-            if good is None:
-                # модель сбилась на этом ключевике: дважды подряд — пропускаем его
-                if not dry:
+            if good is None or good == DOWN:
+                # модель ответила, но непонятно, — дважды так, и ключевик пропускаем;
+                # простой модели ключевику не засчитываем
+                if good is None and not dry:
                     bump_fit_fail(item["q"], at0)
                 stop = "errors"
                 break

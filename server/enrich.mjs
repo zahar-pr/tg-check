@@ -68,6 +68,23 @@ export function makeEnrich({ DIR, CODE, accounts, running, launch, pythonCmd, pu
     return leadsCache;
   }
   const leadKeys = () => leads().keys;
+
+  /**
+   * Лиды, которых сегодня отложили ВСЕ эти писатели (вступления кончились —
+   * enrich/later.json, его ведёт draft-messages.put_off). Для прогона это не
+   * работа до завтра: иначе он звал бы писателя к ним каждую минуту.
+   */
+  function putOffAll(ids) {
+    if (!ids.length) return new Set();
+    const day = new Date().toISOString().slice(0, 10);
+    const data = read(path.join(ROOT, 'later.json'), {});
+    let out = null;
+    for (const id of ids) {
+      const got = data[id]?.day === day ? new Set(data[id].keys || []) : new Set();
+      out = out ? new Set([...out].filter((k) => got.has(k))) : got;
+    }
+    return out || new Set();
+  }
   const keyOf = (l) => l.key || (l.username ? '@' + String(l.username).replace(/^@/, '') : `id:${l.uid}`);
 
   /** Python-помощник (enrich.py, enrich-find.py) без аккаунта: вернёт последнюю JSON-строку. */
@@ -378,6 +395,6 @@ export function makeEnrich({ DIR, CODE, accounts, running, launch, pythonCmd, pu
   }
 
   // tick — наружу только для песочницы (tests/sandbox/enrich_sched_test.mjs)
-  return { view, leadsCsv, leadKeys, setOn, setGoal, addChats, chatsCmd, makeKeywords, saveKeywords, find, tick, stop,
+  return { view, leadsCsv, leadKeys, putOffAll, setOn, setGoal, addChats, chatsCmd, makeKeywords, saveKeywords, find, tick, stop,
            status: () => ({ on: st.on, finding: st.finding }) };
 }

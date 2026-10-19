@@ -138,12 +138,15 @@ def verdict(out):
         if isinstance(d, dict) and "lead" in d:
             found = d
     if found is None:
-        # ответ обрезан на длинной заметке: JSON не закрыт, но «lead» уже сказан
-        m = re.search(r'"lead"\s*:\s*(true|false)', out or "")
-        if not m:
+        # ответ обрезан на длинной заметке: JSON не закрыт, но «lead» уже сказан.
+        # Берём ПОСЛЕДНЕЕ начало вердикта, и не строку формата из промпта
+        # («true|false»), которую модель любит повторять в рассуждениях
+        starts = list(re.finditer(r'\{\s*"lead"\s*:\s*(true|false)\b(?!\s*\|)', out or ""))
+        if not starts:
             return None
-        why = re.search(r'"why"\s*:\s*"((?:[^"\\]|\\.)*)', out)
-        note = re.search(r'"note"\s*:\s*"((?:[^"\\]|\\.)*)', out or "", re.S)
+        m = starts[-1]
+        why = re.compile(r'"why"\s*:\s*"((?:[^"\\]|\\.)*)').search(out, m.end())
+        note = re.compile(r'"note"\s*:\s*"((?:[^"\\]|\\.)*)', re.S).search(out, m.end())
         found = {"lead": m.group(1) == "true", "why": why.group(1) if why else "",
                  "note": (note.group(1).replace("\\n", "\n") + " …") if note else ""}
     return {"lead": found.get("lead") is True or str(found.get("lead")).lower() == "true",
@@ -163,10 +166,12 @@ def ask(system, text):
         info = {}
         out = llm.chat(system, text, max_tokens=tokens, temperature=0.2, info=info)
         if out is None:
-            # сеть и перегрузка — пройдёт; ошибка самого запроса (400: длинно,
-            # модерация) повторится и завтра — это «без вердикта», а не простой
+            # «Без вердикта» — только ошибка про САМ текст автора (400 — длинно или
+            # не понравился, 413 — слишком большой). Всё остальное — простой модели:
+            # сеть, перегрузка, кончились деньги (402), ключ (401/403), таймаут (408),
+            # строковые коды провайдера. Из-за простоя авторов не теряем
             code = info.get("code", "")
-            return None if code in ("net", "", "429") or code.startswith("5") else BAD
+            return BAD if code in ("400", "413") else None
         v = verdict(out)
         if v:
             return v
@@ -252,14 +257,15 @@ def main():
 
     prog_file = enrich.progress_path(ch.get("chat_id"))
     progress = {} if dry else enrich.read_json(prog_file, {})
-    todo = [uid for uid in authors if str(uid) not in progress]
+    todo = [uid for uid in authors if str(uid) not in progress]     # "_out" — служебный ключ, не автор
     if progress:
         say(f"продолжаю: уже разобрано {len(progress)}, осталось {len(todo)}")
 
     lock = threading.Lock()
     failed = []          # модель ответила, но без вердикта (BAD)
     outage = []          # модель недоступна (None) — повторим, попытку не тратим
-    stats = {"done": 0, "leads": sum(1 for v in progress.values() if v), "fails": 0, "stop": False}
+    stats = {"done": 0, "leads": sum(1 for k, v in progress.items() if k != "_out" and v is True),
+             "fails": 0, "stop": False}
 
     def one(uid):
         if stats["stop"]:
@@ -299,6 +305,23 @@ def main():
     with ThreadPoolExecutor(max_workers=workers) as pool:
         list(pool.map(one, todo))
 
+    # Модель жива (другие авторы разобрались или ответила на короткую проверку),
+    # а на этих «не отвечает» — значит, дело в них (длинный текст не успевает за
+    # таймаут и т.п.). Трижды так — считаем их «без вердикта», иначе один автор
+    # держал бы чат и всю очередь. Лежит модель — ждём, авторов не трогаем
+    alive = bool(outage) and (stats["done"] > 0 or llm.chat(
+        "Ответь одним словом.", "ок", max_tokens=5, temperature=0) is not None)   # модель жива?
+    if alive:
+        outs = progress.setdefault("_out", {})
+        stuck = []
+        for uid in outage:
+            outs[str(uid)] = int(outs.get(str(uid), 0)) + 1
+            if outs[str(uid)] >= 3:
+                stuck.append(uid)
+        if not dry:
+            enrich.write_json(prog_file, progress)
+        failed += stuck
+        outage = [u for u in outage if u not in stuck]
     # Модель недоступна (сеть, 5xx) — чат ждёт, попытка не считается: это не
     # вина авторов. Сырьё не удаляем, прогресс по разобранным сохранён.
     if stats["stop"] or outage:

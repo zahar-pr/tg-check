@@ -94,10 +94,13 @@ async def leave(client, entity):
         say(f"  выйти не вышло: {str(e).splitlines()[0][:80]}")
 
 
-async def join(client, acc_id, joined, do):
+async def join(client, acc_id, joined, do, key):
     """Вступление под дневным пределом: считаем его и запоминаем, откуда потом выйти."""
     if enrich.joins_today(acc_id) >= JOIN_MAX:
         raise JoinLimit()
+    # отметку — ДО запроса: убьют посреди вступления (а Telegram уже впустил) —
+    # тот, кто дочитает чат, всё равно из него выйдет
+    enrich.set_chat(key, joined_by=acc_id)
     entity = await do()
     enrich.note_join(acc_id)
     joined.append(entity)
@@ -110,7 +113,7 @@ class NeedsApproval(Exception):
     """В чат пускают только по заявке, одобренной админом: заявку не шлём."""
 
 
-async def open_chat(client, ref, acc_id, joined):
+async def open_chat(client, ref, acc_id, joined, key):
     """
     Сущность для чтения: группа как есть, у канала — его обсуждение. Вступаем
     здесь только по ссылке-приглашению (иначе внутрь не попасть): такое
@@ -132,7 +135,7 @@ async def open_chat(client, ref, acc_id, joined):
             async def by_invite():
                 upd = await client(functions.messages.ImportChatInviteRequest(invite))
                 return upd.chats[0]
-            entity = await join(client, acc_id, joined, by_invite)
+            entity = await join(client, acc_id, joined, by_invite, key)
     else:
         entity = await resolve_chat(client, r, None, join=False)
     head = entity
@@ -152,7 +155,7 @@ async def read_chat(client, acc, key, ch, days, joined):
     from telethon.tl.types import Channel
 
     say(f"\n▸ {ch.get('title') or ch['ref']}")
-    head, entity = await open_chat(client, ch["ref"], acc["id"], joined)
+    head, entity = await open_chat(client, ch["ref"], acc["id"], joined, key)
     title = tglib.cell(getattr(head, "title", "") or ch.get("title") or ch["ref"])
     if entity is None:
         enrich.set_chat(key, status="skipped", title=title, err="канал без комментариев")
@@ -173,11 +176,10 @@ async def read_chat(client, acc, key, ch, days, joined):
         async def by_join(ent=entity):
             await client(functions.channels.JoinChannelRequest(ent))
             return ent
-        await join(client, acc["id"], joined, by_join)
-    if joined:
-        # прошлый заход могли убить посреди чтения — выйти должен и тот, что дочитает
-        enrich.set_chat(key, joined_by=acc["id"])
-    elif ch.get("joined_by") == acc["id"] and isinstance(entity, Channel) and not getattr(entity, "left", True):
+        await join(client, acc["id"], joined, by_join, key)
+    # прошлый заход вступил и умер (убили посреди чтения) — выходит тот, что дочитает
+    if not joined and ch.get("joined_by") == acc["id"] and isinstance(entity, Channel) \
+            and not getattr(entity, "left", True):
         joined.append(entity)
 
     path = enrich.raw_path(entity.id)
@@ -231,13 +233,20 @@ ACCOUNT_ERRORS = {
 
 
 def account_trouble(acc, e):
-    """(stop, cooldown) для отчёта, если ошибка — про аккаунт; ("", 0) — про чат."""
+    """(stop, cooldown) для отчёта, если ошибка — не про чат; ("", 0) — про чат."""
     if tglib.is_frozen_error(e):
         tglib.set_field(acc["id"], spamKind="frozen", spamOk=False, spamAt=tglib.now_iso(),
                         spam=tglib.cell("заморожен — блокировка по жалобам (ToS)"))
         return "quarantine", 0
     cool = ACCOUNT_ERRORS.get(type(e).__name__)
-    return ("errors", cool) if cool else ("", 0)
+    if cool:
+        return "errors", cool
+    # связь оборвалась, сервер Telegram сбоит — чат дочитаем позже с того же места
+    code = getattr(e, "code", None)
+    if isinstance(e, (ConnectionError, OSError, asyncio.TimeoutError)) or \
+            (isinstance(code, int) and (code >= 500 or code < 0)):
+        return "errors", 10 * 60
+    return "", 0
 
 
 async def main():

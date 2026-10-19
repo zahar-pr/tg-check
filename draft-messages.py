@@ -119,6 +119,17 @@ async def find_member(client, key, acc):
 
 
 WRITER_JOINS = 3     # вступлений в закрытые чаты лидов в сутки на писателя
+# Закрытые чаты, куда писатель вступил в этом заходе: ссылка-приглашение ->
+# чат. Следующий лид из того же чата не стоит нового вступления, а выходим
+# из всех разом в конце захода (leave_joined) — нашли лида или нет
+JOINED = {}
+
+
+async def leave_joined(client):
+    for ent in JOINED.values():
+        with contextlib.suppress(Exception):
+            await client.delete_dialog(ent)
+    JOINED.clear()
 
 
 class JoinQuota(Exception):
@@ -167,10 +178,11 @@ async def via_message(client, lead, acc):
         ids = [int(i) for i in (ch.get("msg_ids") or [])][-10:]
         if not ids or not ch.get("ref"):
             continue
-        joined = None            # вступили ради этого лида — выйдем, как только найдём
         try:
             ref, invite = chat_ref(ch["ref"])
-            if invite:
+            if invite and invite in JOINED:
+                entity = JOINED[invite]                   # уже вошли в этом заходе
+            elif invite:
                 res = await client(functions.messages.CheckChatInviteRequest(invite))
                 if isinstance(res, (ChatInviteAlready, ChatInvitePeek)):
                     entity = res.chat                     # уже внутри — вступление не тратим
@@ -183,7 +195,7 @@ async def via_message(client, lead, acc):
                     continue
                 else:
                     upd = await client(functions.messages.ImportChatInviteRequest(invite))
-                    entity = joined = upd.chats[0]
+                    entity = JOINED[invite] = upd.chats[0]
                     enrich.note_join(acc["id"])
             else:
                 entity = await client.get_entity(ref)
@@ -202,10 +214,6 @@ async def via_message(client, lead, acc):
                 got = await client(functions.users.GetUsersRequest(
                     [InputUserFromMessage(peer=peer, msg_id=m.id, user_id=uid)]))
                 if got and not isinstance(got[0], UserEmpty):
-                    if joined is not None:
-                        # доступ к человеку уже есть — сидеть в чужом закрытом чате незачем
-                        with contextlib.suppress(Exception):
-                            await client.delete_dialog(joined)
                     return got[0]
         except (FloodWaitError, PeerFloodError):
             raise                                       # это про аккаунт, а не про чат
@@ -689,6 +697,9 @@ async def main():
                 say(f"    пауза {wait:.0f} с до следующего")
                 await asyncio.sleep(wait)
     finally:
+        # из закрытых чатов лидов выходим: доступ к людям уже есть, а сидеть
+        # в чужих чатах незачем (потолок 500 чатов, лишние глаза модераторов)
+        await leave_joined(client)
         await tglib.aclose(client)
 
     if voice:
@@ -704,12 +715,13 @@ async def main():
     already2 = {r["phone"] for r in log2
                 if r.get("ok") in ("true", "skip") or r.get("sent") == "true"}
     tries2 = tglib.tries_by_phone(log2, already2)
+    later2 = put_off(acc["id"])          # заново: за заход могли отложить ещё
     left = sum(1 for r in tglib.read_csv(tglib.RESULTS)
                if r.get("tg") == "true" and r["phone"] not in already2
                and tries2.get(r["phone"], 0) < MAX_TRIES
                and tglib.can_write(r, acc["id"])
                and (not leads_only or r["phone"] in tglib.lead_refs())
-               and r["phone"] not in put_off(acc["id"]))
+               and r["phone"] not in later2)
     tglib.state(done=ok_n, left=left, stop=stop, cooldown=cooldown)
 
 
