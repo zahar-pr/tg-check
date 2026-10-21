@@ -189,6 +189,7 @@ async def similar(client, topic, known, dry, budget):
     """
     from telethon import functions
     from telethon.errors import FloodWaitError
+    from telethon.tl.types import InputPeerChannel
 
     seeds = enrich.similar_seeds()[:budget]
     if seeds:
@@ -204,7 +205,16 @@ async def similar(client, topic, known, dry, budget):
                 enrich.set_chat(key, similar=True)
             continue
         try:
-            ent = await client.get_entity(r)
+            # Из сессии, а не поиском по нику: канал аккаунт уже видел (поиск,
+            # похожие), а ResolveUsername пачкой — прямая дорога к флуд-паузе
+            ent = await client.get_input_entity(r)
+            if not isinstance(ent, InputPeerChannel):
+                # ник теперь у человека или бота — похожих тут не будет
+                say(f"{seed['ref']}: это уже не канал — пропускаю")
+                if not dry:
+                    enrich.set_chat(key, similar=True)
+                await asyncio.sleep(random.uniform(*PAUSE))
+                continue
             res = await client(functions.channels.GetChannelRecommendationsRequest(channel=ent))
         except FloodWaitError as e:
             say(f"  флуд-пауза {e.seconds} с")
@@ -214,15 +224,18 @@ async def similar(client, topic, known, dry, budget):
             continue
         except (SystemExit, Exception) as e:
             msg = str(e).splitlines()[0][:80] if str(e) else type(e).__name__
-            if (getattr(e, "code", None) == 400 or isinstance(e, (ValueError, SystemExit))) \
-                    and not tglib.is_frozen_error(e):
-                # канал удалили, переименовали, похожих у него не бывает — дальше
-                say(f"{seed['ref']}: похожие не получить ({msg}) — пропускаю")
-                if not dry:
-                    enrich.set_chat(key, similar=True)
-                continue
-            say(f"{seed['ref']}: похожие не получить ({msg}) — остановлюсь, продолжу позже")
-            return added, 0, "errors"
+            if tglib.is_frozen_error(e) or isinstance(e, (ConnectionError, OSError)) \
+                    or (isinstance(getattr(e, "code", None), int) and (e.code >= 500 or e.code < 0)):
+                # связь, сбой Telegram, заморозка — беда не канала: стоп, продолжим позже
+                say(f"{seed['ref']}: похожие не получить ({msg}) — остановлюсь, продолжу позже")
+                return added, 0, "errors"
+            # канал удалили, переименовали, это теперь группа, ошибка запроса —
+            # дважды так, и больше его не раскрываем: один канал не держит поиск
+            say(f"{seed['ref']}: похожие не получить ({msg}) — пропускаю")
+            if not dry:
+                bump_seed_fail(key)
+            await asyncio.sleep(random.uniform(*PAUSE))
+            continue
         cands = [c for c in (candidate(x, known) for x in (res.chats or [])) if c]
         good = fit(topic, cands)
         if good is None or good == DOWN:
@@ -342,6 +355,10 @@ async def search(acc, per_run, dry):
         f"каналов для похожих {sim_left}")
     if wait:
         tglib.state(done=added, left=left, stop="flood", cooldown=wait)
+    elif not todo and not stop:
+        # шли только «похожие»: следующий заход — не сразу (панель подождёт сама,
+        # читателя не держит), иначе запросы к Telegram шли бы подряд весь час
+        tglib.state(done=added, left=left, note="похожие")
     else:
         # модель не отвечает — не дёргаем поиск каждую минуту
         tglib.state(done=added, left=left, stop=stop, cooldown=15 * 60 if stop else 0)

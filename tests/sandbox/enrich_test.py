@@ -136,6 +136,10 @@ class Client:
         raise ValueError(f"Could not find the input entity for {ref}")
 
     async def get_input_entity(self, ent):
+        if isinstance(ent, str):
+            if ent == "stale_name":                  # ник канала теперь у человека
+                return types.InputPeerUser(4242, 1)
+            ent = BY_NAME.get(ent) or (await self.get_entity(ent))
         return types.InputPeerChannel(ent.id, ent.access_hash)
 
     async def get_messages(self, entity, limit=None, offset_id=0, ids=None):
@@ -152,7 +156,8 @@ class Client:
         if isinstance(req, functions.contacts.SearchRequest):
             return Found(SEARCH)
         if isinstance(req, functions.channels.GetChannelRecommendationsRequest):
-            return Found(SIMILAR.get(req.channel.username, []))
+            un = next((c.username for c in BY_NAME.values() if c.id == req.channel.channel_id), "")
+            return Found(SIMILAR.get(un, []))
         if isinstance(req, functions.users.GetUsersRequest):
             iu = req.id[0]
             assert isinstance(iu, types.InputUserFromMessage)
@@ -435,6 +440,7 @@ def main():
     enrich.write_json(enrich.KEYWORDS, {"topic": "Квартиры в Екатеринбурге", "at": "T1",
                                         "items": [{"q": "ЖК Академ", "done": False, "found": 0}]})
     enrich.write_json(enrich.STATE, {"on": False, "finding": True})
+    enrich.add_chats([{"ref": "@stale_name", "title": "Был канал", "kind": "channel"}], source="вручную")
     llm.chat = lambda *a, **k: "[0, 1, 2, 3]"           # «модель»: всё по теме
     run_script("enrich-find.py", "--account", "r1", client=Client())
     q = enrich.load_chats()
@@ -444,6 +450,7 @@ def main():
           f"похожий канал в очереди, шаг 1: {q.get('rec_one')}")
     check("rec_nolink" not in q and "rec_req" not in q, "похожие без комментариев и «по заявке» отсеяны")
     check(q["akadem_news2"].get("similar") is True, "у канала похожие уже проверены — второй раз не спросим")
+    check(q["stale_name"].get("similar") is True, "ник отдали человеку — канал пропущен, поиск не встал")
     run_script("enrich-find.py", "--account", "r1", client=Client())
     q = enrich.load_chats()
     check(q.get("rec_two", {}).get("level") == 2, "похожие на похожие — шаг 2")

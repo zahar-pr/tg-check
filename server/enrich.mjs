@@ -42,6 +42,7 @@ export function makeEnrich({ DIR, CODE, accounts, running, launch, pythonCmd, pu
   let analyzeHold = 0;            // модель не отвечала — разбор ждёт до этого времени
   let kwJob = null;               // идёт подбор ключевиков моделью
   let releasing = false;          // панель возвращает в очередь чаты упавших читателей
+  let findHold = 0;               // заходы «только похожие» — не чаще раза в 5 минут
 
   const chats = () => read(path.join(ROOT, 'chats.json'), {});
   const keywords = () => read(path.join(ROOT, 'keywords.json'), {});
@@ -212,9 +213,13 @@ export function makeEnrich({ DIR, CODE, accounts, running, launch, pythonCmd, pu
       if (!findLeft()) {
         st.finding = false; save();
         note('🔎', 'поиск чатов закончен: ключевики пройдены, похожие каналы проверены');
-      } else if (![...running.values()].some((r) => /Поиск чатов/.test(r.title)) && free.length) {
+      } else if (now >= findHold && ![...running.values()].some((r) => /Поиск чатов/.test(r.title)) && free.length) {
         const a = free.shift();
-        launch('enrichFind', { account: a.id }, after(a.id, 'поиск'));
+        launch('enrichFind', { account: a.id }, (code, s) => {
+          after(a.id, 'поиск')(code, s);
+          // шли только «похожие» — следующий заход через 5 минут; читатель свободен
+          if (s?.note === 'похожие') findHold = Date.now() + 5 * 60_000;
+        });
       }
     }
 
