@@ -46,6 +46,11 @@ export function makeEnrich({ DIR, CODE, accounts, running, launch, pythonCmd, pu
   const chats = () => read(path.join(ROOT, 'chats.json'), {});
   const keywords = () => read(path.join(ROOT, 'keywords.json'), {});
   const kwLeft = () => (keywords().items || []).filter((i) => !i.done).length;
+  // каналы, у которых ещё не спрашивали «похожие» (то же правило, что enrich.similar_seeds)
+  const SIMILAR_LEVELS = 2;
+  const simLeft = () => Object.values(chats()).filter((v) => v.kind === 'channel' && !v.similar
+    && v.status !== 'error' && (Number(v.level) || 0) < SIMILAR_LEVELS && v.ref).length;
+  const findLeft = () => kwLeft() + simLeft();
 
   /** Лиды по ключу получателя (@ник и id:<id>) — тот же расклад, что в enrich.lead_refs. */
   let leadsCache = { mtime: -1, list: [], keys: new Set() };
@@ -204,9 +209,9 @@ export function makeEnrich({ DIR, CODE, accounts, running, launch, pythonCmd, pu
     let free = freeReaders();
     // поиск чатов: одним читателем, порциями, пока есть непройденные ключевики
     if (st.finding) {
-      if (!kwLeft()) {
+      if (!findLeft()) {
         st.finding = false; save();
-        note('🔎', 'поиск чатов по ключевикам закончен');
+        note('🔎', 'поиск чатов закончен: ключевики пройдены, похожие каналы проверены');
       } else if (![...running.values()].some((r) => /Поиск чатов/.test(r.title)) && free.length) {
         const a = free.shift();
         launch('enrichFind', { account: a.id }, after(a.id, 'поиск'));
@@ -278,6 +283,7 @@ export function makeEnrich({ DIR, CODE, accounts, running, launch, pythonCmd, pu
       on: st.on, finding: st.finding, goal: st.goal, topic: st.topic || kw.topic || '',
       kwBusy: !!kwJob,
       keywords: { total: (kw.items || []).length, left: kwLeft(), list: (kw.items || []).map((i) => i.q) },
+      similarLeft: simLeft(),
       analyzer: analyzer ? { title: analyzer.title, since: analyzer.since } : null,
       counts, chats: list.slice(0, 500), chatsTotal: list.length,
       readers: accounts.list().filter((a) => a.role === 'read').map((a) => {
@@ -391,14 +397,17 @@ export function makeEnrich({ DIR, CODE, accounts, running, launch, pythonCmd, pu
 
   function find(on) {
     if (!on) { st.finding = false; save(); return { ok: true }; }
-    if (!kwLeft()) return { ok: false, reason: 'непройденных ключевиков нет — сначала подбери ключевики по теме' };
+    if (!findLeft()) {
+      return { ok: false, reason: 'искать нечего: подбери ключевики по теме или добавь каналы ссылками — ' +
+        'у каналов поиск спросит похожие' };
+    }
     if (kwJob) return { ok: false, reason: 'ключевики ещё подбираются — подожди' };
     if ([...running.values()].some((r) => /^Поиск чатов/.test(r.title || ''))) {
       return { ok: false, reason: 'прошлый поиск ещё заканчивает ключевик — подожди минуту' };
     }
     if (!readers().length) return { ok: false, reason: NO_READERS };
     st.finding = true; save();
-    note('🔎', `поиск чатов по ключевикам: осталось ${kwLeft()}`);
+    note('🔎', `поиск чатов: ключевиков ${kwLeft()}, каналов для похожих ${simLeft()}`);
     setTimeout(tick, 500);
     return { ok: true };
   }

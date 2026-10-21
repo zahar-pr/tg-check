@@ -93,6 +93,27 @@ CHANNEL = types.Channel(id=888, title="Академ — новости", photo=t
                         date=NOW, broadcast=True, username="akadem_news", left=True, access_hash=6)
 
 
+def chan(cid, un, title, broadcast=True, has_link=True, join_request=False, n=500):
+    return types.Channel(id=cid, title=title, photo=types.ChatPhotoEmpty(), date=NOW, username=un,
+                         broadcast=broadcast, megagroup=not broadcast, has_link=has_link,
+                         join_request=join_request, participants_count=n, access_hash=cid)
+
+
+# поиск по ключевику и «похожие каналы» для песка поиска
+SEARCH = [chan(901, "akadem_news2", "Академ — новости 2"), chan(902, "akadem_group", "Академ чат", broadcast=False)]
+SIMILAR = {
+    "akadem_news2": [chan(903, "rec_one", "Похожий 1"), chan(904, "rec_nolink", "Без комментариев", has_link=False),
+                     chan(905, "rec_req", "По заявке", join_request=True)],
+    "rec_one": [chan(906, "rec_two", "Похожий 2")],
+}
+BY_NAME = {c.username: c for c in SEARCH + [x for v in SIMILAR.values() for x in v]}
+
+
+class Found:
+    def __init__(self, chats):
+        self.chats = chats
+
+
 class Full:
     def __init__(self):
         self.full_chat = type("F", (), {"linked_chat_id": CHAT_ID})()
@@ -110,6 +131,8 @@ class Client:
             return GROUP
         if ref == "akadem_news":
             return CHANNEL
+        if ref in BY_NAME:
+            return BY_NAME[ref]
         raise ValueError(f"Could not find the input entity for {ref}")
 
     async def get_input_entity(self, ent):
@@ -126,6 +149,10 @@ class Client:
         self.calls.append(type(req).__name__)
         if isinstance(req, functions.channels.GetFullChannelRequest):
             return Full()
+        if isinstance(req, functions.contacts.SearchRequest):
+            return Found(SEARCH)
+        if isinstance(req, functions.channels.GetChannelRecommendationsRequest):
+            return Found(SIMILAR.get(req.channel.username, []))
         if isinstance(req, functions.users.GetUsersRequest):
             iu = req.id[0]
             assert isinstance(iu, types.InputUserFromMessage)
@@ -403,6 +430,26 @@ def main():
     kw = enrich.read_json(enrich.KEYWORDS, {})
     check([i["q"] for i in kw.get("items", [])] == ["ЖК Академ", "ипотека екб", "новостройки екб"],
           f"ключевики без дублей: {[i['q'] for i in kw.get('items', [])]}")
+
+    print("\n▸ поиск чатов: ключевик и похожие каналы")
+    enrich.write_json(enrich.KEYWORDS, {"topic": "Квартиры в Екатеринбурге", "at": "T1",
+                                        "items": [{"q": "ЖК Академ", "done": False, "found": 0}]})
+    enrich.write_json(enrich.STATE, {"on": False, "finding": True})
+    llm.chat = lambda *a, **k: "[0, 1, 2, 3]"           # «модель»: всё по теме
+    run_script("enrich-find.py", "--account", "r1", client=Client())
+    q = enrich.load_chats()
+    check(q.get("akadem_news2", {}).get("kind") == "channel" and q.get("akadem_group", {}).get("kind") == "group",
+          "поиск по ключевику: канал и группа в очереди, тип запомнен")
+    check(q.get("rec_one", {}).get("level") == 1 and "похожие на @akadem_news2" in q["rec_one"].get("source", ""),
+          f"похожий канал в очереди, шаг 1: {q.get('rec_one')}")
+    check("rec_nolink" not in q and "rec_req" not in q, "похожие без комментариев и «по заявке» отсеяны")
+    check(q["akadem_news2"].get("similar") is True, "у канала похожие уже проверены — второй раз не спросим")
+    run_script("enrich-find.py", "--account", "r1", client=Client())
+    q = enrich.load_chats()
+    check(q.get("rec_two", {}).get("level") == 2, "похожие на похожие — шаг 2")
+    out = run_script("enrich-find.py", "--account", "r1", client=Client())
+    check(not enrich.similar_seeds() and any("искать нечего" in o for o in out),
+          "дальше второго шага не идём, поиск заканчивается")
 
     print("\n▸ панель пишет очередь через enrich.py")
     f = TMP / "links.txt"

@@ -40,6 +40,7 @@ LEADS = ROOT / "leads.json"
 
 DAYS = 90                    # столько истории читаем
 STALE_READING = 3 * 3600     # читатель пропал дольше — чат возвращается в очередь
+SIMILAR_LEVELS = 2           # «похожие на похожие»: столько шагов от найденного поиском
 GOAL_DEFAULT = ("хочет купить квартиру или другое жильё (новостройку, вторичку, "
                 "дом), в том числе в ипотеку")
 
@@ -125,7 +126,11 @@ def add_chats(items, source=""):
                 ids.add(cid)
             data[k] = {"ref": ref, "chat_id": it.get("chat_id") or "",
                        "title": tglib.cell(it.get("title") or ""), "n": it.get("n") or "",
-                       "status": "new", "source": source, "added": now_iso()}
+                       "status": "new", "source": source, "added": now_iso(),
+                       # kind — канал или группа (у канала Telegram знает похожие),
+                       # level — сколько шагов «похожих» от найденного поиском
+                       **({"kind": it["kind"]} if it.get("kind") else {}),
+                       **({"level": int(it["level"])} if it.get("level") else {})}
             added += 1
         return added
     return _update(fn)
@@ -159,6 +164,16 @@ def pick_chat(acc_id):
         data[key].update(status="reading", reader=acc_id, pid=os.getpid(), at=now_iso())
         return key, dict(data[key])
     return _update(fn)
+
+
+def similar_seeds():
+    """
+    Каналы, похожие на которые ещё не спрашивали у Telegram: найденные поиском,
+    добавленные руками (тип узнаёт читатель) и сами «похожие» — до SIMILAR_LEVELS.
+    """
+    return [(k, v) for k, v in load_chats().items()
+            if v.get("kind") == "channel" and not v.get("similar") and v.get("status") != "error"
+            and int(v.get("level") or 0) < SIMILAR_LEVELS and v.get("ref")]
 
 
 def set_chat(key, **fields):

@@ -2713,9 +2713,10 @@ async function leadsView(force) {
   const kw = $('#ld-kw');
   if (free(kw) && !kw.dataset.touched) kw.value = d.keywords.list.join('\n');
   const kn = $('#ld-kw-note');
+  const sim = d.similarLeft ? ` · каналов, у которых проверим похожие: ${d.similarLeft}` : '';
   if (kn) kn.textContent = d.kwBusy ? 'модель подбирает ключевики — это минута-две…'
-    : d.keywords.total ? `ключевиков ${d.keywords.total}, не пройдено ${d.keywords.left}. Список можно поправить — по строке на запрос.`
-    : 'Модель предложит сотни запросов: застройщики, ЖК, районы, «ипотека екб»… Список можно поправить — по строке на запрос.';
+    : d.keywords.total ? `ключевиков ${d.keywords.total}, не пройдено ${d.keywords.left}${sim}. Список можно поправить — по строке на запрос.`
+    : 'Модель предложит сотни запросов: застройщики, ЖК, районы, «ипотека екб»… Список можно поправить — по строке на запрос.' + sim;
   $('#ld-kw-make').disabled = !!d.kwBusy;
   const fb = $('#ld-find');
   fb.textContent = d.finding ? 'Остановить поиск' : 'Найти чаты';

@@ -167,8 +167,10 @@ async def read_chat(client, acc, key, ch, days, joined):
         return 0, f"это тот же чат, что уже в очереди ({dup}) — пропускаю"
     # read_ref — откуда сообщения на самом деле (у канала это его обсуждение):
     # по нему писатель потом найдёт сообщение лида
+    # kind — канал или группа: у канала потом спросят похожие (enrich-find)
     enrich.set_chat(key, title=title, chat_id=entity.id, username=getattr(head, "username", "") or "",
-                    read_ref=("@" + entity.username) if getattr(entity, "username", None) else "")
+                    read_ref=("@" + entity.username) if getattr(entity, "username", None) else "",
+                    kind="channel" if getattr(head, "broadcast", False) else "group")
 
     # публичную группу можно читать и так, но читателю положено быть внутри —
     # так видна вся история. Группу «по заявке» читаем снаружи: заявку не шлём
