@@ -10,7 +10,9 @@
 # Если в конце «всё чисто»:
 #     bash /root/tg-merge/work/deploy/push.sh --here --code-only
 #
-#   --base <коммит>   общая база ветки и серверного кода (по умолчанию main на 19.10)
+#   --base <коммит>   общая база ветки и серверного кода (по умолчанию main на 19.10).
+#                     Ветка уже выкладывалась так раньше — база тот коммит, который
+#                     выкладывали: тогда накладывается только то, что изменилось с него
 #   --live <папка>    где стоит панель (по умолчанию /opt/tg-panel)
 #   --out <папка>     где собирать (по умолчанию /root/tg-merge)
 #
@@ -119,6 +121,7 @@ if ! patch -p1 -d "$OUT/work" --dry-run < "$OUT/branch.patch" > "$OUT/dry.txt" 2
   # dry-run пишет «checking file X», потом по куску «Hunk #N FAILED at L»
   awk '/^(checking|patching) file /{f=$3} /Hunk .*FAILED|can.t find/{n[f]++} END{for (k in n) printf "  не легло в %s: кусков %d\n", k, n[k]}' \
     "$OUT/dry.txt"
+  grep -q 'previously applied' "$OUT/dry.txt" && echo "  похоже, часть правок ветки уже стоит на сервере — запусти с --base <коммит прошлой выкладки>"
   die "правки ветки не ложатся на серверный код без ручного слияния (выше — где). На сервере ничего не менял."
 fi
 grep -B1 'fuzz' "$OUT/dry.txt" | grep -v '^--$' | sed 's/^/  неточно: /' || true
