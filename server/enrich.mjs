@@ -182,7 +182,7 @@ export function makeEnrich({ DIR, CODE, accounts, running, launch, pythonCmd, pu
         p.note = s?.note || (s?.stop === 'flood' ? 'флуд-пауза' : 'отдых');
       } else if (code !== 0 && !s) {
         p.nextAt = Date.now() + 5 * 60_000;
-        p.note = `${what}: сбой, повтор через 5 мин`;
+        p.note = `${what}: сбой (чаще всего нет связи с Telegram — прокси аккаунта), повтор через 5 мин, подробности в журнале`;
       } else {
         p.nextAt = Date.now() + (20 + Math.random() * 40) * 1000;
         p.note = '';

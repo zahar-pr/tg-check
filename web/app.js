@@ -2723,6 +2723,11 @@ async function leadsView(force) {
     step(d.profileBusy ? 'run' : d.profileLeft ? 'wait' : (d.leadsTotal ? 'ok' : ''), 'Профили',
       d.profileLeft ? `осталось посмотреть ${d.profileLeft}` : d.leadsTotal ? 'посмотрены' : '—'),
     step(d.leadsTotal ? 'ok' : '', 'Лиды', `${d.leadsTotal}` + (d.leadsExcluded ? ` · исключено продавцов ${d.leadsExcluded}` : '')),
+    // почему стоит: читатель на паузе после сбоя (нет связи, флуд), без входа, на отлёжке
+    step((d.readers || []).some((r) => r.busy) ? 'run' : (d.readers || []).some((r) => r.rest || !r.ready) ? 'wait' : (d.readers || []).length ? 'ok' : '',
+      'Читатели', (d.readers || []).map((r) => `${esc(r.name || r.title)}: ` + (r.busy ? esc(r.busy.split(' — ')[0].toLowerCase())
+        : r.resting ? 'отлёжка первых суток' : r.rest ? `пауза ${r.rest} мин` + (r.note ? ` — ${esc(r.note)}` : '')
+        : r.ready ? 'готов' : 'не готов: нет входа, заморожен или в резерве')).join(' · ') || 'не отмечены'),
   ].join('') : '';
 
   // читатели — галочки по всем вошедшим; занятые рассылкой не отмечаются
