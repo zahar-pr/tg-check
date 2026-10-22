@@ -36,6 +36,7 @@ AROUND = 10               # соседних сообщений до и посл
 CHUNK = 12000             # столько символов окна за один запрос к модели
 WORKERS = 4               # запросов к модели одновременно
 FAILS_STOP = 6            # подряд не ответила модель — останавливаемся, чат ждёт
+PREFILTER_FROM = 40       # в чате меньше авторов предфильтр не нужен: разбираем всех
 
 SYSTEM = """Ты разбираешь переписку из Telegram-чата и ищешь людей, которые {goal}.
 
@@ -46,6 +47,9 @@ SYSTEM = """Ты разбираешь переписку из Telegram-чата 
 Реши, относится ли ЦЕЛЬ к тем, кто {goal}. Читай смысл и контекст, а не ключевые слова:
 - короткий ответ ЦЕЛИ («да», «+», «и я тоже», «тоже ищу», «интересует») на чужой
   вопрос или реплику по теме — это интерес ЦЕЛИ, хотя ключевых слов у неё нет;
+- комментарий ЦЕЛИ под постом продавца или застройщика («подробности», «цена?»,
+  «сколько стоит», «+», «в лс», «интересно») — интерес ЦЕЛИ, если пост про то,
+  что мы ищем. Пост, на который она отвечает, стоит перед её репликой (↳);
 - вопросы «для себя» по теме (цены, условия, сроки, где выбрать) — скорее интерес;
 - НЕ лид: те, кто сам продаёт или предлагает это за деньги (продавцы, агенты,
   посредники, реклама, боты); кто уже получил своё и просто делится; кто
@@ -85,6 +89,13 @@ def line(m, me):
     return f"{mark} #{m['id']} [{str(m.get('date', ''))[:16].replace('T', ' ')}] {who}{name}{reply}: {text}"
 
 
+def context_line(m):
+    """Сообщение, на которое ЦЕЛЬ отвечает, хотя оно вне окна (пост канала, вопрос)."""
+    who = f"@{m['un']}" if m.get("un") else (m.get("name") or f"id{m.get('uid')}")
+    text = " ".join(str(m.get("text") or "").split())[:600]
+    return f"↳ #{m['id']} [{str(m.get('date', ''))[:16].replace('T', ' ')}] {who}: {text}"
+
+
 def windows(pos, total):
     """Позиции сообщений автора -> слитые отрезки [a, b] с соседями."""
     out = []
@@ -105,10 +116,20 @@ def chunks(msgs, spans, me):
     модели не доходили бы вовсе. Кусок без единой реплики автора не нужен.
     """
     blocks = []
+    byid = {m["id"]: m for m in msgs}
     for a, b in spans:
         cur, size = [], 0
+        inside = {m["id"] for m in msgs[a:b + 1]}
+        lines = []
         for m in msgs[a:b + 1]:
-            ln = line(m, me)
+            r = m.get("reply_to")
+            # ЦЕЛЬ отвечает на пост или вопрос вне окна — ставим его перед репликой:
+            # «подробности» без поста застройщика ничего не значит
+            if m.get("uid") == me and r and r not in inside and r in byid:
+                lines.append(context_line(byid[r]))
+                inside.add(r)
+            lines.append(line(m, me))
+        for ln in lines:
             if cur and size + len(ln) + 1 > CHUNK:
                 blocks.append(cur)
                 # контекст на стыке — последние строки куска, но не больше трети
@@ -391,15 +412,22 @@ def main():
     # AROUND соседних) тема хоть как-то упомянута. «Да» на «хату брать будешь?»
     # проходит — «хату» есть в окне. Главная экономия токенов: в большом чате о
     # теме говорит малая часть людей.
-    roots = enrich.stems() or ([] if sample else enrich.make_stems(enrich.goal()))
-    if roots and todo:
-        hit = [any(r in str(m.get("text") or "").lower() for r in roots) for m in msgs]
-        where = {}
+    small = len(authors) <= PREFILTER_FROM
+    roots = [] if small else (enrich.stems() or ([] if sample else enrich.make_stems(enrich.goal())))
+    if small:
+        say(f"авторов {len(authors)} — разбираю всех, без предфильтра")
+    elif roots and todo:
+        topic_re = enrich.stems_re(roots)
+        hit = [bool(topic_re.search(str(m.get("text") or "").lower().replace("ё", "е"))) for m in msgs]
+        where, replied, at = {}, {}, {m["id"]: i for i, m in enumerate(msgs)}
         for i, m in enumerate(msgs):
             if m.get("uid"):
                 where.setdefault(m["uid"], []).append(i)
+                if m.get("reply_to") in at:          # пост или вопрос, на который он ответил
+                    replied.setdefault(m["uid"], []).append(at[m["reply_to"]])
         quiet = [uid for uid in todo
-                 if not any(any(hit[a:b + 1]) for a, b in windows(where.get(uid, []), len(msgs)))]
+                 if not any(any(hit[a:b + 1]) for a, b in windows(where.get(uid, []), len(msgs)))
+                 and not any(hit[i] for i in replied.get(uid, []))]
         if quiet:
             todo = [uid for uid in todo if uid not in set(quiet)]
             say(f"без слов темы рядом — к модели не идут: {len(quiet)}, к разбору: {len(todo)}")

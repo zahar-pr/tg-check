@@ -22,6 +22,7 @@ import asyncio
 import json
 import random
 import re
+from datetime import datetime, timezone
 
 import enrich
 import llm
@@ -35,48 +36,93 @@ PAUSE = (2, 4)
 MIN_MEMBERS = 30          # совсем пустые чаты не читаем
 FLOOD_MAX = 120
 
-# Ключевики — порциями: двести штук одним ответом многословная модель не
-# укладывает ни в лимит токенов, ни в таймаут, и весь ответ пропадал
-KW_ROUND = 60             # ключевиков за один запрос
-KW_TARGET = 180           # всего: раунды идут, пока не наберём или не иссякнет
-KW_ROUNDS = 5
+# Поиск Telegram (contacts.Search) ищет по НАЗВАНИЯМ и никам чатов. Ключевик —
+# это то, как чат называется («ЖК Светлый», «ипотека Екб», «соседи Уралмаш»),
+# а не фраза покупателя: «ищу квартиру екатеринбург покупка» не найдёт ничего.
+# Поэтому: план разбирает запрос на место и слова темы — из них код сам
+# собирает запросы; модель по отдельности называет конкретные имена (ЖК,
+# застройщики, районы), сообщества и обсуждения; всё, что похоже на фразу
+# покупателя или продавца, код выбрасывает.
+KW_PER_FACET = 50
+KW_MAX_WORDS = 3
+KW_LIMIT = 400            # больше ключевиков не держим: снежный ком не разрастается
 KW_TOKENS = 12000         # потолок, а не плата: «думающая» модель тратит часть на рассуждения
 KW_TIMEOUT = 180          # сек на один ответ модели
+# начала слов, с которыми запрос — фраза покупателя/продавца, а не название чата
+BAD_QUERY = re.compile(
+    r"(?<![а-яёa-z])(купи|купл|покуп|ищу|ищем|ищет|хочу|хотим|хочет|где|как|куда|помощ|помог|лучш|"
+    r"дешев|цены|цена|стоимост|список|найти|поиск|подбор|посмотр|прода|агентст|риелт|риэлт|"
+    r"объявлен|услуг|срочно|недорог|частн)", re.I)
 
-KW_PROMPT = """Тема: «{topic}».{goal}
-Составь {n} поисковых запросов, по которым в поиске Telegram найдутся
-чаты и каналы, где сидят люди по этой теме. Запросы короткие (1–3 слова), как
-люди называют свои чаты и каналы. Перебирай конкретное:
-- названия мест, компаний, брендов, объектов, товаров по теме (для жилья —
-  застройщики и ЖК, для авто — марки и автосалоны, и т.п.);
-- город, районы, пригороды, сокращения и варианты написания города;
-- сообщества: «соседи …», «чат дома …», «родители …», «барахолка …» и т.п.;
-- обычные запросы людей по теме вместе с городом.
-НЕ пиши общие слова без места и названия («квартира», «недвижимость»,
-«продажа», «риелтор», «агентство», «ипотека»): по ним находятся каналы
-продавцов и агентств, а нам нужны чаты, где сидят сами покупатели/клиенты.{have}
-Ответь ТОЛЬКО JSON-массивом строк, без нумерации и пояснений."""
+FACETS = [
+    ("имена", "Назови конкретные НАЗВАНИЯ по теме: компании, бренды, объекты, места. Для жилья — "
+              "жилые комплексы (ЖК) и застройщики этого места, районы, микрорайоны и пригороды. "
+              "Только настоящие названия, которые ты знаешь, — не выдумывай."),
+    ("сообщества", "Назови, как называют СООБЩЕСТВА людей по теме: «соседи …», «жители …», «чат …», "
+                   "«мамы …», «переезд в …», чаты районов, домов и посёлков."),
+    ("обсуждения", "Назови ОБСУЖДЕНИЯ темы с местом: короткая тема + место (для жилья: «ипотека Екб», "
+                   "«новостройки Екатеринбург», «дольщики Екб», «ремонт квартиры Екб»)."),
+]
+
+KW_PROMPT = """Ищем Telegram-чаты, где сидят люди, которые {goal}.
+Поиск Telegram ищет по НАЗВАНИЯМ чатов — поэтому нужны не фразы, а то, как
+такие чаты называются.
+
+{facet}
+
+Правила:
+- каждый запрос — 1–3 слова, как в названии чата;
+- без глаголов и вопросов: «купить», «ищу», «хочу», «где», «как», «помощь»;
+- без слов продавцов: «продажа», «продам», «агентство», «риелтор», «объявления»;
+- место — одним словом в конце, если нужно: {places}.
+Пример хороших запросов для жилья в Екатеринбурге: «ЖК Солнечный», «соседи
+Академический», «Брусника Екб», «ипотека Екб», «новостройки Екатеринбург»,
+«Уралмаш чат», «переезд в Екатеринбург».{have}
+Ответь ТОЛЬКО JSON-массивом из {n} строк."""
 
 PLAN_PROMPT = """Владелец написал, кого ищет: «{query}».
-Разверни это для системы, которая ищет таких людей в Telegram-чатах:
-- goal — кого ищем, одной фразой в форме «хочет/ищет …» (с местом, если оно есть);
-- topic — тема для поиска чатов, 2–5 слов (с городом, если он есть);
-- keywords — 40 коротких поисковых запросов (1–3 слова), как люди называют
-  свои чаты и каналы по этой теме: конкретные места, компании, объекты,
-  районы, сообщества («соседи …», «чат …»), сокращения города. Без общих слов
-  вроде «недвижимость», «продажа», «риелтор» — по ним находятся продавцы.
+Мы ищем Telegram-чаты, где пишут такие люди. Разбери запрос:
+- goal — кого ищем, одной фразой «хочет/ищет …» (с местом, если оно есть);
+- topic — тема, 2–4 слова;
+- places — как это место пишут в названиях чатов: полное название и сокращения
+  (для Екатеринбурга: «Екатеринбург», «Екб», «Екат», «Ебург»); места нет — [];
+- nouns — 6–10 коротких слов темы, которые стоят в названиях таких чатов
+  (для квартир: «квартиры», «новостройки», «ипотека», «ЖК», «недвижимость», «соседи»).
 Ответь ТОЛЬКО JSON без пояснений:
-{{"goal": "...", "topic": "...", "keywords": ["...", "..."]}}"""
+{{"goal": "...", "topic": "...", "places": ["..."], "nouns": ["..."]}}"""
 
-FIT_PROMPT = """Ищем Telegram-чаты, где можно найти людей, которые {goal}.
-Тема поиска: «{topic}».
-Ниже чаты: номер, название, тип. Подходят чаты, где обсуждают эту тему или
-где по месту и составу сидят такие люди (городские и районные, по объектам
-и сообществам темы). Не подходят: другие города (если город задан), другая
-тематика, чисто рекламные каналы продавцов без обсуждения.
-Ответь ТОЛЬКО JSON-массивом номеров подходящих чатов.
+FIT_PROMPT = """Ищем Telegram-чаты, где ЖИВЫЕ ЛЮДИ переписываются и среди них есть те, кто {goal}.
+Ниже найденные чаты: номер, название, тип, участников.
+
+Подходят:
+- чаты жителей и соседей: дома, ЖК, района, посёлка, города;
+- обсуждения темы, где пишут обычные люди (для жилья: ипотека, новостройки,
+  дольщики, ремонт, переезд);
+- общие чаты города или района, если место совпадает;
+- КАНАЛЫ С КОММЕНТАРИЯМИ застройщиков, ЖК, компаний по теме: под их постами
+  («пишите в комментарии — скинем цены») отвечают покупатели.
+Не подходят:
+- доски объявлений — группы, где все сами продают или сдают («продам»,
+  «сдам», «аренда», «объявления», «купить продать снять»);
+- аренда и посуточно, работа и вакансии — если ищем не это;
+- другой город или страна (если место задано), чужой язык;
+- магазины, спам, новости без обсуждения.
+Сомневаешься в месте или теме — не бери: каждый лишний чат стоит вступления.
+Ответь ТОЛЬКО JSON-массивом номеров подходящих чатов, например [0, 3]; нет подходящих — [].
 
 {items}"""
+
+# Чат до вступления: последние сообщения без вступления — живой ли разговор людей
+SAMPLE = 40
+DEAD_DAYS = 30            # молчит дольше — мёртвый
+MIN_AUTHORS = 4           # пишет меньше людей — канал или доска, а не разговор
+AD_SHARE = 0.6            # столько объявлений среди сообщений — доска объявлений
+AD_RE = re.compile(
+    r"(\+7|(?<!\d)8)[\s\-()]*\d{3}[\s\-()]*\d{3}|(?<![а-яё])(продам|продаю|продаётся|продается|сдам|сдаю|"
+    r"сдаётся|сдается|посуточно)|https?://|t\.me/", re.I)
+# «ЖК Светлый», «мкр Академический» в названиях найденных чатов — новые ключевики
+NAME_RE = re.compile(r"(?<![а-яёa-z])(ЖК|ЖР|КП|мкр\.?|микрорайон|квартал|посёлок|поселок)\s*[«\"“„]?"
+                     r"([A-ZА-ЯЁ0-9][\wЁё\-]*(?:\s+[A-ZА-ЯЁ0-9][\wЁё\-]*)?)")
 
 
 def last_json(out, kind):
@@ -92,6 +138,14 @@ def last_json(out, kind):
         if isinstance(d, list) and all(isinstance(x, kind) for x in d):
             found = d
     return found
+
+
+def good_query(q):
+    """Похоже на название чата, а не на фразу покупателя или продавца?"""
+    q = " ".join(str(q).replace("«", "").replace("»", "").replace('"', "").split())
+    if not q or len(q) > 40 or len(q.split()) > KW_MAX_WORDS or q.isdigit():
+        return ""
+    return "" if BAD_QUERY.search(q) else q
 
 
 def strings_from(out, start):
@@ -139,35 +193,48 @@ def make_stems(goal):
     return got
 
 
-def gather(topic, goal="", seed=()):
+def gather(topic, goal="", seed=(), places=()):
     """
-    Ключевики раундами по KW_ROUND: каждый следующий просит других, не тех,
-    что уже есть. Раунд, который дал мало нового, — последний.
+    Ключевики: сперва seed (собраны кодом из места и слов темы), потом модель по
+    граням — имена (ЖК, застройщики, районы), сообщества, обсуждения. Каждый
+    следующий запрос видит, что уже есть. Отбор — good_query.
     """
     words, seen = [], set()
+    goal = goal or enrich.goal()
+    where = ", ".join(f"«{p}»" for p in places) or "если в цели есть место — его название и сокращения"
 
     def take(ws):
-        new = [w for w in (" ".join(str(x).split())[:60] for x in ws) if w and w.lower() not in seen]
-        for w in new:
-            seen.add(w.lower())
+        new = []
+        for w in ws:
+            w = good_query(w)
+            if w and w.lower() not in seen:
+                seen.add(w.lower())
+                new.append(w)
         words.extend(new)
         return len(new)
 
     take(seed)
-    for _ in range(KW_ROUNDS):
-        if len(words) >= KW_TARGET:
-            break
-        have = ("\nУже есть — НЕ повторяй их, дай другие: " + ", ".join(words))[:4000] if words else ""
-        out = ask_text(KW_PROMPT.format(topic=topic, goal=f"\nИщем людей, которые {goal}." if goal else "",
-                                        n=KW_ROUND, have=have), 0.7)
+    if seed:
+        say(f"  из места и слов темы: {len(words)}")
+    for name, facet in FACETS:
+        have = ("\nУже есть — НЕ повторяй их, дай другие: " + ", ".join(words))[:3000] if words else ""
+        out = ask_text(KW_PROMPT.format(goal=goal, facet=facet, places=where, n=KW_PER_FACET, have=have), 0.6)
         if not out:
-            say(f"  модель не ответила ({llm.LAST_ERR or 'нет ответа'}) — беру, что есть")
-            break
+            say(f"  {name}: модель не ответила ({llm.LAST_ERR or 'пусто'}) — дальше")
+            continue
         n = take(word_list(out))
-        say(f"  +{n} ключевиков, всего {len(words)}")
-        if n < 10:
-            break
+        say(f"  {name}: +{n}, всего {len(words)}")
     return words
+
+
+def seeds(places, nouns):
+    """Запросы, которые код собирает сам: место, «слово темы + место»."""
+    places = [good_query(p) for p in places if good_query(p)][:4]
+    nouns = [good_query(n) for n in nouns if good_query(n)][:10]
+    out = list(places)
+    for p in places[:3]:
+        out += [f"{n} {p}" for n in nouns]
+    return out if places else nouns
 
 
 def save_keywords(topic, words):
@@ -191,11 +258,9 @@ def _blank(s):
 
 def parse_plan(out):
     """
-    (goal, topic, keywords) из ответа модели — или None. Модели с рассуждениями
-    повторяют в ответе шаблон из промпта ({"goal": "...", …}) и потом пишут
-    настоящий JSON, который бывает обрезан. Поэтому идём с конца и берём только
-    объект, похожий на план: цель и тема не «...», ключевики — список настоящих
-    строк, и их не меньше PLAN_MIN.
+    {goal, topic, places, nouns} из ответа модели — или None. Модели с
+    рассуждениями повторяют шаблон из промпта ({"goal": "...", …}) — берём
+    последний объект с настоящими целью и темой.
     """
     dec = json.JSONDecoder(strict=False)
     for m in reversed(list(re.finditer(r'\{\s*"goal"', out or ""))):
@@ -203,27 +268,13 @@ def parse_plan(out):
             plan, _ = dec.raw_decode(out, m.start())
         except ValueError:
             continue
-        if not isinstance(plan, dict) or not isinstance(plan.get("keywords"), list):
+        if not isinstance(plan, dict) or _blank(plan.get("goal")) or _blank(plan.get("topic")):
             continue
-        words = [w for w in plan["keywords"] if isinstance(w, str) and not _blank(w)]
-        if _blank(plan.get("goal")) or _blank(plan.get("topic")) or len({w.lower() for w in words}) < PLAN_MIN:
-            continue
-        return (" ".join(str(plan["goal"]).split())[:300], " ".join(str(plan["topic"]).split())[:100], words)
+        lst = lambda k: [str(x) for x in plan.get(k) or [] if isinstance(x, str) and not _blank(x)] \
+            if isinstance(plan.get(k), list) else []
+        return {"goal": " ".join(str(plan["goal"]).split())[:300], "topic": " ".join(str(plan["topic"]).split())[:100],
+                "places": lst("places")[:6], "nouns": lst("nouns")[:12]}
     return None
-
-
-def salvage_plan(out):
-    """Ответ обрезан: цель и тема обычно целы, из ключевиков — что успело."""
-    def field(name):
-        m = None
-        for m in re.finditer(r'"%s"\s*:\s*"((?:[^"\\]|\\.)*)"' % name, out or ""):
-            pass                                    # последнее вхождение: шаблон из промпта — раньше
-        return " ".join(m.group(1).split()) if m else ""
-    goal, topic = field("goal"), field("topic")
-    if _blank(goal) or _blank(topic):
-        return None
-    kw = list(re.finditer(r'"keywords"\s*:\s*\[', out or ""))
-    return goal[:300], topic[:100], (strings_from(out, kw[-1].end()) if kw else [])
 
 
 def make_plan(query):
@@ -232,15 +283,15 @@ def make_plan(query):
     разбора, тема для поиска чатов и ключевики. Последней строкой — JSON для
     панели: цель и тему она сохраняет в enrich/state.json сама.
     """
-    out = ask_text(PLAN_PROMPT.format(query=query), 0.5)
-    plan = (parse_plan(out) or salvage_plan(out)) if out else None
+    out = ask_text(PLAN_PROMPT.format(query=query), 0.3, tokens=None)
+    plan = parse_plan(out) if out else None
     if not plan:
         why = llm.LAST_ERR or ("пустой ответ" if out == "" else (out or "")[:120])
         raise SystemExit(f"модель не разобрала запрос: {why}")
-    goal, topic, seed = plan
+    goal, topic = plan["goal"], plan["topic"]
     say(f"кого ищем: {goal}")
-    say(f"тема поиска: {topic} · добираю ключевики порциями")
-    words = gather(topic, goal, seed)
+    say(f"тема: {topic} · место: {', '.join(plan['places']) or '—'} · слова темы: {', '.join(plan['nouns']) or '—'}")
+    words = gather(topic, goal, seeds(plan["places"], plan["nouns"]), plan["places"])
     if len(words) < PLAN_MIN:
         raise SystemExit(f"модель не разобрала запрос: ключевиков мало ({len(words)}) — {llm.LAST_ERR or 'попробуй ещё раз'}")
     items = save_keywords(topic, words)
@@ -270,8 +321,8 @@ def fit(topic, cands):
     очередь всё подряд — каждый лишний чат стоит читателю вступления)."""
     if not cands:
         return []
-    items = "\n".join(f"{i}. {c['title']} ({'канал' if c['kind'] == 'channel' else 'группа'})"
-                      for i, c in enumerate(cands))
+    items = "\n".join(f"{i}. {c['title']} — {'канал с комментариями' if c['kind'] == 'channel' else 'группа'}"
+                      + (f", участников {c['n']}" if c.get("n") else "") for i, c in enumerate(cands))
     info = {}
     out = enrich.ask_llm("Отвечай строго в формате, который просят.",
                          FIT_PROMPT.format(goal=enrich.goal(), topic=topic, items=items),
@@ -341,7 +392,117 @@ def candidate(c, known):
     if (c.participants_count or MIN_MEMBERS) < MIN_MEMBERS:
         return None
     return {"ref": "@" + c.username, "chat_id": c.id, "title": tglib.cell(c.title),
-            "n": c.participants_count or "", "kind": "channel" if c.broadcast else "group"}
+            "n": c.participants_count or "", "kind": "channel" if c.broadcast else "group", "_obj": c}
+
+
+QUEUE_KEYS = ("ref", "chat_id", "title", "n", "kind", "sample")
+
+
+async def qualify(client, c):
+    """
+    Живой ли это разговор людей — по последним SAMPLE сообщениям, без
+    вступления (публичную группу Telegram показывает и так). (годится, почему
+    нет, сводка). Не дали посмотреть — пускаем: решит чтение.
+    """
+    from telethon import functions
+    from telethon.errors import FloodWaitError
+    obj = c.get("_obj")
+    if obj is None:
+        return True, "", {}
+    try:
+        target = obj
+        if obj.broadcast:                   # у канала люди пишут в обсуждении
+            full = await client(functions.channels.GetFullChannelRequest(obj))
+            lid = getattr(full.full_chat, "linked_chat_id", None)
+            target = next((x for x in full.chats if x.id == lid), None)
+            if target is None:
+                return False, "у канала нет обсуждения", {}
+        msgs = await client.get_messages(target, limit=SAMPLE)
+    except FloodWaitError:
+        raise
+    except Exception:
+        return True, "", {"note": "не дали посмотреть без вступления"}
+    # только люди: в обсуждении канала его посты приходят от самого канала
+    # (sender_id < 0) — это не разговор, и цены в них объявлениями не считаем
+    texts = [m for m in msgs if getattr(m, "message", None) and (getattr(m, "sender_id", None) or 0) > 0]
+    if not texts:
+        return False, "нет сообщений людей", {}
+    days = max(0, (datetime.now(timezone.utc) - texts[0].date).days)
+    authors = len({m.sender_id for m in texts})
+    ads = sum(1 for m in texts if AD_RE.search(m.message)) / len(texts)
+    sample = {"days": days, "authors": authors, "ads": round(ads, 2), "msgs": len(texts)}
+    if days > DEAD_DAYS:
+        return False, f"мёртвый: последнее сообщение {days} дн. назад", sample
+    if authors < MIN_AUTHORS:
+        return False, f"пишут {authors} чел. — канал или доска, а не разговор", sample
+    if ads >= AD_SHARE:
+        return False, f"доска объявлений: {round(ads * 100)}% — объявления", sample
+    return True, "", sample
+
+
+REJECTED = enrich.ROOT / "rejected.json"     # отсеянные чаты: второй раз не проверяем
+
+
+def reject(c, why):
+    data = enrich.read_json(REJECTED, {})
+    data[str(c["chat_id"])] = {"title": c.get("title", ""), "why": why, "at": enrich.now_iso()}
+    enrich.write_json(REJECTED, data)
+
+
+async def screen(client, topic, cands, known, dry):
+    """
+    Кандидаты -> годные в очередь: модель по названию, потом проверка живости.
+    None/DOWN — как у fit. Отсеянных запоминаем: другой ключевик их не вернёт.
+    """
+    from telethon.errors import FloodWaitError
+    good = fit(topic, cands)
+    if good is None or good == DOWN:
+        return good
+    ids = {str(c["chat_id"]) for c in good}
+    for c in cands:
+        known.add(str(c["chat_id"]))
+        if str(c["chat_id"]) not in ids and not dry:
+            reject(c, "не по теме (модель)")
+    out = []
+    for c in good:
+        try:
+            ok, why, sample = await qualify(client, c)
+        except FloodWaitError as e:
+            if e.seconds > FLOOD_MAX:
+                raise
+            await asyncio.sleep(e.seconds)
+            ok, why, sample = True, "", {}
+        if ok:
+            out.append({**c, "sample": sample} if sample else c)
+        else:
+            say(f"    мимо: {c['title']} — {why}")
+            if not dry:
+                reject(c, why)
+        await asyncio.sleep(random.uniform(1, 2))
+    return out
+
+
+def snowball(chats, at0, dry):
+    """«ЖК Светлый», «мкр Академический» из названий найденных чатов — в ключевики."""
+    names = []
+    for c in chats or []:
+        for m in NAME_RE.finditer(str(getattr(c, "title", "") or "")):
+            kind = m.group(1).replace(".", "")
+            q = good_query(f"{'ЖК' if kind.upper() == 'ЖК' else kind} {m.group(2)}")
+            if q:
+                names.append(q)
+    if not names or dry:
+        return []
+    cur = enrich.read_json(enrich.KEYWORDS, {})
+    if cur.get("at") != at0:
+        return []
+    have = {str(i.get("q", "")).lower() for i in cur.get("items", [])}
+    new = [q for q in dict.fromkeys(names) if q.lower() not in have][:max(0, KW_LIMIT - len(have))]
+    if new:
+        cur["items"] = cur.get("items", []) + [{"q": q, "done": False, "found": 0, "from": "названия чатов"}
+                                               for q in new]
+        enrich.write_json(enrich.KEYWORDS, cur)
+    return new
 
 
 def bump_seed_fail(key):
@@ -408,16 +569,14 @@ async def similar(client, topic, known, dry, budget):
             await asyncio.sleep(random.uniform(*PAUSE))
             continue
         cands = [c for c in (candidate(x, known) for x in (res.chats or [])) if c]
-        good = fit(topic, cands)
+        good = await screen(client, topic, cands, known, dry)
         if good is None or good == DOWN:
             if good is None and not dry:
                 bump_seed_fail(key)
             return added, 0, "errors"
-        for c in good:
-            known.add(str(c["chat_id"]))
         level = int(seed.get("level") or 0) + 1
         got = 0 if dry else enrich.add_chats(
-            [{**{k: c[k] for k in ("ref", "chat_id", "title", "n", "kind")}, "level": level} for c in good],
+            [{**{k: c[k] for k in QUEUE_KEYS if k in c}, "level": level} for c in good],
             source=f"похожие на {seed['ref']}")
         added += got
         say(f"{seed['ref']}: похожих {len(cands)}, по теме {len(good)}"
@@ -439,6 +598,7 @@ async def search(acc, per_run, dry):
     at0 = kw.get("at")
     # без темы (каналы добавили ссылками) модель судит по цели разбора
     topic = kw.get("topic") or enrich.read_json(enrich.STATE, {}).get("topic") or enrich.goal()
+    # снежный ком добавляет ключевики по ходу — список берём заново каждый заход
     todo = [i for i in kw.get("items", []) if not i.get("done")]
     if not todo and not enrich.similar_seeds():
         say("искать нечего: ключевики пройдены, похожие на все каналы уже проверены")
@@ -449,6 +609,7 @@ async def search(acc, per_run, dry):
 
     client = await tglib.connect(acc)
     known = {str(v.get("chat_id")) for v in enrich.load_chats().values() if v.get("chat_id")}
+    known |= set(enrich.read_json(REJECTED, {}))
     added = wait = 0
     stop = ""
     try:
@@ -491,7 +652,10 @@ async def search(acc, per_run, dry):
                 got_c = candidate(c, known)
                 if got_c:
                     cands.append(got_c)
-            good = fit(topic, cands)
+            snow = snowball(res.chats, at0, dry)
+            if snow:
+                say(f"    из названий чатов — новые ключевики: {', '.join(snow)}")
+            good = await screen(client, topic, cands, known, dry)
             if good is None or good == DOWN:
                 # модель ответила, но непонятно, — дважды так, и ключевик пропускаем;
                 # простой модели ключевику не засчитываем
@@ -499,10 +663,8 @@ async def search(acc, per_run, dry):
                     bump_fit_fail(item["q"], at0)
                 stop = "errors"
                 break
-            for c in good:
-                known.add(str(c["chat_id"]))
             got = 0 if dry else enrich.add_chats(
-                [{k: c[k] for k in ("ref", "chat_id", "title", "n", "kind")} for c in good],
+                [{k: c[k] for k in QUEUE_KEYS if k in c} for c in good],
                 source=f"поиск: {item['q']}")
             added += got
             say(f"«{item['q']}»: найдено {len(cands)}, по теме {len(good)}"

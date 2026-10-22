@@ -2718,7 +2718,8 @@ async function leadsView(force) {
     step(d.planning ? 'run' : d.planErr ? 'err' : d.goal ? 'ok' : '', 'План', d.planning ? 'модель разбирает запрос и подбирает ключевики'
       : d.planErr ? esc(d.planErr) : d.goal ? `ищем тех, кто ${esc(d.goal)}` : '—'),
     step(stF, 'Поиск чатов', d.keywords.total ? `ключевиков ${d.keywords.total}, осталось ${d.keywords.left}` +
-      (d.similarLeft ? ` · каналов для похожих ${d.similarLeft}` : '') : '—'),
+      (d.similarLeft ? ` · каналов для похожих ${d.similarLeft}` : '')
+      + (d.rejected ? ` · отсеяно чатов ${d.rejected} (не по теме, мёртвые, доски объявлений)` : '') : '—'),
     step(reading ? 'run' : queued ? 'wait' : (c0.done ? 'ok' : ''), 'Чтение', `в очереди ${queued}, читается ${reading}`),
     step(d.analyzer ? 'run' : inAnalysis ? 'wait' : (c0.done ? 'ok' : ''), 'Разбор',
       d.analyzer ? `разбирается «${esc(d.analyzer.title)}»` : `разобрано чатов ${c0.done || 0}` + (inAnalysis ? `, ждут ${inAnalysis}` : '')),

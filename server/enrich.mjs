@@ -364,6 +364,8 @@ export function makeEnrich({ DIR, CODE, accounts, running, launch, pythonCmd, pu
       kwBusy: !!kwJob,
       keywords: { total: (kw.items || []).length, left: kwLeft(), list: (kw.items || []).map((i) => i.q) },
       similarLeft: simLeft(),
+      // отсеяно до чтения: не по теме, мёртвые, доски объявлений (enrich-find.screen)
+      rejected: Object.keys(read(path.join(ROOT, 'rejected.json'), {})).length,
       analyzer: analyzer ? { title: analyzer.title, since: analyzer.since } : null,
       counts, chats: list.slice(0, 500), chatsTotal: list.length,
       readers: accounts.list().filter((a) => a.role === 'read').map((a) => {

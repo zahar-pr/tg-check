@@ -56,34 +56,66 @@ def ask_llm(system, user, **kw):
     return llm.chat(system, user, provider=llm_provider(), **kw)
 
 
-def save_stems(goal, stems):
-    """Корни слов темы для цели — какие окна вообще показывать модели."""
-    clean = sorted({" ".join(str(s).lower().split())[:30] for s in stems if str(s).strip()} - {""})
+# Предфильтр разбора — корни слов темы. Модель называет обычные СЛОВА
+# («квартира», «хата», «однушка»), корни режет код: склеенных «купкварт» в
+# переписке не бывает, и такой предфильтр отсеивал всех подряд.
+STEMS_V = 2
+STOP_WORDS = {"хочет", "хочу", "хотят", "ищет", "ищу", "ищут", "нужно", "нужен", "нужна", "нужны", "который",
+              "которые", "человек", "люди", "сейчас", "очень", "можно"}
+
+
+def stem(word):
+    """Начало слова, по которому узнаются его формы: квартира → кварти, хата → хат."""
+    import re
+    w = re.sub(r"[^a-zа-я0-9]", "", str(word).lower().replace("ё", "е"))
+    if len(w) < 2:
+        return ""
+    return w if len(w) <= 3 else w[:max(3, min(7, len(w) - 2))]
+
+
+def stems_re(roots):
+    """Регулярка: корень с начала слова (ложка не совпадёт с «жк»)."""
+    import re
+    return re.compile(r"(?<![a-zа-я0-9])(" + "|".join(sorted({re.escape(r) for r in roots}, key=len, reverse=True))
+                      + ")")
+
+
+def save_stems(for_goal, words):
+    """Слова темы -> корни для цели; плюс корни слов самой цели (без места и общих слов)."""
+    import re
+    roots = set()
+    for phrase in words:
+        for w in str(phrase).split()[:2]:           # «вторичное жильё» — оба слова
+            roots.add(stem(w))
+    for w in re.findall(r"[А-ЯЁа-яё]{4,}", for_goal):
+        if not w[0].isupper() and w.lower() not in STOP_WORDS:   # место пишется с большой
+            roots.add(stem(w))
+    clean = sorted(r for r in roots if r and len(r) >= 2)
     ROOT.mkdir(parents=True, exist_ok=True)
-    write_json(STEMS, {"goal": goal, "stems": clean, "at": now_iso()})
+    write_json(STEMS, {"goal": for_goal, "stems": clean, "v": STEMS_V, "at": now_iso()})
     return clean
 
 
 def stems():
-    """Корни для текущей цели или [] (тогда разбор без предфильтра или сам их спросит)."""
+    """Корни для текущей цели или [] (тогда разбор их спросит или пойдёт без предфильтра)."""
     d = read_json(STEMS, {})
-    return (d.get("stems") or []) if d.get("goal") == goal() else []
+    return (d.get("stems") or []) if d.get("goal") == goal() and d.get("v") == STEMS_V else []
 
 
 STEMS_PROMPT = """Ищем в переписке Telegram-чатов людей, которые {goal}.
-Перед разбором отсеиваем куски переписки, где тема даже не упоминается.
-Дай 30–60 КОРНЕЙ слов (начала слов, 3–8 букв, в нижнем регистре), которыми
-люди говорят об этом в чатах — и прямо, и разговорно, и сокращениями. Для
-квартиры, например: «квартир», «хат», «однушк», «двушк», «ипотек», «жк»,
-«новостро», «вторичк», «застройщ», «жиль». Город и общие слова («купить»,
-«хочу», «нужно») не нужны — только слова самой темы.
+Перечисли 40–70 СЛОВ, которыми люди пишут об этом в чатах: существительные и
+глаголы темы, разговорные и сокращения. Для покупки квартиры, например:
+«квартира», «хата», «однушка», «двушка», «студия», «ипотека», «ЖК»,
+«новостройка», «вторичка», «застройщик», «переезд», «съехать», «метраж».
+Город и общие слова («купить», «хочу», «нужно») не нужны. Каждое слово —
+отдельной строкой массива, целиком, без склейки с другими.
 Ответь ТОЛЬКО JSON-массивом строк."""
 
 
 def make_stems(for_goal):
     """
-    Корни слов темы у модели обогащения — для предфильтра разбора: к модели
-    идут только авторы, в окне которых тема хоть как-то упомянута. Это и есть
+    Корни слов темы для предфильтра разбора: к модели идут только авторы, в
+    окне которых (или в сообщении, на которое они ответили) тема упомянута. Это
     главная экономия токенов: в большом чате о теме говорит малая часть людей.
     Не вышло — [] (разбор пойдёт без предфильтра).
     """
@@ -92,8 +124,9 @@ def make_stems(for_goal):
                   max_tokens=1500, temperature=0.3, tries=2, timeout=120) or ""
     starts = [m.end() for m in re.finditer(r"\[\s*(?=\")", out)]
     words = re.findall(r'"([^"\\]{2,30})"', out[starts[-1]:]) if starts else []
-    words = [w for w in words if w.strip(" .…") and len(w.strip()) >= 2]
+    words = [w for w in words if w.strip(" .…") and len(w.split()) <= 2]
     return save_stems(for_goal, words) if len(words) >= 5 else []
+
 
 DAYS = 90                    # столько истории читаем
 STALE_READING = 3 * 3600     # читатель пропал дольше — чат возвращается в очередь
@@ -187,7 +220,9 @@ def add_chats(items, source=""):
                        # kind — канал или группа (у канала Telegram знает похожие),
                        # level — сколько шагов «похожих» от найденного поиском
                        **({"kind": it["kind"]} if it.get("kind") else {}),
-                       **({"level": int(it["level"])} if it.get("level") else {})}
+                       **({"level": int(it["level"])} if it.get("level") else {}),
+                       # последние сообщения до вступления: дней тишины, людей, доля объявлений
+                       **({"sample": it["sample"]} if it.get("sample") else {})}
             added += 1
         return added
     return _update(fn)

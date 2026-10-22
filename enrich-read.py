@@ -2,11 +2,19 @@
 """
 Читатель: один чат из очереди обогащения за запуск.
 
-Берёт следующий свободный чат (enrich/chats.json), вступает, если надо,
-выкачивает историю за 90 дней пачками по 100 с паузой 1–3 с и пишет её в
-enrich/raw/<chat_id>.jsonl. Потом выходит из чата: у аккаунта потолок 500
-чатов, а читать этот ему больше незачем. Разбор — уже не его дело
+Берёт следующий свободный чат (enrich/chats.json) и пишет его сообщения за
+90 дней в enrich/raw/<chat_id>.jsonl. Разбор — уже не его дело
 (enrich-analyze.py, без Telegram).
+
+Как читает. Маленький чат (вся история за срок — страница-две) — целиком.
+Большой — ПОИСКОМ ВНУТРИ ЧАТА по корням слов темы (enrich/stems.json:
+«кварти», «хат», «ипоте», «жк»…): каждая находка с соседями и ответами на неё
+(комментарии под постом застройщика, «да» на «хату брать будешь?»). В городском
+чате на тысячи сообщений о теме — десятки, и модели идут они, а не всё подряд.
+
+Вступает, только когда Telegram без этого сообщений не отдаёт: публичную
+группу видно и так, а вступлений у читателя ~20 в сутки. Вступил — потом
+выходит: у аккаунта потолок 500 чатов.
 
 Читатель никому не пишет, не комментирует и не ставит реакций: жалобы и
 заморозки достаются писателям, база с читателями не теряется.
@@ -33,6 +41,12 @@ from chatlib import chat_ref, resolve_chat
 from tglib import say
 
 PAGE = 100
+SEARCH_ROOTS = 30         # корней темы на чат
+SEARCH_LIMIT = 150        # находок на корень
+HITS_MAX = 400            # находок на чат: самые свежие
+CONTEXT = 4               # соседних сообщений до и после находки
+THREADS = 40              # у стольких находок смотрим ответы на них
+REPLIES = 30              # ответов на находку
 PAUSE = (1, 3)            # между запросами истории, сек
 FLOOD_MAX = 600           # дольше этой флуд-паузы не сидим — отдаём чат обратно
 JOIN_MAX = 20             # вступлений в сутки на читателя
@@ -172,24 +186,51 @@ async def read_chat(client, acc, key, ch, days, joined):
                     read_ref=("@" + entity.username) if getattr(entity, "username", None) else "",
                     kind="channel" if getattr(head, "broadcast", False) else "group")
 
-    # публичную группу можно читать и так, но читателю положено быть внутри —
-    # так видна вся история. Группу «по заявке» читаем снаружи: заявку не шлём
-    if isinstance(entity, Channel) and getattr(entity, "left", False) and not getattr(entity, "join_request", False):
-        async def by_join(ent=entity):
-            await client(functions.channels.JoinChannelRequest(ent))
-            return ent
-        await join(client, acc["id"], joined, by_join, key)
     # прошлый заход вступил и умер (убили посреди чтения) — выходит тот, что дочитает
     if not joined and ch.get("joined_by") == acc["id"] and isinstance(entity, Channel) \
             and not getattr(entity, "left", True):
         joined.append(entity)
 
+    async def enter():
+        """Вступить — только если без этого Telegram сообщений не отдаёт."""
+        if not (isinstance(entity, Channel) and getattr(entity, "left", False)) \
+                or getattr(entity, "join_request", False):
+            return False                    # уже внутри, или «по заявке» — заявку не шлём
+        async def by_join(ent=entity):
+            await client(functions.channels.JoinChannelRequest(ent))
+            return ent
+        await join(client, acc["id"], joined, by_join, key)
+        entity.left = False
+        return True
+
     path = enrich.raw_path(entity.id)
     path.parent.mkdir(parents=True, exist_ok=True)
-    offset, n = resume_point(path)
-    if n:
-        say(f"  продолжаю: уже прочитано {n}")
     since = datetime.now(timezone.utc) - timedelta(days=days)
+    for attempt in (0, 1):
+        try:
+            return await fetch(client, entity, key, path, since, days)
+        except FloodWaitError:
+            raise
+        except Exception as e:
+            # снаружи не показали — вступаем и пробуем ещё раз (один раз)
+            if attempt or getattr(e, "code", None) not in (400, 403) or not await enter():
+                raise
+            say("  снаружи сообщений не видно — вступил")
+
+
+async def fetch(client, entity, key, path, since, days):
+    """Сообщения чата за срок в jsonl: маленький — целиком, большой — поиском по теме."""
+    from telethon.errors import FloodWaitError
+
+    offset, n = resume_point(path)
+    if not n:
+        first = await client.get_messages(entity, limit=PAGE)
+        whole = not first or len(first) < PAGE or first[-1].date < since
+        roots = enrich.stems() or ([] if whole else enrich.make_stems(enrich.goal()))
+        if not whole and roots:
+            return await search_read(client, entity, key, path, since, roots)
+    else:
+        say(f"  продолжаю: уже прочитано {n}")
     done_reading = False
     with path.open("a", encoding="utf-8") as out:
         while not done_reading:
@@ -221,8 +262,87 @@ async def read_chat(client, acc, key, ch, days, joined):
                 enrich.set_chat(key, msgs=n)       # заодно отметка «читатель жив»
             await asyncio.sleep(random.uniform(*PAUSE))
 
-    enrich.set_chat(key, status="downloaded", msgs=n, read_at=enrich.now_iso())
+    enrich.set_chat(key, status="downloaded", msgs=n, read_at=enrich.now_iso(), read_mode="целиком")
     return 1, f"готово: сообщений за {days} дн. — {n}"
+
+
+async def search_read(client, entity, key, path, since, roots):
+    """
+    Большой чат — поиском внутри по корням темы. Каждая находка — с соседями
+    (±CONTEXT), с сообщением, на которое она отвечает, и с ответами на неё:
+    «да» на «хату брать будешь?» и «подробности» под постом застройщика
+    без них не понять.
+    """
+    from telethon.errors import FloodWaitError
+
+    async def pause():
+        await asyncio.sleep(random.uniform(*PAUSE))
+
+    async def flood_safe(make):
+        while True:
+            try:
+                return await make()
+            except FloodWaitError as e:
+                if e.seconds > FLOOD_MAX:
+                    raise
+                say(f"  … флуд-пауза {e.seconds} с")
+                await asyncio.sleep(e.seconds)
+
+    hits = {}
+    for root in roots[:SEARCH_ROOTS]:
+        async def one(root=root):
+            got = []
+            async for m in client.iter_messages(entity, search=root, limit=SEARCH_LIMIT):
+                if m.date < since:
+                    break
+                got.append(m)
+            return got
+        for m in await flood_safe(one):
+            hits[m.id] = m
+        await pause()
+    if not hits:
+        enrich.set_chat(key, status="done", msgs=0, authors=0, leads=0, read_mode="поиск",
+                        done_at=enrich.now_iso(), err="о теме здесь не пишут")
+        return 0, "поиск по теме внутри чата ничего не нашёл — чат закрыт"
+    fresh = sorted(hits, reverse=True)[:HITS_MAX]
+    got = {i: hits[i] for i in fresh}
+    want = set()
+    for i in fresh:
+        want.update(range(max(1, i - CONTEXT), i + CONTEXT + 1))
+        r = getattr(getattr(hits[i], "reply_to", None), "reply_to_msg_id", None)
+        if r:
+            want.add(r)
+    want = sorted(want - set(got))
+    for k in range(0, len(want), 100):
+        part = want[k:k + 100]
+        for m in await flood_safe(lambda part=part: client.get_messages(entity, ids=part)):
+            if m is not None:
+                got[m.id] = m
+        await pause()
+    # ответы на находки: комментарии под постом, ответы на вопрос
+    threads = [hits[i] for i in fresh if getattr(getattr(hits[i], "replies", None), "replies", 0)][:THREADS]
+    for t in threads:
+        async def replies(t=t):
+            return [m async for m in client.iter_messages(entity, reply_to=t.id, limit=REPLIES)]
+        try:
+            for m in await flood_safe(replies):
+                got[m.id] = m
+        except FloodWaitError:
+            raise
+        except Exception:
+            pass                            # ответы не дали — хватит соседей
+        await pause()
+    tmp = path.with_suffix(".jsonl.part")
+    n = 0
+    with tmp.open("w", encoding="utf-8") as out:
+        for i in sorted(got):
+            rec = record(got[i])
+            if rec and got[i].date >= since - timedelta(days=7):   # контекст чуть старше срока — пусть будет
+                out.write(json.dumps(rec, ensure_ascii=False) + "\n")
+                n += 1
+    tmp.replace(path)
+    enrich.set_chat(key, status="downloaded", msgs=n, hits=len(fresh), read_at=enrich.now_iso(), read_mode="поиск")
+    return 1, f"поиском по теме: находок {len(fresh)}, с соседями и ответами — сообщений {n}"
 
 
 # ошибки, после которых виноват аккаунт, а не чат: сколько ему отдыхать

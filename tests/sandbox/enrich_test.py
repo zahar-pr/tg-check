@@ -124,8 +124,9 @@ class Full:
 class Client:
     """Ровно то, что зовут enrich-read и find_member/via_message."""
 
-    def __init__(self):
+    def __init__(self, closed=False):
         self.calls = []
+        self.closed = closed                        # снаружи истории не показывают — надо вступить
 
     async def get_entity(self, ref):
         if ref in ("akadem_sosedi", CHAT_ID):
@@ -144,6 +145,9 @@ class Client:
         return types.InputPeerChannel(ent.id, ent.access_hash)
 
     async def get_messages(self, entity, limit=None, offset_id=0, ids=None):
+        if self.closed and "JoinChannelRequest" not in self.calls and ids is None:
+            from telethon.errors import ChannelPrivateError
+            raise ChannelPrivateError(request=None)
         if ids is not None:
             return [next((m for m in MSGS if m.id == i), None) for i in ids]
         older = [m for m in reversed(MSGS) if not offset_id or m.id < offset_id]
@@ -250,12 +254,72 @@ def main():
     out = run_script("enrich-read.py", "--account", "r1", client=c)
     ch = enrich.load_chats()["akadem_sosedi"]
     check(ch["status"] == "downloaded", f"чат выкачан: {ch['status']}")
-    check("JoinChannelRequest" in c.calls and "LeaveChannelRequest" in c.calls, "вступил и вышел")
+    check("JoinChannelRequest" not in c.calls, "публичную группу прочитал снаружи — вступление не потратил")
     raw = [json.loads(x) for x in enrich.raw_path(CHAT_ID).read_text("utf-8").splitlines()]
     check(all(m["uid"] != 6 for m in raw), "бот отброшен")
     check(all("всем привет" not in m["text"] for m in raw), "сообщения старше 90 дней не читаются")
     check(ch["msgs"] == len(raw) == len(SCRIPT) - 2, f"сообщений {ch['msgs']} (ожидалось {len(SCRIPT) - 2})")
-    check(enrich.joins_today("r1") == 1, "вступление посчитано")
+    check(enrich.joins_today("r1") == 0, "вступлений 0")
+
+    print("\n▸ читатель: снаружи не показывают — вступает и потом выходит")
+    enrich.set_chat("akadem_sosedi", status="new", reader="")
+    enrich.raw_path(CHAT_ID).unlink()
+    c = Client(closed=True)
+    run_script("enrich-read.py", "--account", "r1", client=c)
+    ch = enrich.load_chats()["akadem_sosedi"]
+    check(ch["status"] == "downloaded" and "JoinChannelRequest" in c.calls and "LeaveChannelRequest" in c.calls
+          and enrich.joins_today("r1") == 1, f"вступил, прочитал, вышел, вступление посчитано: {ch['status']}")
+
+    print("\n▸ читатель: большой чат — поиском по теме внутри, с соседями и ответами")
+    ns_r = {"__name__": "read_test"}
+    src_r = (REPO / "enrich-read.py").read_text("utf-8").rsplit("\nasyncio.run(main())", 1)[0]
+    exec(compile(src_r, "enrich-read.py", "exec"), ns_r)
+    post_ch = types.Channel(id=990, title="ЛСР Екатеринбург", photo=types.ChatPhotoEmpty(), date=NOW,
+                            broadcast=True, username="lsr_ekb", access_hash=9)
+
+    class BigMsg:
+        def __init__(self, mid, uid, text, days, reply=None, replies=0):
+            self.id, self.message, self.action = mid, text, None
+            self.date = NOW - timedelta(days=days)
+            self.sender = post_ch if uid == 0 else types.User(id=uid, first_name=f"U{uid}", access_hash=uid)
+            self.sender_id = -990 if uid == 0 else uid
+            self.reply_to = types.MessageReplyHeader(reply_to_msg_id=reply) if reply else None
+            self.replies = types.MessageReplies(replies=replies, replies_pts=0) if replies else None
+    big = {i: BigMsg(i, 500 + i % 7, f"болтовня {i}", 60 - i // 6) for i in range(1, 321)}
+    big[150] = BigMsg(150, 3, "Оль, а ты хату брать будешь?", 30, replies=1)
+    big[151] = BigMsg(151, 4, "да", 30, reply=150)
+    big[220] = BigMsg(220, 0, "ЖК Светлый: старт продаж! Пишите в комментарии — скинем цены", 20, replies=2)
+    big[300] = BigMsg(300, 77, "подробности", 9, reply=220)
+    big[310] = BigMsg(310, 78, "сколько стоит двушка?", 8, reply=220)
+
+    class BigClient:
+        async def get_messages(self, entity, limit=None, ids=None, **kw):
+            if ids is not None:
+                return [big.get(i) for i in ids]
+            return [big[i] for i in sorted(big, reverse=True)][:limit]
+
+        async def iter_messages(self, entity, search=None, limit=None, reply_to=None):
+            n = 0
+            for i in sorted(big, reverse=True):
+                m = big[i]
+                if search and search not in m.message.lower():
+                    continue
+                if reply_to and getattr(m.reply_to, "reply_to_msg_id", None) != reply_to:
+                    continue
+                n += 1
+                if limit and n > limit:
+                    return
+                yield m
+    enrich.add_chats([{"ref": "t.me/big_city", "chat_id": 779, "title": "Екатеринбург чат"}])
+    ns_r["PAUSE"] = (0, 0)
+    done, msg = asyncio.run(ns_r["search_read"](BigClient(), None, "big_city", enrich.raw_path(779),
+                                                NOW - timedelta(days=90), ["хат", "жк", "кварти"]))
+    got = {json.loads(x)["id"] for x in enrich.raw_path(779).read_text("utf-8").splitlines()}
+    check(done and {150, 151, 220, 300, 310} <= got and len(got) < 60,
+          f"находки с соседями и ответами, без остального чата: {sorted(got)[:12]}… всего {len(got)} — {msg}")
+    check(enrich.load_chats()["big_city"].get("read_mode") == "поиск", "в очереди видно, что чат прочитан поиском")
+    enrich.set_chat("big_city", status="done")         # дальше в песке разбирают только «Академ»
+    enrich.raw_path(779).unlink()
     check(any(o.startswith(tglib.STATE_MARK) for o in out), "отчёт ⌁STATE в конце")
     # второй читатель возьмёт уже другой чат — не тот же
     k2, ch2 = enrich.pick_chat("r2")
@@ -460,6 +524,8 @@ def main():
              (31, 804, "fan2", "Фанат", "наши опять проиграли", 30)]
     # между ними — 20 нейтральных сообщений, чтобы окна не слиплись
     lines += [(10 + i, 810, "noise", "Шум", "привет всем", None) for i in range(15)]
+    # большой чат: предфильтр включается с PREFILTER_FROM авторов
+    lines += [(100 + i, 1000 + i, f"m{i}", f"Молчун{i}", "погода норм", None) for i in range(40)]
     with enrich.raw_path(ev_id).open("w", encoding="utf-8") as f:
         for mid, uid, un, name, text, rep in lines:
             f.write(json.dumps({"id": mid, "date": NOW.isoformat(), "uid": uid, "un": un, "name": name,
@@ -475,7 +541,7 @@ def main():
         return '{"lead": false, "score": 5, "why": "не про покупку"}'
     llm.chat = judge_llm
     out = run_script("enrich-analyze.py", "--chat", "ev_chat")
-    check(any("к модели не идут: 2" in o for o in out) and not any("Болельщик" in a or "Фанат" in a for a in asked),
+    check(any("к модели не идут: 42" in o for o in out) and not any("Болельщик" in a or "Фанат" in a for a in asked),
           f"авторы без слов темы в окне к модели не идут, «да» рядом с «хату» — идёт: {[o for o in out if 'модели' in o]}")
     oleg = enrich.load_leads().get("802", {})
     ev = (oleg.get("chats") or [{}])[-1].get("evidence") or []
@@ -508,6 +574,47 @@ def main():
           f"из обрезанного ответа взято что успело, раунды без повторов: {len(kw.get('items', []))} за {len(kwr)}")
     check(all(r[1] >= 150 and r[2] <= 2 for r in kwr) and kwr[1][3],
           f"длинный ответ — свой таймаут и мало повторов, второй раунд знает, что уже есть: {rounds}")
+
+    print("\n▸ поиск чатов: запросы как названия чатов, отбор живых чатов, снежный ком")
+    ns_f = {"__name__": "find_test"}
+    src_f = (REPO / "enrich-find.py").read_text("utf-8").rsplit("\nmain()", 1)[0]
+    exec(compile(src_f, "enrich-find.py", "exec"), ns_f)
+    gq = ns_f["good_query"]
+    check(not gq("ищу квартиру екатеринбург покупка") and not gq("продажа квартир Екб") and not gq("где купить квартиру")
+          and gq("ЖК Солнечный") == "ЖК Солнечный" and gq("ипотека Екб") and gq("соседи Уралмаш"),
+          "фразы покупателя и продавца — мимо, названия чатов — берём")
+    sd = ns_f["seeds"](["Екатеринбург", "Екб"], ["новостройки", "ипотека", "ЖК"])
+    check("ипотека Екб" in sd and "Екатеринбург" in sd and "ЖК Екатеринбург" in sd, f"код сам собирает «слово темы + место»: {sd[:6]}")
+
+    class T:
+        def __init__(self, title):
+            self.title = title
+    enrich.write_json(enrich.KEYWORDS, {"topic": "т", "at": "S1", "items": [{"q": "ЖК Академ", "done": True}]})
+    snow = ns_f["snowball"]([T("ЖК «Светлый» — соседи"), T("мкр Академический | чат"), T("Флуд Екб")], "S1", False)
+    items = [i["q"] for i in enrich.read_json(enrich.KEYWORDS, {})["items"]]
+    check("ЖК Светлый" in snow and "мкр Академический" in snow and "ЖК Светлый" in items,
+          f"новые ЖК и микрорайоны из названий найденных чатов — в ключевики: {snow}")
+
+    class M:
+        def __init__(self, text, sender, days):
+            self.message, self.sender_id, self.date = text, sender, NOW - timedelta(days=days)
+
+    class Peek:
+        def __init__(self, msgs):
+            self.msgs = msgs
+
+        async def get_messages(self, target, limit=None):
+            return self.msgs
+    live = [M(f"кто брал в ипотеку? {i}", 10 + i % 6, 1 + i) for i in range(20)]
+    dead = [M("привет", 10 + i % 6, 60) for i in range(20)]
+    ads = [M(f"Продам двушку, +7 912 000-00-{i:02d}", 10 + i % 9, 1) for i in range(20)]
+    few = [M("наш канал", 10 + i % 2, 1) for i in range(20)]
+    grp = {"_obj": types.Channel(id=1, title="t", photo=types.ChatPhotoEmpty(), date=NOW, megagroup=True,
+                                 access_hash=1)}
+    verdicts = {k: asyncio.run(ns_f["qualify"](Peek(v), grp))[:2] for k, v in
+                (("живой", live), ("мёртвый", dead), ("доска", ads), ("двое", few))}
+    check(verdicts["живой"][0] and not verdicts["мёртвый"][0] and not verdicts["доска"][0] and not verdicts["двое"][0],
+          f"до вступления: живой разговор — берём, мёртвый, доска объявлений и «пишут двое» — мимо: {verdicts}")
 
     print("\n▸ поиск чатов: ключевик и похожие каналы")
     enrich.write_json(enrich.KEYWORDS, {"topic": "Квартиры в Екатеринбурге", "at": "T1",
