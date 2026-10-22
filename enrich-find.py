@@ -64,7 +64,7 @@ FACETS = [
                    "«новостройки Екатеринбург», «дольщики Екб», «ремонт квартиры Екб»)."),
 ]
 
-KW_PROMPT = """Ищем Telegram-чаты, где сидят люди, которые {goal}.
+KW_PROMPT = """Ищем Telegram-чаты, где сидят люди, которые {goal}. Тема: «{topic}».
 Поиск Telegram ищет по НАЗВАНИЯМ чатов — поэтому нужны не фразы, а то, как
 такие чаты называются.
 
@@ -74,7 +74,7 @@ KW_PROMPT = """Ищем Telegram-чаты, где сидят люди, кото�
 - каждый запрос — 1–3 слова, как в названии чата;
 - без глаголов и вопросов: «купить», «ищу», «хочу», «где», «как», «помощь»;
 - без слов продавцов: «продажа», «продам», «агентство», «риелтор», «объявления»;
-- место — одним словом в конце, если нужно: {places}.
+- место (из темы или цели) — одним словом в конце, если нужно: {places}.
 Пример хороших запросов для жилья в Екатеринбурге: «ЖК Солнечный», «соседи
 Академический», «Брусника Екб», «ипотека Екб», «новостройки Екатеринбург»,
 «Уралмаш чат», «переезд в Екатеринбург».{have}
@@ -92,6 +92,7 @@ PLAN_PROMPT = """Владелец написал, кого ищет: «{query}»
 {{"goal": "...", "topic": "...", "places": ["..."], "nouns": ["..."]}}"""
 
 FIT_PROMPT = """Ищем Telegram-чаты, где ЖИВЫЕ ЛЮДИ переписываются и среди них есть те, кто {goal}.
+Тема поиска: «{topic}» (место — из темы или цели).
 Ниже найденные чаты: номер, название, тип, участников.
 
 Подходят:
@@ -121,7 +122,7 @@ AD_RE = re.compile(
     r"(\+7|(?<!\d)8)[\s\-()]*\d{3}[\s\-()]*\d{3}|(?<![а-яё])(продам|продаю|продаётся|продается|сдам|сдаю|"
     r"сдаётся|сдается|посуточно)|https?://|t\.me/", re.I)
 # «ЖК Светлый», «мкр Академический» в названиях найденных чатов — новые ключевики
-NAME_RE = re.compile(r"(?<![а-яёa-z])(ЖК|ЖР|КП|мкр\.?|микрорайон|квартал|посёлок|поселок)\s*[«\"“„]?"
+NAME_RE = re.compile(r"(?<![а-яёa-z])(ЖК|ЖР|КП|мкр\.?|микрорайон|квартал|посёлок|поселок)(?![А-ЯЁа-яёA-Za-z])\s*[«\"“„]?"
                      r"([A-ZА-ЯЁ0-9][\wЁё\-]*(?:\s+[A-ZА-ЯЁ0-9][\wЁё\-]*)?)")
 
 
@@ -218,7 +219,8 @@ def gather(topic, goal="", seed=(), places=()):
         say(f"  из места и слов темы: {len(words)}")
     for name, facet in FACETS:
         have = ("\nУже есть — НЕ повторяй их, дай другие: " + ", ".join(words))[:3000] if words else ""
-        out = ask_text(KW_PROMPT.format(goal=goal, facet=facet, places=where, n=KW_PER_FACET, have=have), 0.6)
+        out = ask_text(KW_PROMPT.format(goal=goal, topic=topic, facet=facet, places=where, n=KW_PER_FACET,
+                                        have=have), 0.6)
         if not out:
             say(f"  {name}: модель не ответила ({llm.LAST_ERR or 'пусто'}) — дальше")
             continue
@@ -441,12 +443,30 @@ async def qualify(client, c):
 
 
 REJECTED = enrich.ROOT / "rejected.json"     # отсеянные чаты: второй раз не проверяем
+OFF_TOPIC = "не по теме (модель)"
+REJECT_DAYS = 30          # мёртвый чат может ожить, доска — сменить правила: через месяц проверим снова
 
 
 def reject(c, why):
     data = enrich.read_json(REJECTED, {})
-    data[str(c["chat_id"])] = {"title": c.get("title", ""), "why": why, "at": enrich.now_iso()}
+    data[str(c["chat_id"])] = {"title": c.get("title", ""), "why": why, "at": enrich.now_iso(),
+                               **({"goal": enrich.goal()} if why == OFF_TOPIC else {})}
     enrich.write_json(REJECTED, data)
+
+
+def rejected_now():
+    """Чаты, которые сейчас проверять незачем: «не по теме» — этой же цели, и не старше месяца."""
+    from datetime import timedelta
+    g, edge = enrich.goal(), datetime.now(timezone.utc) - timedelta(days=REJECT_DAYS)
+    out = set()
+    for k, v in enrich.read_json(REJECTED, {}).items():
+        at = enrich._parse(v.get("at")) if isinstance(v, dict) else None
+        if not at or at < edge:
+            continue
+        if v.get("why") == OFF_TOPIC and v.get("goal") != g:
+            continue                    # по прошлому запросу не подходил — по этому может
+        out.add(k)
+    return out
 
 
 async def screen(client, topic, cands, known, dry):
@@ -462,7 +482,7 @@ async def screen(client, topic, cands, known, dry):
     for c in cands:
         known.add(str(c["chat_id"]))
         if str(c["chat_id"]) not in ids and not dry:
-            reject(c, "не по теме (модель)")
+            reject(c, OFF_TOPIC)
     out = []
     for c in good:
         try:
@@ -569,7 +589,11 @@ async def similar(client, topic, known, dry, budget):
             await asyncio.sleep(random.uniform(*PAUSE))
             continue
         cands = [c for c in (candidate(x, known) for x in (res.chats or [])) if c]
-        good = await screen(client, topic, cands, known, dry)
+        try:
+            good = await screen(client, topic, cands, known, dry)
+        except FloodWaitError as e:
+            say(f"  флуд-пауза {e.seconds} с — продолжу позже")
+            return added, e.seconds, ""
         if good is None or good == DOWN:
             if good is None and not dry:
                 bump_seed_fail(key)
@@ -609,7 +633,7 @@ async def search(acc, per_run, dry):
 
     client = await tglib.connect(acc)
     known = {str(v.get("chat_id")) for v in enrich.load_chats().values() if v.get("chat_id")}
-    known |= set(enrich.read_json(REJECTED, {}))
+    known |= rejected_now()
     added = wait = 0
     stop = ""
     try:
@@ -652,10 +676,12 @@ async def search(acc, per_run, dry):
                 got_c = candidate(c, known)
                 if got_c:
                     cands.append(got_c)
-            snow = snowball(res.chats, at0, dry)
-            if snow:
-                say(f"    из названий чатов — новые ключевики: {', '.join(snow)}")
-            good = await screen(client, topic, cands, known, dry)
+            try:
+                good = await screen(client, topic, cands, known, dry)
+            except FloodWaitError as e:
+                say(f"  флуд-пауза {e.seconds} с — продолжу позже")
+                wait = e.seconds
+                break
             if good is None or good == DOWN:
                 # модель ответила, но непонятно, — дважды так, и ключевик пропускаем;
                 # простой модели ключевику не засчитываем
@@ -663,6 +689,10 @@ async def search(acc, per_run, dry):
                     bump_fit_fail(item["q"], at0)
                 stop = "errors"
                 break
+            # снежный ком — из названий ПОДХОДЯЩИХ чатов: ЖК чужого города не нужен
+            snow = snowball([c["_obj"] for c in good if c.get("_obj")], at0, dry)
+            if snow:
+                say(f"    из названий чатов — новые ключевики: {', '.join(snow)}")
             got = 0 if dry else enrich.add_chats(
                 [{k: c[k] for k in QUEUE_KEYS if k in c} for c in good],
                 source=f"поиск: {item['q']}")

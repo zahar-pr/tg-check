@@ -229,6 +229,10 @@ def fake_llm(system, user, max_tokens=400, temperature=0.8, tries=5, model=None,
                        ensure_ascii=False))
 
 
+def NAME_TEST(ns, title):
+    return [m.group(0) for m in ns["NAME_RE"].finditer(title)]
+
+
 def main():
     acc = {"id": "r1", "title": "читатель", "dir": "accounts/r1"}
     (TMP / "accounts.json").write_text(json.dumps([acc]), "utf-8")
@@ -318,8 +322,37 @@ def main():
     check(done and {150, 151, 220, 300, 310} <= got and len(got) < 60,
           f"находки с соседями и ответами, без остального чата: {sorted(got)[:12]}… всего {len(got)} — {msg}")
     check(enrich.load_chats()["big_city"].get("read_mode") == "поиск", "в очереди видно, что чат прочитан поиском")
+    ns_r["HITS_MAX"] = 20
+    done, msg = asyncio.run(ns_r["search_read"](BigClient(), None, "big_city", enrich.raw_path(779),
+                                                NOW - timedelta(days=90), ["болтов", "хат", "жк"]))
+    got = {json.loads(x)["id"] for x in enrich.raw_path(779).read_text("utf-8").splitlines()}
+    check({150, 151, 220, 300, 310} <= got, f"частый корень («болтов», 300 находок) не вытеснил редкие: {msg}")
+    other = types.Message(id=5, peer_id=types.PeerChannel(779), message="да", date=NOW,
+                          reply_to=types.MessageReplyHeader(reply_to_msg_id=3, reply_to_peer_id=types.PeerChannel(42)))
+    same = types.Message(id=6, peer_id=types.PeerChannel(779), message="да", date=NOW,
+                         reply_to=types.MessageReplyHeader(reply_to_msg_id=3))
+    check(ns_r["reply_id"](other) is None and ns_r["reply_id"](same) == 3,
+          "цитата из другого чата — не ответ на сообщение этого чата")
     enrich.set_chat("big_city", status="done")         # дальше в песке разбирают только «Академ»
     enrich.raw_path(779).unlink()
+
+    print("\n▸ читатель: вступления кончились — чат «только со вступлением» ждёт, остальные читаются")
+    enrich.add_chats([{"ref": "t.me/need_join", "chat_id": 780, "title": "Закрытая снаружи"}])
+    enrich.set_chat("need_join", needs_join=True)
+    for _ in range(enrich.JOIN_MAX):
+        enrich.note_join("r9")
+    taken = []
+    while True:
+        k, _ = enrich.pick_chat("r9")
+        if not k:
+            break
+        taken.append(k)
+        enrich.set_chat(k, status="done")
+    check("need_join" not in taken and enrich.load_chats()["need_join"]["status"] == "new",
+          f"читатель без вступлений не берёт чат, который без вступления не прочитать: взял {taken}")
+    enrich.set_chat("need_join", status="done")
+    for k in taken:                                     # дальше в песке эти чаты ещё нужны
+        enrich.set_chat(k, status="new", reader="", read_by=[])
     check(any(o.startswith(tglib.STATE_MARK) for o in out), "отчёт ⌁STATE в конце")
     # второй читатель возьмёт уже другой чат — не тот же
     k2, ch2 = enrich.pick_chat("r2")
@@ -615,6 +648,19 @@ def main():
                 (("живой", live), ("мёртвый", dead), ("доска", ads), ("двое", few))}
     check(verdicts["живой"][0] and not verdicts["мёртвый"][0] and not verdicts["доска"][0] and not verdicts["двое"][0],
           f"до вступления: живой разговор — берём, мёртвый, доска объявлений и «пишут двое» — мимо: {verdicts}")
+
+    enrich.write_json(enrich.STATE, {**enrich.read_json(enrich.STATE, {}), "goal": "хочет купить авто"})
+    ns_f["reject"]({"chat_id": 31, "title": "ЖК чат"}, ns_f["OFF_TOPIC"])
+    ns_f["reject"]({"chat_id": 32, "title": "Доска"}, "доска объявлений: 90% — объявления")
+    enrich.write_json(enrich.STATE, {**enrich.read_json(enrich.STATE, {}), "goal": "хочет купить квартиру"})
+    now_rej = ns_f["rejected_now"]()
+    check("31" not in now_rej and "32" in now_rej,
+          f"«не по теме» прошлого запроса не мешает новому, доска объявлений — мимо всегда: {sorted(now_rej)}")
+    st0 = enrich.read_json(enrich.STATE, {})
+    st0.pop("goal", None)
+    enrich.write_json(enrich.STATE, st0)
+    check(not NAME_TEST(ns_f, "ЖКХ Екатеринбурга") and NAME_TEST(ns_f, "ЖК «Светлый» соседи"),
+          "«ЖКХ» — не «ЖК»: мусорных ключевиков из названий нет")
 
     print("\n▸ поиск чатов: ключевик и похожие каналы")
     enrich.write_json(enrich.KEYWORDS, {"topic": "Квартиры в Екатеринбурге", "at": "T1",

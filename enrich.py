@@ -59,18 +59,29 @@ def ask_llm(system, user, **kw):
 # Предфильтр разбора — корни слов темы. Модель называет обычные СЛОВА
 # («квартира», «хата», «однушка»), корни режет код: склеенных «купкварт» в
 # переписке не бывает, и такой предфильтр отсеивал всех подряд.
-STEMS_V = 2
+STEMS_V = 3
 STOP_WORDS = {"хочет", "хочу", "хотят", "ищет", "ищу", "ищут", "нужно", "нужен", "нужна", "нужны", "который",
-              "которые", "человек", "люди", "сейчас", "очень", "можно"}
+              "которые", "человек", "люди", "сейчас", "очень", "можно", "другое", "другой", "другие", "другую",
+              "числе", "числа", "этом", "также", "того", "тоже", "свой", "свою", "своё"}
+# служебные слова фраз («жильё на вторичке»): корнями не бывают
+SMALL_WORDS = {"в", "во", "на", "от", "по", "под", "для", "без", "про", "при", "над", "из", "за", "до", "со", "или",
+               "и", "а", "с", "к", "у", "о", "об", "том", "не"}
+SHORT_OK = {"жк", "дду", "ижс"}     # короткие, но настоящие корни темы
 
 
 def stem(word):
-    """Начало слова, по которому узнаются его формы: квартира → кварти, хата → хат."""
+    """
+    Начало слова, по которому узнаются его формы: квартира → кварти, хата → хат,
+    ипотека → ипоте. Слова в 4–5 букв режем на одну гласную, не больше: «этаж»
+    не должен стать «эта», а «банк» — «бан» (такие корни ловят всё подряд).
+    """
     import re
     w = re.sub(r"[^a-zа-я0-9]", "", str(word).lower().replace("ё", "е"))
-    if len(w) < 2:
-        return ""
-    return w if len(w) <= 3 else w[:max(3, min(7, len(w) - 2))]
+    if len(w) <= 3:
+        return w if len(w) == 3 or w in SHORT_OK else ""
+    if len(w) <= 5:
+        return w[:-1] if w[-1] in "аеиоуыэюяйь" else w
+    return w[:min(7, len(w) - 2)]
 
 
 def stems_re(roots):
@@ -81,16 +92,21 @@ def stems_re(roots):
 
 
 def save_stems(for_goal, words):
-    """Слова темы -> корни для цели; плюс корни слов самой цели (без места и общих слов)."""
+    """
+    Слова темы -> корни для цели; плюс корни слов самой цели (без места и общих
+    слов). Порядок — как дала модель (самые типичные первыми), цель — в конце:
+    поиск внутри чата идёт по первым корням списка.
+    """
     import re
-    roots = set()
+    roots = []
     for phrase in words:
-        for w in str(phrase).split()[:2]:           # «вторичное жильё» — оба слова
-            roots.add(stem(w))
+        for w in str(phrase).split()[:3]:           # «жильё на вторичке» — без «на»
+            if w.lower() not in SMALL_WORDS and w.lower() not in STOP_WORDS:
+                roots.append(stem(w))
     for w in re.findall(r"[А-ЯЁа-яё]{4,}", for_goal):
         if not w[0].isupper() and w.lower() not in STOP_WORDS:   # место пишется с большой
-            roots.add(stem(w))
-    clean = sorted(r for r in roots if r and len(r) >= 2)
+            roots.append(stem(w))
+    clean = [r for r in dict.fromkeys(roots) if r]
     ROOT.mkdir(parents=True, exist_ok=True)
     write_json(STEMS, {"goal": for_goal, "stems": clean, "v": STEMS_V, "at": now_iso()})
     return clean
@@ -129,6 +145,7 @@ def make_stems(for_goal):
 
 
 DAYS = 90                    # столько истории читаем
+JOIN_MAX = 20                # вступлений в сутки на читателя
 STALE_READING = 3 * 3600     # читатель пропал дольше — чат возвращается в очередь
 SIMILAR_LEVELS = 2           # «похожие на похожие»: столько шагов от найденного поиском
 GOAL_DEFAULT = ("хочет купить квартиру или другое жильё (новостройку, вторичку, "
@@ -246,6 +263,9 @@ def pick_chat(acc_id):
         # свой недочитанный — первым (файл уже начат, продолжим с места); чат, куда
         # вступил другой читатель, — в конец: пусть дочитает (и выйдет из него) он
         new = [(k, v) for k, v in data.items() if v.get("status") == "new"]
+        # снаружи этот чат не показали, а вступления на сегодня кончились — не ему
+        if joins_today(acc_id) >= JOIN_MAX:
+            new = [(k, v) for k, v in new if not v.get("needs_join")]
         mine = [k for k, v in new if v.get("reader") == acc_id or v.get("joined_by") == acc_id]
         free = ([k for k, v in new if not v.get("joined_by")]
                 + [k for k, v in new if v.get("joined_by") and v.get("joined_by") != acc_id])

@@ -118,32 +118,30 @@ def chunks(msgs, spans, me):
     blocks = []
     byid = {m["id"]: m for m in msgs}
     for a, b in spans:
-        cur, size = [], 0
-        inside = {m["id"] for m in msgs[a:b + 1]}
-        lines = []
+        cur, size = [], 0                    # cur — пары (id, строка): кто уже в куске
         for m in msgs[a:b + 1]:
             r = m.get("reply_to")
-            # ЦЕЛЬ отвечает на пост или вопрос вне окна — ставим его перед репликой:
-            # «подробности» без поста застройщика ничего не значит
-            if m.get("uid") == me and r and r not in inside and r in byid:
-                lines.append(context_line(byid[r]))
-                inside.add(r)
-            lines.append(line(m, me))
-        for ln in lines:
-            if cur and size + len(ln) + 1 > CHUNK:
-                blocks.append(cur)
-                # контекст на стыке — последние строки куска, но не больше трети
-                # куска: иначе длинные сообщения дали бы запрос на каждую реплику
-                tail = []
-                for x in reversed(cur[-AROUND:]):
-                    if sum(len(y) + 1 for y in tail) + len(x) + 1 > CHUNK // 3:
-                        break
-                    tail.insert(0, x)
-                cur, size = tail, sum(len(y) + 1 for y in tail)
-            cur.append(ln)
-            size += len(ln) + 1
+            todo = []
+            # ЦЕЛЬ отвечает на пост или вопрос, которого в ЭТОМ куске нет, — ставим
+            # его перед репликой: «подробности» без поста застройщика ничего не значит
+            if m.get("uid") == me and r and r in byid and r not in {i for i, _ in cur}:
+                todo.append((r, context_line(byid[r])))
+            todo.append((m["id"], line(m, me)))
+            for mid, ln in todo:
+                if cur and size + len(ln) + 1 > CHUNK:
+                    blocks.append([x for _, x in cur])
+                    # контекст на стыке — последние строки куска, но не больше трети
+                    # куска: иначе длинные сообщения дали бы запрос на каждую реплику
+                    tail = []
+                    for pair in reversed(cur[-AROUND:]):
+                        if sum(len(y) + 1 for _, y in tail) + len(pair[1]) + 1 > CHUNK // 3:
+                            break
+                        tail.insert(0, pair)
+                    cur, size = tail, sum(len(y) + 1 for _, y in tail)
+                cur.append((mid, ln))
+                size += len(ln) + 1
         if cur:
-            blocks.append(cur)
+            blocks.append([x for _, x in cur])
     blocks = [bl for bl in blocks if any(x.startswith("►") for x in bl)]
     parts, cur, size = [], [], 0
     for bl in blocks:

@@ -49,7 +49,7 @@ THREADS = 40              # у стольких находок смотрим о
 REPLIES = 30              # ответов на находку
 PAUSE = (1, 3)            # между запросами истории, сек
 FLOOD_MAX = 600           # дольше этой флуд-паузы не сидим — отдаём чат обратно
-JOIN_MAX = 20             # вступлений в сутки на читателя
+JOIN_MAX = enrich.JOIN_MAX  # вступлений в сутки на читателя
 
 
 def record(m):
@@ -67,10 +67,21 @@ def record(m):
         # пост канала в группе обсуждения или аноним-админ: для контекста
         # оставляем, автором для разбора не считаем (uid 0)
         uid, un, name = 0, getattr(s, "username", "") or "", getattr(s, "title", "") or "канал"
-    reply = getattr(m, "reply_to", None)
     return {"id": m.id, "date": m.date.isoformat(timespec="seconds"), "uid": uid, "un": un,
-            "name": tglib.cell(name), "text": m.message[:3000],
-            "reply_to": getattr(reply, "reply_to_msg_id", None) or None}
+            "name": tglib.cell(name), "text": m.message[:3000], "reply_to": reply_id(m)}
+
+
+def reply_id(m):
+    """На какое сообщение ЭТОГО чата отвечает m. Цитата из другого чата — None:
+    её номер здесь — совсем другое сообщение."""
+    reply = getattr(m, "reply_to", None)
+    rid = getattr(reply, "reply_to_msg_id", None)
+    other = getattr(reply, "reply_to_peer_id", None)
+    if rid and other is not None and getattr(m, "peer_id", None) is not None:
+        from telethon import utils
+        if utils.get_peer_id(other) != utils.get_peer_id(m.peer_id):
+            return None
+    return rid or None
 
 
 def resume_point(path):
@@ -117,6 +128,7 @@ async def join(client, acc_id, joined, do, key):
     enrich.set_chat(key, joined_by=acc_id)
     entity = await do()
     enrich.note_join(acc_id)
+    enrich.set_chat(key, needs_join=False)
     joined.append(entity)
     say("  вступил")
     await asyncio.sleep(random.uniform(3, 6))
@@ -288,7 +300,7 @@ async def search_read(client, entity, key, path, since, roots):
                 say(f"  … флуд-пауза {e.seconds} с")
                 await asyncio.sleep(e.seconds)
 
-    hits = {}
+    hits, per = {}, {}
     for root in roots[:SEARCH_ROOTS]:
         async def one(root=root):
             got = []
@@ -297,19 +309,27 @@ async def search_read(client, entity, key, path, since, roots):
                     break
                 got.append(m)
             return got
-        for m in await flood_safe(one):
+        found = await flood_safe(one)
+        per[root] = [m.id for m in found]
+        for m in found:
             hits[m.id] = m
         await pause()
     if not hits:
         enrich.set_chat(key, status="done", msgs=0, authors=0, leads=0, read_mode="поиск",
                         done_at=enrich.now_iso(), err="о теме здесь не пишут")
         return 0, "поиск по теме внутри чата ничего не нашёл — чат закрыт"
-    fresh = sorted(hits, reverse=True)[:HITS_MAX]
+    # у каждого корня — своя доля находок: частый корень («дом») не вытесняет
+    # редкие («однуш»), остаток добираем самыми свежими
+    quota = max(10, HITS_MAX // max(1, len([v for v in per.values() if v])))
+    keep = set().union(*(sorted(v, reverse=True)[:quota] for v in per.values()))
+    rest = sorted(set(hits) - keep, reverse=True)
+    fresh = sorted(keep | set(rest[:max(0, HITS_MAX - len(keep))]), reverse=True)
+    rare = {i for v in per.values() if len(v) <= quota for i in v}     # находки редких корней — в ответы первыми
     got = {i: hits[i] for i in fresh}
     want = set()
     for i in fresh:
         want.update(range(max(1, i - CONTEXT), i + CONTEXT + 1))
-        r = getattr(getattr(hits[i], "reply_to", None), "reply_to_msg_id", None)
+        r = reply_id(hits[i])
         if r:
             want.add(r)
     want = sorted(want - set(got))
@@ -320,7 +340,8 @@ async def search_read(client, entity, key, path, since, roots):
                 got[m.id] = m
         await pause()
     # ответы на находки: комментарии под постом, ответы на вопрос
-    threads = [hits[i] for i in fresh if getattr(getattr(hits[i], "replies", None), "replies", 0)][:THREADS]
+    threads = sorted((hits[i] for i in fresh if getattr(getattr(hits[i], "replies", None), "replies", 0)),
+                     key=lambda m: (m.id not in rare, -m.id))[:THREADS]
     for t in threads:
         async def replies(t=t):
             return [m async for m in client.iter_messages(entity, reply_to=t.id, limit=REPLIES)]
@@ -378,8 +399,14 @@ async def main():
 
     key, ch = enrich.pick_chat(acc["id"])
     if not key:
-        say("в очереди нет чатов — добавь ссылки или найди чаты по ключевикам")
-        tglib.state(done=0, left=0)
+        waiting = sum(1 for v in enrich.load_chats().values() if v.get("status") == "new" and v.get("needs_join"))
+        if waiting:
+            # остались чаты, которые без вступления не прочитать, а вступления кончились
+            say(f"остались чаты только со вступлением ({waiting}), а вступлений на сегодня нет — до завтра")
+            tglib.state(done=0, left=waiting, cooldown=tglib.until_tomorrow(), note="предел вступлений")
+        else:
+            say("в очереди нет чатов — добавь ссылки или найди чаты по ключевикам")
+            tglib.state(done=0, left=0)
         return
     left_q = sum(1 for v in enrich.load_chats().values() if v.get("status") == "new")
 
@@ -406,9 +433,12 @@ async def main():
         say(f"  {msg}")
         report = dict(done=done, left=left_q)
     except JoinLimit:
-        enrich.set_chat(key, status="new")
-        say(f"  на сегодня вступлений уже {JOIN_MAX} — чат вернул в очередь, продолжу завтра")
-        report = dict(done=0, left=left_q + 1, cooldown=tglib.until_tomorrow(), note="предел вступлений")
+        # без вступления этот чат не прочитать, а вступления на сегодня кончились:
+        # чат ждёт читателя с запасом (или завтра), остальную очередь читаем дальше
+        enrich.set_chat(key, status="new", reader="", needs_join=True)
+        say(f"  на сегодня вступлений уже {JOIN_MAX}, а без вступления этот чат не прочитать — "
+            "оставил его другому читателю или на завтра")
+        report = dict(done=0, left=left_q + 1)
     except FloodWaitError as e:
         enrich.set_chat(key, status="new")
         say(f"  Telegram просит паузу {e.seconds} с — чат вернул в очередь, продолжу с этого места")
