@@ -432,7 +432,10 @@ export function makeEnrich({ DIR, CODE, accounts, running, launch, pythonCmd, pu
       if (code !== 0 || !res?.ok) {
         planJob = planChild = null;
         const why = String(out || '').trim().split('\n').filter((l) => !l.startsWith('\u2301')).pop() || '';
-        st.auto = false; st.planErr = `модель не разобрала запрос${why ? ': ' + why.slice(0, 160) : ''}`; save();
+        // enrich-find сам пишет «модель не разобрала запрос: причина» — не дублируем
+        st.auto = false;
+        st.planErr = /^модель/.test(why) ? why.slice(0, 220) : `модель не разобрала запрос${why ? ': ' + why.slice(0, 160) : ''}`;
+        save();
         note('⚠', 'автопилот: модель не разобрала запрос — смотри журнал, попробуй ещё раз');
         return;
       }

@@ -47,14 +47,15 @@ def _cfg(k, d=""):
     return os.environ.get(k) or _ENV.get(k, d)
 
 
-def chat(system, user, max_tokens=400, temperature=0.8, tries=5, model=None, info=None):
+def chat(system, user, max_tokens=400, temperature=0.8, tries=5, model=None, info=None, timeout=90):
     """Один запрос к модели через curl (надёжно тоннелит HTTPS через прокси).
     Возвращает текст ответа или None (мягкий фейл, причина в LAST_ERR).
     info — словарь, куда положить код сбоя: "net" (сеть, таймаут), "429"/"5xx"
     (перегрузка — после всех повторов), иначе код ошибки запроса ("400"…).
     Свой словарь на вызов: LAST_ERR общий и в потоках перемешивается.
     model — своя модель для задачи (комментарии); имя вида «провайдер/модель»
-    понимает только агрегатор (OpenRouter), у прямого провайдера берём LLM_MODEL."""
+    понимает только агрегатор (OpenRouter), у прямого провайдера берём LLM_MODEL.
+    timeout — секунд на один ответ: длинный список модель пишет дольше 90 с."""
     global LAST_ERR
     LAST_ERR = ""
     base = _cfg("LLM_BASE_URL", "https://api.deepseek.com").rstrip("/")
@@ -71,7 +72,7 @@ def chat(system, user, max_tokens=400, temperature=0.8, tries=5, model=None, inf
         "messages": [{"role": "system", "content": system}, {"role": "user", "content": user}],
         "max_tokens": max_tokens, "temperature": temperature,
     })
-    cmd = ["curl", "-s", "-m", "90", "-X", "POST", base + "/chat/completions",
+    cmd = ["curl", "-s", "-m", str(int(timeout)), "-X", "POST", base + "/chat/completions",
            "-H", "Authorization: Bearer " + key, "-H", "Content-Type: application/json",
            "-H", "X-Title: tg-panel", "-H", "HTTP-Referer: https://bqa.egor-kochnev.ru",
            "-d", body]
@@ -80,7 +81,7 @@ def chat(system, user, max_tokens=400, temperature=0.8, tries=5, model=None, inf
     delay = 3
     for i in range(tries):
         try:
-            out = subprocess.run(cmd, capture_output=True, text=True, timeout=100).stdout
+            out = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout + 10).stdout
             d = json.loads(out)
         except Exception as e:
             LAST_ERR = f"{type(e).__name__}: {str(e)[:120]}"

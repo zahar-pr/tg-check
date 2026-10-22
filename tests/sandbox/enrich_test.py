@@ -456,6 +456,25 @@ def main():
     check([i["q"] for i in kw.get("items", [])] == ["ЖК Академ", "ипотека екб", "новостройки екб"],
           f"ключевики без дублей: {[i['q'] for i in kw.get('items', [])]}")
 
+    print("\n▸ ключевики порциями: многословная модель, обрезанный ответ")
+    rounds = []
+
+    def wordy(system, user, max_tokens=400, timeout=90, tries=5, **kw):
+        rounds.append((max_tokens, timeout, tries, "Уже есть" in user))
+        n = len(rounds)
+        if n == 1:          # обрезан по токенам посреди 61-го слова
+            return "Вот: [" + ", ".join(f'"ЖК {i}"' for i in range(60)) + ', "ЖК обре'
+        if n == 2:
+            return json.dumps([f"ЖК {i}" for i in range(50, 120)], ensure_ascii=False)
+        return '["ЖК 1", "дом 1", "дом 2"]'
+    llm.chat = wordy
+    run_script("enrich-find.py", "--keywords", "--topic", "Квартиры в Екатеринбурге")
+    kw = enrich.read_json(enrich.KEYWORDS, {})
+    check(len(kw.get("items", [])) == 122 and len(rounds) == 3,
+          f"из обрезанного ответа взято что успело, раунды без повторов: {len(kw.get('items', []))} за {len(rounds)}")
+    check(all(r[1] >= 150 and r[2] <= 2 for r in rounds) and rounds[1][3],
+          f"длинный ответ — свой таймаут и мало повторов, второй раунд знает, что уже есть: {rounds}")
+
     print("\n▸ поиск чатов: ключевик и похожие каналы")
     enrich.write_json(enrich.KEYWORDS, {"topic": "Квартиры в Екатеринбурге", "at": "T1",
                                         "items": [{"q": "ЖК Академ", "done": False, "found": 0}]})

@@ -35,24 +35,31 @@ PAUSE = (2, 4)
 MIN_MEMBERS = 30          # совсем пустые чаты не читаем
 FLOOD_MAX = 120
 
-KW_PROMPT = """Тема: «{topic}».
-Составь список поисковых запросов, по которым в поиске Telegram найдутся
-чаты и каналы, где сидят люди по этой теме. Нужны 150–250 коротких запросов
-(1–3 слова), как люди называют свои чаты и каналы. Подумай, где такие люди
-собираются, и перебери всё конкретное:
+# Ключевики — порциями: двести штук одним ответом многословная модель не
+# укладывает ни в лимит токенов, ни в таймаут, и весь ответ пропадал
+KW_ROUND = 60             # ключевиков за один запрос
+KW_TARGET = 180           # всего: раунды идут, пока не наберём или не иссякнет
+KW_ROUNDS = 5
+KW_TOKENS = 4000
+KW_TIMEOUT = 150          # сек на один ответ модели
+
+KW_PROMPT = """Тема: «{topic}».{goal}
+Составь {n} поисковых запросов, по которым в поиске Telegram найдутся
+чаты и каналы, где сидят люди по этой теме. Запросы короткие (1–3 слова), как
+люди называют свои чаты и каналы. Перебирай конкретное:
 - названия мест, компаний, брендов, объектов, товаров по теме (для жилья —
   застройщики и ЖК, для авто — марки и автосалоны, и т.п.);
 - город, районы, пригороды, сокращения и варианты написания города;
 - сообщества: «соседи …», «чат дома …», «родители …», «барахолка …» и т.п.;
-- обычные запросы людей по теме вместе с городом.
-Ответь ТОЛЬКО JSON-массивом строк, без пояснений."""
+- обычные запросы людей по теме вместе с городом.{have}
+Ответь ТОЛЬКО JSON-массивом строк, без нумерации и пояснений."""
 
 PLAN_PROMPT = """Владелец написал, кого ищет: «{query}».
 Разверни это для системы, которая ищет таких людей в Telegram-чатах:
 - goal — кого ищем, одной фразой в форме «хочет/ищет …» (с местом, если оно есть);
 - topic — тема для поиска чатов, 2–5 слов (с городом, если он есть);
-- keywords — 150–250 коротких поисковых запросов (1–3 слова), как люди
-  называют свои чаты и каналы по этой теме: места, компании, объекты, районы,
+- keywords — 40 коротких поисковых запросов (1–3 слова), как люди называют
+  свои чаты и каналы по этой теме: места, компании, объекты, районы,
   сообщества, сокращения города и варианты написания.
 Ответь ТОЛЬКО JSON без пояснений:
 {{"goal": "...", "topic": "...", "keywords": ["...", "..."]}}"""
@@ -81,6 +88,61 @@ def last_json(out, kind):
         if isinstance(d, list) and all(isinstance(x, kind) for x in d):
             found = d
     return found
+
+
+def strings_from(out, start):
+    """Целые строки JSON-массива с позиции start; массив может быть обрезан."""
+    words = []
+    for m in re.finditer(r'"((?:[^"\\]|\\.)*)"\s*(,|\]|$)', out[start:]):
+        try:
+            words.append(json.loads('"' + m.group(1) + '"'))
+        except ValueError:
+            continue
+        if m.group(2) == "]":
+            break
+    return words
+
+
+def word_list(out):
+    """Список строк из ответа: целый массив, а если ответ обрезан — что успело."""
+    words = last_json(out, str)
+    if words is None:
+        starts = list(re.finditer(r'\[\s*"', out or ""))
+        words = strings_from(out, starts[-1].start() + 1) if starts else []
+    return [w for w in words if isinstance(w, str) and w.strip(' .…"\'«»')]
+
+
+def gather(topic, goal="", seed=()):
+    """
+    Ключевики раундами по KW_ROUND: каждый следующий просит других, не тех,
+    что уже есть. Раунд, который дал мало нового, — последний.
+    """
+    words, seen = [], set()
+
+    def take(ws):
+        new = [w for w in (" ".join(str(x).split())[:60] for x in ws) if w and w.lower() not in seen]
+        for w in new:
+            seen.add(w.lower())
+        words.extend(new)
+        return len(new)
+
+    take(seed)
+    for _ in range(KW_ROUNDS):
+        if len(words) >= KW_TARGET:
+            break
+        have = ("\nУже есть — НЕ повторяй их, дай другие: " + ", ".join(words))[:4000] if words else ""
+        out = llm.chat("Отвечай строго в формате, который просят.",
+                       KW_PROMPT.format(topic=topic, goal=f"\nИщем людей, которые {goal}." if goal else "",
+                                        n=KW_ROUND, have=have),
+                       max_tokens=KW_TOKENS, temperature=0.7, tries=2, timeout=KW_TIMEOUT)
+        if out is None:
+            say(f"  модель не ответила ({llm.LAST_ERR or 'нет ответа'}) — беру, что есть")
+            break
+        n = take(word_list(out))
+        say(f"  +{n} ключевиков, всего {len(words)}")
+        if n < 10:
+            break
+    return words
 
 
 def save_keywords(topic, words):
@@ -125,35 +187,48 @@ def parse_plan(out):
     return None
 
 
+def salvage_plan(out):
+    """Ответ обрезан: цель и тема обычно целы, из ключевиков — что успело."""
+    def field(name):
+        m = None
+        for m in re.finditer(r'"%s"\s*:\s*"((?:[^"\\]|\\.)*)"' % name, out or ""):
+            pass                                    # последнее вхождение: шаблон из промпта — раньше
+        return " ".join(m.group(1).split()) if m else ""
+    goal, topic = field("goal"), field("topic")
+    if _blank(goal) or _blank(topic):
+        return None
+    kw = list(re.finditer(r'"keywords"\s*:\s*\[', out or ""))
+    return goal[:300], topic[:100], (strings_from(out, kw[-1].end()) if kw else [])
+
+
 def make_plan(query):
     """
     Автопилот: из одной фразы владельца («хочет квартиру в Екб») — цель для
     разбора, тема для поиска чатов и ключевики. Последней строкой — JSON для
     панели: цель и тему она сохраняет в enrich/state.json сама.
     """
-    plan = out = None
-    for tokens in (5000, 9000):         # двести ключевиков плюс рассуждения — бывает и мало
-        out = llm.chat("Отвечай строго в формате, который просят.", PLAN_PROMPT.format(query=query),
-                       max_tokens=tokens, temperature=0.5)
-        plan = parse_plan(out) if out is not None else None
-        if plan or out is None:
-            break
+    out = llm.chat("Отвечай строго в формате, который просят.", PLAN_PROMPT.format(query=query),
+                   max_tokens=KW_TOKENS, temperature=0.5, tries=2, timeout=KW_TIMEOUT)
+    plan = (parse_plan(out) or salvage_plan(out)) if out else None
     if not plan:
-        raise SystemExit(f"модель не разобрала запрос: {llm.LAST_ERR or (out or '')[:120]}")
-    goal, topic, words = plan
-    items = save_keywords(topic, words)
+        why = llm.LAST_ERR or ("пустой ответ" if out == "" else (out or "")[:120])
+        raise SystemExit(f"модель не разобрала запрос: {why}")
+    goal, topic, seed = plan
     say(f"кого ищем: {goal}")
-    say(f"тема поиска: {topic} · ключевиков: {len(items)}")
+    say(f"тема поиска: {topic} · добираю ключевики порциями")
+    words = gather(topic, goal, seed)
+    if len(words) < PLAN_MIN:
+        raise SystemExit(f"модель не разобрала запрос: ключевиков мало ({len(words)}) — {llm.LAST_ERR or 'попробуй ещё раз'}")
+    items = save_keywords(topic, words)
+    say(f"ключевиков: {len(items)}")
     say(", ".join(i["q"] for i in items[:40]) + (" …" if len(items) > 40 else ""))
     print(json.dumps({"ok": True, "goal": goal, "topic": topic, "n": len(items)}, ensure_ascii=False), flush=True)
 
 
 def make_keywords(topic):
-    out = llm.chat("Отвечай строго в формате, который просят.", KW_PROMPT.format(topic=topic),
-                   max_tokens=4000, temperature=0.7)
-    words = last_json(out, str)
+    words = gather(topic)
     if not words:
-        raise SystemExit(f"модель не дала список ключевиков: {llm.LAST_ERR or (out or '')[:120]}")
+        raise SystemExit(f"модель не дала список ключевиков: {llm.LAST_ERR or 'пустой ответ'}")
     items = save_keywords(topic, words)
     say(f"ключевиков: {len(items)}")
     say(", ".join(i["q"] for i in items[:40]) + (" …" if len(items) > 40 else ""))
