@@ -15,7 +15,11 @@
 читал. Другой читатель такого не трогает и попытку ему не засчитывает —
 дождётся «своего».
 
-    python enrich-profile.py --account r1 [--per-run 15]
+    python enrich-profile.py --account r1 [--per-run 15] [--alive r1,r3]
+
+--alive — читатели, которых панель сейчас готова запускать. Лида, чьи читатели
+все вне этого списка (вышли из аккаунта, в резерве), пробует любой — иначе он
+ждал бы вечно, а автопилот не кончился бы.
 """
 import asyncio
 import json
@@ -225,20 +229,20 @@ async def main():
         tglib.state(done=0, left=0)
         return
     # сначала лиды из чатов, которые читал этот аккаунт: они уже в кеше сессии
-    readers = {str(v.get("chat_id")): v.get("reader") for v in enrich.load_chats().values() if v.get("chat_id")}
-    owners = lambda l: {readers.get(str(c.get("chat_id"))) for c in l.get("chats") or []} - {None, ""}
+    readers = enrich.chat_readers()
+    owners = lambda l: set().union(*[readers.get(str(c.get("chat_id")), set()) for c in l.get("chats") or []])
     mine = lambda l: acc["id"] in owners(l)
-    # живые читатели: их лидов из закрытых чатов не трогаем — у них доступ есть, у нас нет
-    alive = {a["id"] for a in tglib.load_accounts() if a.get("role") == "read" and not a.get("retired")
-             and a.get("spamKind") not in ("frozen", "perm")}
+    # читатели, которых панель готова запускать (без списка — по реестру): их
+    # лидов из закрытых чатов не трогаем — у них доступ есть, у нас, скорее всего, нет
+    given = [x for x in tglib.arg("alive", "").split(",") if x]
+    alive = set(given) if given else {
+        a["id"] for a in tglib.load_accounts() if a.get("role") == "read" and not a.get("retired")
+        and not a.get("reserve") and a.get("authed") is True and a.get("spamKind") not in ("frozen", "perm")}
     theirs = lambda l: not mine(l) and bool(owners(l) & alive)
     reachable = lambda l: bool(l.get("username") or public_chats(l))
-    todo = [l for l in todo if not theirs(l) or reachable(l)]
-    todo.sort(key=lambda l: not mine(l))
-    if not todo:
-        say("остались лиды из закрытых чатов других читателей — их профили посмотрят они")
-        tglib.state(done=0, left=len(enrich.profile_todo()))
-        return
+    # свои — первыми; чужие без ника и публичного чата — последними: у них
+    # пробуем только кеш сессии (это без запросов), попытку не тратим
+    todo.sort(key=lambda l: (not mine(l), theirs(l) and not reachable(l)))
     say(f"профилей к просмотру: {len(todo)}, за этот заход до {per_run}")
 
     client = await tglib.connect(acc)
@@ -246,6 +250,7 @@ async def main():
     stop, wait = "", 0
     budget = {"resolves": RESOLVES}
     answered = False                  # модель в этом заходе уже отвечала — значит, жива
+    skipped = 0                       # чужих оставили их читателям
     try:
         for n, lead in enumerate(todo[:per_run]):
             who = f"@{lead['username']}" if lead.get("username") else f"id{lead['uid']} ({lead.get('name', '')})"
@@ -257,6 +262,7 @@ async def main():
                 if iu is None:
                     if theirs(lead):
                         say(f"  {who}: доступ к нему у читателя, который читал его чат, — оставлю ему")
+                        skipped += 1
                         continue
                     enrich.save_profile(lead["uid"], err="нет доступа к человеку")
                     say(f"  {who}: к профилю не подступиться — позже")
@@ -313,6 +319,9 @@ async def main():
     say(f"\nитого: профилей посмотрено {done}, осталось {left}")
     if wait:
         tglib.state(done=done, left=left, stop="flood", cooldown=wait)
+    elif not done and not stop and skipped:
+        # всё, что осталось, — чужие лиды: не зовите меня каждую минуту
+        tglib.state(done=0, left=left, cooldown=10 * 60, note="ждут своих читателей")
     else:
         tglib.state(done=done, left=left, stop=stop, cooldown=15 * 60 if stop else 0)
 

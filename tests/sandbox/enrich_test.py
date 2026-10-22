@@ -550,7 +550,7 @@ def main():
     check(not enrich.profile_todo(), "после второго отказа лид идёт без профиля, автопилот не висит")
 
     print("\n▸ профиль: лид из закрытого чата другого читателя")
-    (TMP / "accounts.json").write_text(json.dumps([acc, {"id": "r2", "title": "читатель 2", "role": "read"}]), "utf-8")
+    (TMP / "accounts.json").write_text(json.dumps([acc, {"id": "r2", "title": "читатель 2", "role": "read", "authed": True}]), "utf-8")
     enrich.add_chats([{"ref": "t.me/+Closed9", "chat_id": 909, "title": "Закрытый"}], source="вручную")
     enrich.set_chat("+Closed9", reader="r2")
     key909 = next(k for k, v in enrich.load_chats().items() if v.get("chat_id") == 909)
@@ -563,12 +563,22 @@ def main():
             if ent == 63:
                 raise ValueError("Could not find the input entity")
             return await super().get_input_entity(ent)
+    # вторая ссылка-инвайт на тот же чат: id узнаёт вступивший, чат — дубль
+    enrich.add_chats(["t.me/+Closed9b"], source="вручную")
+    k2 = next(k for k, v in enrich.load_chats().items() if "Closed9b" in v.get("ref", ""))
+    enrich.set_chat(k2, status="skipped", reader="r1", chat_id=909)
+    check(enrich.chat_readers().get("909") == {"r2"},
+          f"дубль по второй ссылке не делает вступившего «знающим» людей чата: {enrich.chat_readers().get('909')}")
     llm.chat = prof_llm
     out = run_script("enrich-profile.py", "--account", "r1", client=NoCache())
-    check(not enrich.load_leads()["63"].get("profile_tries") and any("закрытых чатов" in o for o in out),
-          f"чужого лида из закрытого чата не трогаем и попытку не тратим: {out[-3:]}")
+    st = json.loads(next(o for o in reversed(out) if o.startswith("⌁STATE"))[6:])
+    check(not enrich.load_leads()["63"].get("profile_tries") and any("оставлю ему" in o for o in out)
+          and st.get("cooldown") == 600,
+          f"чужого лида из закрытого чата не трогаем, попытку не тратим, зря не перезапускаемся: {out[-3:]}")
+    run_script("enrich-profile.py", "--account", "r1", "--alive", "r1", client=NoCache())
+    check(enrich.load_leads()["63"].get("profile_tries") == 1,
+          "его читатель выбыл (панель его не запускает) — пробует любой, попытка считается")
     (TMP / "accounts.json").write_text(json.dumps([acc]), "utf-8")
-    enrich.save_profile(63, err="тест")
     enrich.save_profile(63, err="тест")
 
     print("\n▸ автопилот: одна фраза → цель, тема, ключевики")

@@ -799,6 +799,7 @@ function start(name, opts, onDone) {
   if (t.send && opts.sendGap) args.push('--send-gap');
   // «Написать лидам»: из очереди по чатам — только лиды обогащения
   if (name === 'drafts' && opts.leadsOnly) args.push('--leads-only');
+  if (name === 'enrichProfile' && opts.alive?.length) args.push('--alive', opts.alive.join(','));
   // догрев между пачками рассылки — свои, лёгкие действия
   if (name === 'warmup' && opts.between) args.push('--between');
   // «живой день»: аккаунт из рассылки греется весь день по потолку «между пачками»

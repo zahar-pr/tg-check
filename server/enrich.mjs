@@ -32,8 +32,9 @@ export function makeEnrich({ DIR, CODE, accounts, running, launch, pythonCmd, pu
   const st = { on: false, finding: false, goal: '', topic: '', ...read(STATE, {}) };
   // панель перезапустилась, пока модель разбирала запрос автопилота: план умер
   // вместе с ней — не делаем вид, что автопилот работает
-  if (st.auto && !st.on && !st.finding) {
+  if (st.planning || (st.auto && !st.on && !st.finding)) {
     st.auto = false;
+    delete st.planning;
     st.planErr = 'панель перезапускалась, пока модель разбирала запрос — запусти автопилот снова';
   }
   const save = () => {
@@ -252,12 +253,18 @@ export function makeEnrich({ DIR, CODE, accounts, running, launch, pythonCmd, pu
     if (profileLeft() && !busyWith(/^Профили лидов/) && free.length && (free.length > 1 || !fresh)) {
       // лучше тот, кто читал их чаты: людей оттуда он уже знает, а лида из
       // закрытого чата без @ника видит только он
-      const readerOf = new Map(all.filter((v) => v.chat_id).map((v) => [String(v.chat_id), v.reader]));
+      const readOf = new Map();             // chat_id -> все, кто его читал (дубли по второй ссылке — мимо)
+      for (const v of all) {
+        if (!v.chat_id || v.status === 'skipped') continue;
+        const k = String(v.chat_id);
+        readOf.set(k, [...(readOf.get(k) || []), ...(v.read_by || []), v.reader].filter(Boolean));
+      }
       const owners = new Set(leads().list.filter((l) => !l.profile_at && !l.excluded
-        && (Number(l.profile_tries) || 0) < 2).flatMap((l) => (l.chats || []).map((c) => readerOf.get(String(c.chat_id)))));
+        && (Number(l.profile_tries) || 0) < 2).flatMap((l) => (l.chats || []).flatMap((c) => readOf.get(String(c.chat_id)) || [])));
       const i = free.findIndex((x) => owners.has(x.id));
       const [a] = free.splice(i >= 0 ? i : 0, 1);
-      launch('enrichProfile', { account: a.id }, after(a.id, 'профили'));
+      // кого панель готова запускать: лидов вышедших из строя читателей пробует любой
+      launch('enrichProfile', { account: a.id, alive: readers().map((x) => x.id) }, after(a.id, 'профили'));
     }
     const live = (v) => (v.status === 'reading' ? running.has(v.reader) : IN_WORK.includes(v.status));
     let inWork = all.filter(live).length;
@@ -368,14 +375,21 @@ export function makeEnrich({ DIR, CODE, accounts, running, launch, pythonCmd, pu
 
   /* ───────── действия кнопок ───────── */
 
+  /** Модель ещё думает над запросом автопилота — гасим, иначе она перепишет
+   *  ключевики отменённого запроса, а кнопка провисит до её ответа. */
+  function cancelPlan() {
+    if (!planJob) return;
+    if (planChild) { try { planChild.kill('SIGTERM'); } catch {} }
+    delete st.planning;
+    st.planErr = 'автопилот остановлен, пока модель разбирала запрос';
+  }
+
   /** Остановить всё обогащение: общая кнопка «Остановить», полная чистка. */
   function stop(why) {
     const was = st.on || st.finding || st.auto || !!planJob;
+    cancelPlan();
     st.on = false; st.finding = false; st.auto = false; save();
     if (analyzer) { try { analyzer.child.kill('SIGTERM'); } catch {} }
-    // модель ещё думает над запросом: гасим, иначе она перепишет ключевики
-    // остановленного запроса и кнопка будет висеть до её ответа
-    if (planChild) { try { planChild.kill('SIGTERM'); } catch {} }
     if (was) note('⏸', `сбор лидов и поиск чатов остановлены${why ? ' — ' + why : ''}`);
   }
 
@@ -406,14 +420,15 @@ export function makeEnrich({ DIR, CODE, accounts, running, launch, pythonCmd, pu
     if (left && prev && prev !== query && !['clear', 'keep'].includes(queue)) {
       return { ok: false, ask: 'queue', n: left, prev };
     }
-    st.query = query; st.auto = true; st.finding = false; st.planErr = ''; save();
+    st.query = query; st.auto = true; st.finding = false; st.planErr = ''; st.planning = query; save();
     push(`\n▶ Автопилот: «${query}»`);
     const job = py(['enrich-find.py', '--plan', '--query', query], (l) => {
       if (!l.startsWith('\u2301STATE') && !l.startsWith('{')) push(`[автопилот] ${l}`);
     });
     planChild = job.child;
     planJob = job.then(async ({ code, res, out }) => {
-      if (!st.auto) { planJob = planChild = null; return; }     // пока модель думала, автопилот остановили
+      delete st.planning;
+      if (!st.auto) { planJob = planChild = null; save(); return; }   // пока модель думала, автопилот остановили
       if (code !== 0 || !res?.ok) {
         planJob = planChild = null;
         const why = String(out || '').trim().split('\n').filter((l) => !l.startsWith('\u2301')).pop() || '';
@@ -440,7 +455,7 @@ export function makeEnrich({ DIR, CODE, accounts, running, launch, pythonCmd, pu
       return { ok: false, reason: 'очередь чатов пуста — добавь ссылки или найди чаты по ключевикам' };
     }
     st.on = !!on;
-    if (!on) st.auto = false;          // остановили сбор руками — автопилот больше не ведёт
+    if (!on) { cancelPlan(); st.auto = false; }   // остановили сбор руками — автопилот больше не ведёт
     save();
     note(on ? '🎯' : '⏸', on ? 'сбор лидов включён' : 'сбор лидов остановлен');
     if (on) setTimeout(tick, 500);

@@ -161,7 +161,10 @@ def pick_chat(acc_id):
         if key is None:
             return None, None
         # pid — чей процесс читает: панель вернёт чат в очередь, только если он мёртв
-        data[key].update(status="reading", reader=acc_id, pid=os.getpid(), at=now_iso())
+        # read_by — все, кто читал (заход оборвался — дочитывает другой): людей
+        # из чата знает сессия каждого из них
+        read_by = [r for r in data[key].get("read_by") or [] if r != acc_id] + [acc_id]
+        data[key].update(status="reading", reader=acc_id, read_by=read_by, pid=os.getpid(), at=now_iso())
         return key, dict(data[key])
     return _update(fn)
 
@@ -289,6 +292,17 @@ def excluded_keys():
 
 
 PROFILE_TRIES = 2           # столько раз профиль не дался — больше не пробуем
+
+
+def chat_readers():
+    """chat_id -> читатели, которые этот чат читали. Дубль по второй ссылке
+    (skipped) не в счёт: его читатель только вступил, людей не видел."""
+    out = {}
+    for v in load_chats().values():
+        if v.get("chat_id") and v.get("status") != "skipped":
+            who = set(v.get("read_by") or []) | ({v["reader"]} if v.get("reader") else set())
+            out.setdefault(str(v["chat_id"]), set()).update(who)
+    return out
 
 
 def profile_todo():

@@ -243,7 +243,19 @@ en.stop('проверка');
 await sleep(500);
 check(en.leadsCsv().includes(`"'=HYPERLINK(""http://x"")"`), 'в CSV «о себе» с = в начале — текст, а не формула Excel');
 
+console.log('\n▸ «Остановить сбор» во время плана');
+writeChats(chatsOf([['n2', 'new']]));
+en.setOn(true);
+r = en.autopilot('хочет баню медленно', 'keep');
+en.setOn(false);
+await sleep(800);
+v3 = en.view();
+check(r.ok && !v3.planning && !v3.auto && /остановлен/.test(v3.planErr), `план погашен вместе со сбором: ${v3.planErr}`);
+
 console.log('\n▸ перезапуск панели посреди плана');
+fs.writeFileSync(path.join(DIR, 'enrich', 'state.json'), JSON.stringify({ auto: true, on: true, finding: false, planning: 'q2', query: 'q2' }));
+const en3 = makeEnrich(opts);
+check(!en3.view().auto && /перезапуск/.test(en3.view().planErr), 'шёл ручной сбор — план всё равно не висит «работает»');
 fs.writeFileSync(path.join(DIR, 'enrich', 'state.json'), JSON.stringify({ auto: true, on: false, finding: false, query: 'q' }));
 const en2 = makeEnrich(opts);
 check(!en2.view().auto && /перезапуск/.test(en2.view().planErr), 'автопилот без живого плана не висит «работает»');
