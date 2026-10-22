@@ -2699,6 +2699,8 @@ async function leadsView(force) {
   // автопилот: запрос, кнопка и ход работы по шагам
   const aq = $('#ap-query');
   if (free(aq) && !aq.dataset.touched) aq.value = d.query || '';
+  const at = $('#ap-target');
+  if (free(at) && !at.dataset.touched) at.value = d.target || '';
   const ab = $('#ap-run');
   if (ab) {
     const on = d.auto || d.planning;
@@ -2722,7 +2724,9 @@ async function leadsView(force) {
       d.analyzer ? `разбирается «${esc(d.analyzer.title)}»` : `разобрано чатов ${c0.done || 0}` + (inAnalysis ? `, ждут ${inAnalysis}` : '')),
     step(d.profileBusy ? 'run' : d.profileLeft ? 'wait' : (d.leadsTotal ? 'ok' : ''), 'Профили',
       d.profileLeft ? `осталось посмотреть ${d.profileLeft}` : d.leadsTotal ? 'посмотрены' : '—'),
-    step(d.leadsTotal ? 'ok' : '', 'Лиды', `${d.leadsTotal}` + (d.leadsExcluded ? ` · исключено продавцов ${d.leadsExcluded}` : '')),
+    step(d.reached ? 'ok' : d.target ? (d.auto ? 'run' : '') : (d.leadsTotal ? 'ok' : ''), 'Лиды',
+      (d.target ? `в этом заходе ${d.found} из ${d.target}` + (d.reached ? ' — цель набрана' : '') + ` · всего ${d.leadsTotal}` : `${d.leadsTotal}`)
+      + (d.leadsExcluded ? ` · исключено продавцов ${d.leadsExcluded}` : '')),
     // почему стоит: читатель на паузе после сбоя (нет связи, флуд), без входа, на отлёжке
     step((d.readers || []).some((r) => r.busy) ? 'run' : (d.readers || []).some((r) => r.rest || !r.ready) ? 'wait' : (d.readers || []).length ? 'ok' : '',
       'Читатели', (d.readers || []).map((r) => `${esc(r.name || r.title)}: ` + (r.busy ? esc(r.busy.split(' — ')[0].toLowerCase())
@@ -2800,6 +2804,9 @@ async function leadsView(force) {
           <div class="hint">${esc(l.excluded || l.why)}</div>
           ${Object.keys(l.facts || {}).length ? `<div class="ld-facts">${Object.entries(l.facts).slice(0, 8)
             .map(([k, v]) => `<span class="ld-fact"><i>${esc(k)}</i> ${esc(v)}</span>`).join('')}</div>` : ''}</summary>
+        ${l.trigger?.length ? `<div class="ld-trig"><div class="hint">Почему лид — сообщения, по которым решила модель:</div>${l.trigger
+          .map((m) => `<div class="ld-msg${m.mine ? ' ld-mine' : ''}"><span class="hint">${esc(m.date)} · ${esc(m.who)}</span> ${esc(m.text)}</div>`)
+          .join('')}</div>` : ''}
         ${l.profile?.about ? `<div class="hint" style="margin-top:6px">О себе: ${esc(l.profile.about)}</div>` : ''}
         ${l.profile?.channel ? `<div class="hint">Личный канал: ${esc(l.profile.channel.title || '')}${l.profile.channel.username
           ? ' (@' + esc(l.profile.channel.username) + ')' : ''}${l.profile.channel.posts ? ', постов прочитано ' + l.profile.channel.posts : ''}</div>` : ''}
@@ -2808,7 +2815,7 @@ async function leadsView(force) {
   }
 }
 
-['#ld-goal', '#ld-topic', '#ld-kw', '#ap-query'].forEach((id) => $(id)?.addEventListener('input', (e) => { e.target.dataset.touched = '1'; }));
+['#ld-goal', '#ld-topic', '#ld-kw', '#ap-query', '#ap-target'].forEach((id) => $(id)?.addEventListener('input', (e) => { e.target.dataset.touched = '1'; }));
 const ldDo = async (url, data, note) => {
   let r;
   try { r = await post(url, data); } catch (err) { alert(err.message); return null; }
@@ -2863,13 +2870,14 @@ $('#ap-run')?.addEventListener('click', async () => {
   const ids = [...document.querySelectorAll('#ld-readers input[data-reader]:checked')].map((i) => i.dataset.reader);
   if (!q.value.trim()) { alert('Напиши, кого ищем: например «хочет купить квартиру в Екатеринбурге»'); return; }
   if (!ids.length) { alert('Отметь аккаунты, которые будут искать и читать чаты'); return; }
-  let r = await ldDo('/api/enrich/auto', { query: q.value, accounts: ids });
+  const target = parseInt($('#ap-target')?.value || '0', 10) || 0;
+  let r = await ldDo('/api/enrich/auto', { query: q.value, accounts: ids, target });
   if (r?.ask === 'queue') {
     // в очереди остались чаты прошлого запроса — решает владелец
     const clear = confirm(`В очереди ${r.n} чатов от прошлого запроса «${r.prev}».\n\n` +
       'ОК — отложить их и искать только по новому запросу (вернуть можно кнопкой «перечитать»).\n' +
       'Отмена — оставить: читатели сначала дочитают их.');
-    r = await ldDo('/api/enrich/auto', { query: q.value, accounts: ids, queue: clear ? 'clear' : 'keep' });
+    r = await ldDo('/api/enrich/auto', { query: q.value, accounts: ids, target, queue: clear ? 'clear' : 'keep' });
   }
   if (r?.ok) delete q.dataset.touched;
 });
@@ -2878,6 +2886,8 @@ $('#ld-chats')?.addEventListener('click', (e) => {
   ldDo('/api/enrich/chats-cmd', { cmd: b.dataset.ldcmd, keys: [b.dataset.key] });
 });
 $('#ld-csv')?.addEventListener('click', () => { location.href = '/api/enrich/leads.csv'; });
+$('#ld-json')?.addEventListener('click', () => { location.href = '/api/enrich/leads.json'; });
+$('#ld-json-run')?.addEventListener('click', () => { location.href = '/api/enrich/leads.json?run=1'; });
 $('#ld-write')?.addEventListener('click', async () => {
   if (!ld?.leadsTotal) { alert('Лидов пока нет — сначала собери их'); return; }
   const run = ((lastState && lastState.auto && lastState.auto.runs) || {}).chats || {};

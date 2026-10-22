@@ -58,6 +58,11 @@ export function makeEnrich({ DIR, CODE, accounts, running, launch, pythonCmd, pu
     && (Number(l.profile_tries) || 0) < 2).length;
 
   const chats = () => read(path.join(ROOT, 'chats.json'), {});
+  /** Лидов, найденных в этом заходе автопилота (продавцы не в счёт). */
+  const foundInRun = () => (st.startedAt
+    ? leads().list.filter((l) => !l.excluded && String(l.found_at || '') >= st.startedAt).length : 0);
+  /** Автопилот набрал, сколько просили, — новые чаты не берём. */
+  const reached = () => !!st.auto && Number(st.target) > 0 && foundInRun() >= Number(st.target);
   const keywords = () => read(path.join(ROOT, 'keywords.json'), {});
   const kwLeft = () => (keywords().items || []).filter((i) => !i.done).length;
   // каналы, у которых ещё не спрашивали «похожие» (то же правило, что enrich.similar_seeds)
@@ -223,8 +228,17 @@ export function makeEnrich({ DIR, CODE, accounts, running, launch, pythonCmd, pu
     const all = Object.values(chats());
     const count = (s) => all.filter((v) => v.status === s).length;
 
+    // цель по числу лидов достигнута: новые чаты не ищем, не читаем и не
+    // разбираем — доделываем начатое (чтение, текущий разбор, профили найденных)
+    const done = reached();
+    if (done && st.finding) { st.finding = false; save(); }
+    if (done && !st.reachedNoted) {
+      st.reachedNoted = true; save();
+      note('🎯', `цель достигнута: лидов ${foundInRun()} из ${st.target} — новые чаты не беру, доделываю начатое`);
+    }
+
     // разбор: по одному чату за раз, без аккаунта
-    if (st.on && !analyzer && now >= analyzeHold && (count('downloaded') + count('analyzing'))) startAnalyze();
+    if (st.on && !done && !analyzer && now >= analyzeHold && (count('downloaded') + count('analyzing'))) startAnalyze();
 
     let free = freeReaders();
     // поиск чатов: одним читателем, порциями, пока есть непройденные ключевики
@@ -250,7 +264,7 @@ export function makeEnrich({ DIR, CODE, accounts, running, launch, pythonCmd, pu
 
     // профили лидов (описание, личный канал): одним читателем, порциями. Если
     // свободный читатель один и чаты ждут чтения — сначала чтение
-    if (profileLeft() && !busyWith(/^Профили лидов/) && free.length && (free.length > 1 || !fresh)) {
+    if (profileLeft() && !busyWith(/^Профили лидов/) && free.length && (free.length > 1 || !fresh || done)) {
       // лучше тот, кто читал их чаты: людей оттуда он уже знает, а лида из
       // закрытого чата без @ника видит только он
       const readOf = new Map();             // chat_id -> все, кто его читал (дубли по второй ссылке — мимо)
@@ -276,9 +290,16 @@ export function makeEnrich({ DIR, CODE, accounts, running, launch, pythonCmd, pu
     }
     const cap = readers().length + 1;
     for (const a of free) {
-      if (!fresh || inWork >= cap) break;
+      if (done || !fresh || inWork >= cap) break;
       const r = launch('enrichRead', { account: a.id }, after(a.id, 'чтение'));
       if (r.ok) { fresh--; inWork++; }
+    }
+    // цель набрана и начатое доделано — готово (недочитанные чаты ждут в очереди)
+    if (done && !analyzer && !planJob && !busyWith(/^Чтение чата/) && !profileLeft() && !busyWith(/^Профили лидов/)) {
+      const n = foundInRun();
+      st.on = false; st.auto = false; save();
+      note('✅', `автопилот: найдено лидов ${n} (цель ${st.target}) — готово. Выгрузка: «Лиды» → «Скачать JSON»`);
+      return;
     }
     // очередь пуста и всё разобрано — выключаемся сами, чтобы не крутиться вхолостую.
     // inWork — уже после раздачи этого захода: последний чат только что ушёл читателю
@@ -287,7 +308,8 @@ export function makeEnrich({ DIR, CODE, accounts, running, launch, pythonCmd, pu
       const wasAuto = st.auto;
       st.on = false; st.auto = false; save();
       const n = leads().list.filter((l) => !l.excluded).length;
-      note('✅', wasAuto ? `автопилот закончил: лидов ${n} — чаты разобраны, профили посмотрены`
+      note('✅', wasAuto ? `автопилот закончил: лидов ${n}` + (st.target ? ` (в этом заходе ${foundInRun()} из ${st.target})` : '')
+                          + ' — чаты разобраны, профили посмотрены'
                           : 'сбор лидов: все чаты из очереди разобраны');
     }
   }
@@ -325,6 +347,8 @@ export function makeEnrich({ DIR, CODE, accounts, running, launch, pythonCmd, pu
       score: Number(l.score) || 0, facts: l.facts || {},
       profile: l.profile_at ? { about: l.profile?.about || '', channel: l.profile?.channel || null } : null,
       excluded: l.excluded || '',
+      // триггер: сообщения, по которым модель решила, что это лид (из последнего чата)
+      trigger: ((l.chats || []).slice(-1)[0]?.evidence || []).slice(0, 8),
       found: l.found_at || '', status: l.excluded ? 'исключён' : (ls.get(keyOf(l)) || 'в очереди'),
     })).sort((a, b) => (a.excluded ? 1 : 0) - (b.excluded ? 1 : 0) || b.score - a.score
       || String(b.found).localeCompare(String(a.found)));
@@ -334,6 +358,8 @@ export function makeEnrich({ DIR, CODE, accounts, running, launch, pythonCmd, pu
       on: st.on, finding: st.finding, goal: st.goal, topic: st.topic || kw.topic || '',
       auto: !!st.auto && (st.on || st.finding || !!planJob), query: st.query || '', planning: !!planJob,
       planErr: st.planErr || '', planOk: !!st.goal && st.planFor === st.query,
+      target: Number(st.target) || 0, found: foundInRun(),
+      reached: Number(st.target) > 0 && foundInRun() >= Number(st.target),
       profileLeft: profileLeft(), profileBusy: busyWith(/^Профили лидов/),
       kwBusy: !!kwJob,
       keywords: { total: (kw.items || []).length, left: kwLeft(), list: (kw.items || []).map((i) => i.q) },
@@ -373,6 +399,42 @@ export function makeEnrich({ DIR, CODE, accounts, running, launch, pythonCmd, pu
     return '﻿' + rows.map((r) => r.map(q).join(';')).join('\n') + '\n';
   }
 
+  /**
+   * Выгрузка лидов в JSON — всё, что о человеке известно, и почему модель
+   * решила, что он хочет того, что ищем: сообщения-триггеры с датой и
+   * автором, её короткое «почему», оценка, факты, профиль. run=true — только
+   * найденные в этом заходе автопилота.
+   */
+  function leadsJson(run = false) {
+    const ls = leadStatus();
+    const inRun = (l) => !!st.startedAt && String(l.found_at || '') >= st.startedAt;
+    const list = leads().list.filter((l) => !run || inRun(l)).map((l) => ({
+      uid: l.uid, username: l.username || '', name: l.name || '',
+      link: l.username ? `https://t.me/${String(l.username).replace(/^@/, '')}` : `tg://user?id=${l.uid}`,
+      score: Number(l.score) || 0,
+      why: (l.chats || []).slice(-1)[0]?.why || '',
+      triggers: (l.chats || []).map((c) => ({
+        chat: c.title || '', chat_ref: c.ref || '', why: c.why || '', score: c.score ?? null,
+        messages: c.evidence || [], author_quotes: c.quotes || [], at: c.at || '',
+      })),
+      facts: l.facts || {},
+      profile: l.profile_at ? {
+        about: l.profile?.about || '', birthday: l.profile?.birthday || '',
+        business: l.profile?.business || '', address: l.profile?.address || '',
+        channel: l.profile?.channel || null, checked_at: l.profile_at,
+      } : null,
+      note: l.note || '',
+      excluded: l.excluded || '',
+      status: l.excluded ? 'исключён' : (ls.get(keyOf(l)) || 'в очереди'),
+      found_at: l.found_at || '', in_this_run: inRun(l),
+    })).sort((a, b) => (a.excluded ? 1 : 0) - (b.excluded ? 1 : 0) || b.score - a.score);
+    return JSON.stringify({
+      goal: st.goal || '', query: st.query || '', target: Number(st.target) || 0,
+      found_in_run: foundInRun(), started_at: st.startedAt || '', exported_at: new Date().toISOString(),
+      leads: list,
+    }, null, 2) + '\n';
+  }
+
   /* ───────── действия кнопок ───────── */
 
   /** Модель ещё думает над запросом автопилота — гасим, иначе она перепишет
@@ -406,7 +468,7 @@ export function makeEnrich({ DIR, CODE, accounts, running, launch, pythonCmd, pu
    * 'clear' — в «пропущен» (на новый запрос не тратим вступления и разбор),
    * 'keep' — оставить. Не сказано, а такие есть — спросим владельца.
    */
-  function autopilot(query, queue) {
+  function autopilot(query, queue, target) {
     query = String(query || '').trim().slice(0, 300);
     if (!query) return { ok: false, reason: 'напиши, кого ищем: например «хочет купить квартиру в Екатеринбурге»' };
     if (planJob) return { ok: false, reason: 'автопилот уже разбирает запрос — подожди минуту' };
@@ -420,7 +482,11 @@ export function makeEnrich({ DIR, CODE, accounts, running, launch, pythonCmd, pu
     if (left && prev && prev !== query && !['clear', 'keep'].includes(queue)) {
       return { ok: false, ask: 'queue', n: left, prev };
     }
-    st.query = query; st.auto = true; st.finding = false; st.planErr = ''; st.planning = query; save();
+    st.query = query; st.auto = true; st.finding = false; st.planErr = ''; st.planning = query;
+    // сколько лидов найти (0 — без предела) и с какого момента их считать
+    st.target = Math.max(0, Math.min(100_000, parseInt(target, 10) || 0));
+    st.startedAt = new Date().toISOString(); st.reachedNoted = false;
+    save();
     push(`\n▶ Автопилот: «${query}»`);
     const job = py(['enrich-find.py', '--plan', '--query', query], (l) => {
       if (!l.startsWith('\u2301STATE') && !l.startsWith('{')) push(`[автопилот] ${l}`);
@@ -548,6 +614,6 @@ export function makeEnrich({ DIR, CODE, accounts, running, launch, pythonCmd, pu
   }
 
   // tick — наружу только для песочницы (tests/sandbox/enrich_sched_test.mjs)
-  return { view, leadsCsv, leadKeys, excludedKeys, putOffAll, putOffAny, autopilot, setOn, setGoal, addChats, chatsCmd, makeKeywords, saveKeywords, find, tick, stop,
+  return { view, leadsCsv, leadsJson, leadKeys, excludedKeys, putOffAll, putOffAny, autopilot, setOn, setGoal, addChats, chatsCmd, makeKeywords, saveKeywords, find, tick, stop,
            status: () => ({ on: st.on, finding: st.finding }) };
 }

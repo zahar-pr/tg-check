@@ -4243,6 +4243,16 @@ async function handler(req, res) {
       });
       return res.end(enrich.leadsCsv());
     }
+    // лиды целиком, с триггерами (почему модель решила, что это лид); ?run=1 — только этот заход
+    if (u.pathname === '/api/enrich/leads.json') {
+      const run = u.searchParams.get('run') === '1';
+      res.writeHead(200, {
+        'content-type': 'application/json; charset=utf-8',
+        'content-disposition': `${u.searchParams.get('view') === '1' ? 'inline' : 'attachment'}; filename="leads${run ? '-run' : ''}.json"`,
+        'cache-control': 'no-store',
+      });
+      return res.end(enrich.leadsJson(run));
+    }
     if (u.pathname.startsWith('/api/enrich/') && req.method === 'POST') {
       const o = await body(req);
       const what = u.pathname.slice('/api/enrich/'.length);
@@ -4265,7 +4275,7 @@ async function handler(req, res) {
             'сейчас в рассылке — сними их с рассылки или отметь другие аккаунты' });
         }
         for (const a of picked) makeReader(a);
-        return json(res, 200, enrich.autopilot(o.query, o.queue));
+        return json(res, 200, enrich.autopilot(o.query, o.queue, o.target));
       }
       // «Написать лидам» — обычный автопрогон по чатам, только по лидам.
       // Настройки (тексты, паузы, лимиты, кто пишет) — с вкладки «Рассылка по чатам»

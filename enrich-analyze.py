@@ -59,7 +59,11 @@ score — уверенность от 0 до 100, что ЦЕЛЬ относит
 
 Ответь СТРОГО одним JSON без пояснений вокруг:
 {{"lead": true|false, "score": 0-100, "why": "одна короткая фраза",
-  "facts": {{"поле": "значение"}}, "note": "заметка"}}
+  "evidence": [номера #id], "facts": {{"поле": "значение"}}, "note": "заметка"}}
+
+evidence — только для лида: номера (#id, без решётки) 1–5 сообщений, по которым
+видно намерение: реплики ЦЕЛИ и чужая реплика, на которую ЦЕЛЬ отвечает
+(«хату брать будешь?» → «да» — оба номера).
 
 facts — только для лида: короткие факты о человеке, полезные для личного
 письма. Поля по смыслу цели, например: «что ищет», «город», «район», «бюджет»,
@@ -146,8 +150,14 @@ def _clean(d):
             k, v = " ".join(str(k).split())[:40], " ".join(str(v).split())[:300]
             if k and v and v.lower() not in ("нет", "неизвестно", "-", "—", "null", "none"):
                 facts[k] = v
+    ev = []
+    for x in d.get("evidence") if isinstance(d.get("evidence"), list) else []:
+        try:
+            ev.append(int(str(x).strip().lstrip("#")))
+        except ValueError:
+            pass
     return {"lead": lead, "score": score, "why": str(d.get("why") or "")[:300],
-            "facts": facts, "note": str(d.get("note") or "")}
+            "facts": facts, "note": str(d.get("note") or ""), "evidence": ev[:8]}
 
 
 # strict=False: заметку в markdown модели пишут с настоящими переносами строк
@@ -225,7 +235,7 @@ def ask(system, text):
     budgets = (1200, 2500)
     for n, tokens in enumerate(budgets):
         info = {}
-        out = llm.chat(system, text, max_tokens=tokens, temperature=0.2, info=info)
+        out = enrich.ask_llm(system, text, max_tokens=tokens, temperature=0.2, info=info)
         if out is None:
             code = str(info.get("code", ""))
             return Fail("req" if code in ("400", "413") else "out", code)
@@ -242,7 +252,7 @@ def model_alive():
     крошечный запрос и отказывает обычным (402 «можете позволить N токенов»).
     """
     info = {}
-    out = llm.chat("Ответь одним словом.", "ок", max_tokens=900, temperature=0, info=info)
+    out = enrich.ask_llm("Ответь одним словом.", "ок", max_tokens=900, temperature=0, info=info)
     return out is not None
 
 
@@ -267,7 +277,31 @@ def judge(system, msgs, me):
     return {"lead": True, "score": top["score"], "why": top["why"], "facts": facts,
             "note": "\n\n".join(v["note"] for v in yes if v["note"]),
             "msg_ids": [msgs[i]["id"] for i in pos],
-            "quotes": [str(msgs[i].get("text"))[:200] for i in pos[-3:]]}
+            "quotes": [str(msgs[i].get("text"))[:200] for i in pos[-3:]],
+            "evidence": evidence(msgs, me, pos, [i for v in yes for i in v.get("evidence") or []])}
+
+
+def evidence(msgs, me, pos, ids):
+    """
+    Триггер: сообщения, по которым модель решила, что это лид, — с датой и
+    автором, чтобы человек проверил её глазами. Модель номеров не назвала —
+    последние реплики автора и то, на что он отвечал.
+    """
+    byid = {m["id"]: m for m in msgs}
+    want = [i for i in dict.fromkeys(ids) if i in byid]
+    if not want:
+        for i in pos[-3:]:
+            m = msgs[i]
+            if m.get("reply_to") in byid:
+                want.append(m["reply_to"])
+            want.append(m["id"])
+    out = []
+    for i in sorted(dict.fromkeys(want))[:8]:
+        m = byid[i]
+        out.append({"id": i, "date": str(m.get("date", ""))[:16].replace("T", " "),
+                    "who": f"@{m['un']}" if m.get("un") else (m.get("name") or f"id{m.get('uid')}"),
+                    "mine": m.get("uid") == me, "text": " ".join(str(m.get("text") or "").split())[:500]})
+    return out
 
 
 def load(path):
@@ -299,7 +333,9 @@ def next_chat():
 def main():
     dry = tglib.flag("dry")
     sample = tglib.arg("sample", "")
-    workers = int(tglib.arg("workers", 0) or 0) or WORKERS
+    # ГигаЧат по ключу физлица пускает один запрос за раз — больше дало бы 429
+    workers = int(tglib.arg("workers", 0) or 0) or (
+        int(llm._cfg("GIGACHAT_WORKERS", "1") or 1) if enrich.llm_provider() == "gigachat" else WORKERS)
     if sample:
         key, ch, path = "sample", {"title": Path(sample).name, "chat_id": "sample", "ref": ""}, Path(sample)
     else:
@@ -351,6 +387,29 @@ def main():
         failed += stuck_before
         todo = [uid for uid in todo if uid not in stuck_before]
 
+    # Предфильтр: к модели идут только авторы, в окне которых (их реплики и по
+    # AROUND соседних) тема хоть как-то упомянута. «Да» на «хату брать будешь?»
+    # проходит — «хату» есть в окне. Главная экономия токенов: в большом чате о
+    # теме говорит малая часть людей.
+    roots = enrich.stems() or ([] if sample else enrich.make_stems(enrich.goal()))
+    if roots and todo:
+        hit = [any(r in str(m.get("text") or "").lower() for r in roots) for m in msgs]
+        where = {}
+        for i, m in enumerate(msgs):
+            if m.get("uid"):
+                where.setdefault(m["uid"], []).append(i)
+        quiet = [uid for uid in todo
+                 if not any(any(hit[a:b + 1]) for a, b in windows(where.get(uid, []), len(msgs)))]
+        if quiet:
+            todo = [uid for uid in todo if uid not in set(quiet)]
+            say(f"без слов темы рядом — к модели не идут: {len(quiet)}, к разбору: {len(todo)}")
+            if not dry:
+                for uid in quiet:
+                    progress[str(uid)] = False
+                enrich.write_json(prog_file, progress)
+    elif not roots:
+        say("предфильтра нет (не получил корни слов темы) — все авторы идут к модели")
+
     def one(uid):
         if stats["stop"]:
             return
@@ -382,7 +441,7 @@ def main():
                                     {"chat_id": ch.get("chat_id"), "ref": ch.get("read_ref") or ch.get("ref", ""),
                                      "title": title},
                                     v["msg_ids"], v["why"], v["note"], v["quotes"],
-                                    facts=v["facts"], score=v["score"])
+                                    facts=v["facts"], score=v["score"], evidence=v["evidence"])
             if not dry:
                 progress[str(uid)] = bool(v["lead"])
                 enrich.write_json(prog_file, progress)

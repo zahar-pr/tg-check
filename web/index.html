@@ -2,7 +2,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>Telegram — панель</title>
-<link rel="stylesheet" href="/app.css?v=r112">
+<link rel="stylesheet" href="/app.css?v=r113">
 <div class="app">
 
   <!-- ЛЕВАЯ ПАНЕЛЬ РЕЖИМОВ -->
@@ -223,6 +223,9 @@
           кнопкой ниже.</p>
         <div class="frow ld-row"><span style="min-width:130px">Кого ищем</span>
           <input id="ap-query" class="ftext" placeholder="например: хочет купить квартиру в Екатеринбурге"></div>
+        <div class="frow ld-row"><span style="min-width:130px">Сколько лидов</span>
+          <input id="ap-target" class="ftext" type="number" min="0" step="1" style="max-width:140px" placeholder="без предела">
+          <span class="hint">наберёт столько новых — и остановится</span></div>
         <div class="fh" style="margin-top:6px">Аккаунты, которые ищут и читают</div>
         <p class="hint" style="margin:0 0 8px">Они только читают чаты: не греются и никому не пишут. Подойдут старые и
           дешёвые — не те, что пишут людям.</p>
@@ -281,6 +284,8 @@
         <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap">
           <button class="primary" id="ld-write">Написать лидам</button>
           <button class="ghost" id="ld-csv">Скачать CSV</button>
+          <button class="ghost" id="ld-json" title="Все лиды целиком: факты, профиль и сообщения, по которым модель решила, что это лид">Скачать JSON</button>
+          <button class="ghost" id="ld-json-run" title="Только найденные в последнем заходе автопилота">JSON этого захода</button>
           <span id="ld-leads-note" class="hint"></span>
         </div>
         <div id="ld-leads" style="margin-top:12px"></div>
@@ -832,4 +837,4 @@
 
   </main>
 </div>
-<script src="/app.js?v=r112"></script>
+<script src="/app.js?v=r113"></script>

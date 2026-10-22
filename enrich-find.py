@@ -116,15 +116,27 @@ def word_list(out):
     return [w for w in words if isinstance(w, str) and w.strip(' .…"\'«»')]
 
 
-def ask_text(prompt, temperature):
-    """Ответ модели на длинную генерацию; пустой — ещё одна попытка."""
+def ask_text(prompt, temperature, tokens=None):
+    """Ответ модели обогащения на длинную генерацию; пустой — ещё одна попытка."""
+    # ГигаЧат не «думает» вслух: ему хватает 4000, и больше он может не принять
+    tokens = tokens or (4000 if enrich.llm_provider() == "gigachat" else KW_TOKENS)
     out = None
     for _ in range(2):
-        out = llm.chat("Отвечай строго в формате, который просят.", prompt,
-                       max_tokens=KW_TOKENS, temperature=temperature, tries=2, timeout=KW_TIMEOUT)
+        out = enrich.ask_llm("Отвечай строго в формате, который просят.", prompt,
+                             max_tokens=tokens, temperature=temperature, tries=2, timeout=KW_TIMEOUT)
         if out:
             break
     return out
+
+
+def make_stems(goal):
+    """Корни слов темы для предфильтра разбора. Не вышло — разбор пойдёт без него."""
+    got = enrich.make_stems(goal)
+    if not got:
+        say(f"корни слов темы не получил ({llm.LAST_ERR or 'мало'}) — разбор пойдёт без предфильтра")
+        return []
+    say(f"корни слов темы для предфильтра: {len(got)} — " + ", ".join(got[:25]) + (" …" if len(got) > 25 else ""))
+    return got
 
 
 def gather(topic, goal="", seed=()):
@@ -234,6 +246,7 @@ def make_plan(query):
     items = save_keywords(topic, words)
     say(f"ключевиков: {len(items)}")
     say(", ".join(i["q"] for i in items[:40]) + (" …" if len(items) > 40 else ""))
+    make_stems(goal)
     print(json.dumps({"ok": True, "goal": goal, "topic": topic, "n": len(items)}, ensure_ascii=False), flush=True)
 
 
@@ -244,6 +257,7 @@ def make_keywords(topic):
     items = save_keywords(topic, words)
     say(f"ключевиков: {len(items)}")
     say(", ".join(i["q"] for i in items[:40]) + (" …" if len(items) > 40 else ""))
+    make_stems(enrich.goal())
     tglib.state(done=len(items), left=0)
 
 
@@ -259,9 +273,9 @@ def fit(topic, cands):
     items = "\n".join(f"{i}. {c['title']} ({'канал' if c['kind'] == 'channel' else 'группа'})"
                       for i, c in enumerate(cands))
     info = {}
-    out = llm.chat("Отвечай строго в формате, который просят.",
-                   FIT_PROMPT.format(goal=enrich.goal(), topic=topic, items=items),
-                   max_tokens=1500, temperature=0, info=info)
+    out = enrich.ask_llm("Отвечай строго в формате, который просят.",
+                         FIT_PROMPT.format(goal=enrich.goal(), topic=topic, items=items),
+                         max_tokens=1500, temperature=0, info=info)
     if out is None:
         # отказ из-за САМИХ названий (модерация, «Content Exists Risk», длинно)
         # повторится — это как непонятный ответ: после двух раз ключевик пропустим

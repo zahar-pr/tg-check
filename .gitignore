@@ -96,3 +96,7 @@ tests/sandbox/profile/
 
 # обогащение: очередь чатов, сырые сообщения, ключевики (enrich.py)
 enrich/
+
+# ГигаЧат: токен доступа (живёт 30 минут) и корневой сертификат Минцифры — на сервере
+.gigachat-token.json
+russian_trusted_root_ca.pem

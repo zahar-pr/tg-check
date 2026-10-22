@@ -513,3 +513,6 @@ details.fieldset[open] > summary.fh::before{content:'▾'}
 .ld-fact{font-size:12px;border:1px solid var(--line);border-radius:8px;padding:1px 7px;color:var(--ink)}
 .ld-fact i{font-style:normal;color:var(--mut)}
 .ld-out{opacity:.55}
+.ld-trig{margin-top:8px;display:grid;gap:4px}
+.ld-msg{font-size:12.5px;border-left:2px solid var(--line);padding:2px 8px;color:var(--ink)}
+.ld-msg.ld-mine{border-left-color:var(--acc)}

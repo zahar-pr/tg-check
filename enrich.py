@@ -26,6 +26,7 @@ import json
 import os
 from datetime import datetime, timedelta, timezone
 
+import llm
 import tglib
 from chatlib import chat_ref, locked
 
@@ -37,6 +38,62 @@ KEYWORDS = ROOT / "keywords.json"
 STATE = ROOT / "state.json"
 JOINS = ROOT / "joins.json"
 LEADS = ROOT / "leads.json"
+STEMS = ROOT / "stems.json"       # корни слов темы для предфильтра разбора (их пишет Python)
+
+
+def llm_provider():
+    """
+    Чем обогащение спрашивает модель: Сбер ГигаЧат, если в .env задан его ключ
+    (GIGACHAT_CREDENTIALS). ENRICH_LLM=openrouter — вернуть общую модель панели.
+    """
+    if (llm._cfg("ENRICH_LLM", "") or "").lower() in ("openrouter", "default", "llm"):
+        return None
+    return "gigachat" if llm.gigachat_ready() else None
+
+
+def ask_llm(system, user, **kw):
+    """llm.chat моделью обогащения."""
+    return llm.chat(system, user, provider=llm_provider(), **kw)
+
+
+def save_stems(goal, stems):
+    """Корни слов темы для цели — какие окна вообще показывать модели."""
+    clean = sorted({" ".join(str(s).lower().split())[:30] for s in stems if str(s).strip()} - {""})
+    ROOT.mkdir(parents=True, exist_ok=True)
+    write_json(STEMS, {"goal": goal, "stems": clean, "at": now_iso()})
+    return clean
+
+
+def stems():
+    """Корни для текущей цели или [] (тогда разбор без предфильтра или сам их спросит)."""
+    d = read_json(STEMS, {})
+    return (d.get("stems") or []) if d.get("goal") == goal() else []
+
+
+STEMS_PROMPT = """Ищем в переписке Telegram-чатов людей, которые {goal}.
+Перед разбором отсеиваем куски переписки, где тема даже не упоминается.
+Дай 30–60 КОРНЕЙ слов (начала слов, 3–8 букв, в нижнем регистре), которыми
+люди говорят об этом в чатах — и прямо, и разговорно, и сокращениями. Для
+квартиры, например: «квартир», «хат», «однушк», «двушк», «ипотек», «жк»,
+«новостро», «вторичк», «застройщ», «жиль». Город и общие слова («купить»,
+«хочу», «нужно») не нужны — только слова самой темы.
+Ответь ТОЛЬКО JSON-массивом строк."""
+
+
+def make_stems(for_goal):
+    """
+    Корни слов темы у модели обогащения — для предфильтра разбора: к модели
+    идут только авторы, в окне которых тема хоть как-то упомянута. Это и есть
+    главная экономия токенов: в большом чате о теме говорит малая часть людей.
+    Не вышло — [] (разбор пойдёт без предфильтра).
+    """
+    import re
+    out = ask_llm("Отвечай строго в формате, который просят.", STEMS_PROMPT.format(goal=for_goal),
+                  max_tokens=1500, temperature=0.3, tries=2, timeout=120) or ""
+    starts = [m.end() for m in re.finditer(r"\[\s*(?=\")", out)]
+    words = re.findall(r'"([^"\\]{2,30})"', out[starts[-1]:]) if starts else []
+    words = [w for w in words if w.strip(" .…") and len(w.strip()) >= 2]
+    return save_stems(for_goal, words) if len(words) >= 5 else []
 
 DAYS = 90                    # столько истории читаем
 STALE_READING = 3 * 3600     # читатель пропал дольше — чат возвращается в очередь
@@ -225,12 +282,13 @@ def load_leads():
     return read_json(LEADS, {})
 
 
-def add_lead(uid, username, name, chat, msg_ids, why, note, quotes, facts=None, score=None):
+def add_lead(uid, username, name, chat, msg_ids, why, note, quotes, facts=None, score=None, evidence=None):
     """
     Лид в leads.json. Один человек — одна карточка, сколько бы чатов его ни
     показали: заметка по новому чату дописывается, ссылки на сообщения копятся.
     Заодно кладём его в очередь рассылки «по чатам» — писать ему будет
     обычная рассылка (by=lead: писать может любой аккаунт, см. tglib.can_write).
+    evidence — сообщения, по которым модель решила, что это лид (триггер).
     """
     ROOT.mkdir(parents=True, exist_ok=True)
     with locked(LEADS):
@@ -255,7 +313,7 @@ def add_lead(uid, username, name, chat, msg_ids, why, note, quotes, facts=None, 
         lead["chats"] = [c for c in lead["chats"] if str(c.get("chat_id")) != str(chat.get("chat_id"))]
         lead["chats"].append({"chat_id": chat.get("chat_id"), "ref": chat.get("ref", ""), "title": title,
                               "msg_ids": list(msg_ids)[-20:], "why": why, "quotes": quotes[:5],
-                              "at": now_iso()})
+                              "evidence": list(evidence or [])[:10], "score": score, "at": now_iso()})
         block = f"### {title}\n{note.strip()}"
         if block not in lead["note"]:
             lead["note"] = (lead["note"].rstrip() + "\n\n" + block).strip()

@@ -113,6 +113,7 @@ EXCLUDES=(
   './comment-persona.txt' './llm-usage.json'
   './tgapi.json' './personas'
   './enrich'
+  './.gigachat-token.json' './russian_trusted_root_ca.pem'
   '*.xlsx' '*.session' './_backup_*' './_reset_backup_*' '.DS_Store' '.send-gap.*'
 )
 
@@ -134,6 +135,7 @@ DATA_GUARD=(
   tgapi.json personas
   'auto-run.paused-*.json' 'egrul-*.log'
   keywords.json joins.json add-list.txt '*.jsonl'
+  .gigachat-token.json
 )
 
 TMP_ARCHIVE=""

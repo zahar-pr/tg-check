@@ -252,6 +252,32 @@ await sleep(800);
 v3 = en.view();
 check(r.ok && !v3.planning && !v3.auto && /остановлен/.test(v3.planErr), `план погашен вместе со сбором: ${v3.planErr}`);
 
+console.log('\n▸ цель по числу лидов и выгрузка JSON');
+running.clear();
+notes.length = 0;
+writeChats(chatsOf([['t1', 'new'], ['t2', 'new']]));
+r = en.autopilot('хочет купить квартиру в Екатеринбурге', 'keep', 1);
+await sleep(1500);
+// разбор нашёл лида уже после старта захода
+fs.writeFileSync(path.join(DIR, 'enrich', 'leads.json'), JSON.stringify({
+  9: { uid: 9, username: 'buyer9', name: 'Покупатель', found_at: new Date(Date.now() + 1000).toISOString(),
+       profile_at: 'T', score: 91, facts: { 'бюджет': '8 млн' },
+       chats: [{ title: 'ЖК', why: 'ответил «да» на «хату брать будешь?»', score: 91,
+                 evidence: [{ id: 1, who: '@vasya', mine: false, text: 'хату брать будешь?' },
+                            { id: 2, who: '@buyer9', mine: true, text: 'да' }] }] },
+}));
+await sleep(30);
+running.clear(); launched.length = 0;
+en.tick();
+let v4 = en.view();
+check(r.ok && v4.found === 1 && v4.reached && !launched.some((x) => x[0] === 'enrichRead') && !v4.on && !v4.auto,
+  `набрал 1 из 1 — новые чаты не читает и выключился: found ${v4.found}, launched ${launched.map((x) => x[0])}`);
+check(notes.some((t) => /найдено лидов 1 \(цель 1\)/.test(t)), `итог в журнале: ${notes.slice(-2).join(' | ')}`);
+const js = JSON.parse(en.leadsJson(true));
+check(js.found_in_run === 1 && js.leads[0].triggers[0].messages[1].text === 'да' && js.leads[0].link === 'https://t.me/buyer9'
+  && js.leads[0].facts['бюджет'] === '8 млн', 'JSON: лид с фактами, ссылкой и сообщениями-триггерами');
+check(v4.leads[0].trigger.length === 2, 'на карточке лида — сообщения-триггеры');
+
 console.log('\n▸ перезапуск панели посреди плана');
 fs.writeFileSync(path.join(DIR, 'enrich', 'state.json'), JSON.stringify({ auto: true, on: true, finding: false, planning: 'q2', query: 'q2' }));
 const en3 = makeEnrich(opts);

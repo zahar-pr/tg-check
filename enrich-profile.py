@@ -202,8 +202,8 @@ def ask(lead, prof, posts):
     budgets = (1200, 2500)
     for n, tokens in enumerate(budgets):
         info = {}
-        out = llm.chat("Отвечай строго в формате, который просят.", text,
-                       max_tokens=tokens, temperature=0.2, info=info)
+        out = enrich.ask_llm("Отвечай строго в формате, который просят.", text,
+                             max_tokens=tokens, temperature=0.2, info=info)
         if out is None:
             return "req" if refused(str(info.get("code", ""))) else None
         got = _parse(out, final=n == len(budgets) - 1)
@@ -214,7 +214,7 @@ def ask(lead, prof, posts):
 
 def model_alive():
     """Жива ли модель вообще — тот же запас токенов, что у настоящего запроса."""
-    return llm.chat("Ответь одним словом.", "ок", max_tokens=900, temperature=0, info={}) is not None
+    return enrich.ask_llm("Ответь одним словом.", "ок", max_tokens=900, temperature=0, info={}) is not None
 
 
 async def main():

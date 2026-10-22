@@ -16,6 +16,7 @@
 """
 import asyncio
 import json
+import time
 import os
 import re
 import runpy
@@ -194,7 +195,7 @@ def run_script(name, *args, client=None):
     return out
 
 
-def fake_llm(system, user, max_tokens=400, temperature=0.8, tries=5, model=None, info=None):
+def fake_llm(system, user, max_tokens=400, temperature=0.8, tries=5, model=None, info=None, **kw):
     """
     «Модель» для песка: смотрит на реплики ЦЕЛИ (►) и на соседние строки. Лид —
     если цель сама говорит про покупку, или отвечает «да»/«и я тоже» сразу
@@ -449,6 +450,38 @@ def main():
     check(not tglib.is_frozen_error(ValueError('No user has "Frozen_Soul" as username')),
           "ник с «frozen_» — не заморозка аккаунта")
 
+    print("\n▸ разбор: предфильтр по словам темы и сообщения-триггеры")
+    ev_id = 556
+    enrich.add_chats([{"ref": "t.me/ev_chat", "chat_id": ev_id, "title": "Соседи ЖК"}])
+    enrich.set_chat("ev_chat", status="downloaded")
+    lines = [(1, 801, "vasya", "Вася", "Олег, хату брать будешь в этом году?", None),
+             (2, 802, "oleg", "Олег", "да", 1),
+             (30, 803, "fan", "Болельщик", "кто смотрел матч вчера?", None),
+             (31, 804, "fan2", "Фанат", "наши опять проиграли", 30)]
+    # между ними — 20 нейтральных сообщений, чтобы окна не слиплись
+    lines += [(10 + i, 810, "noise", "Шум", "привет всем", None) for i in range(15)]
+    with enrich.raw_path(ev_id).open("w", encoding="utf-8") as f:
+        for mid, uid, un, name, text, rep in lines:
+            f.write(json.dumps({"id": mid, "date": NOW.isoformat(), "uid": uid, "un": un, "name": name,
+                                "text": text, "reply_to": rep}, ensure_ascii=False) + "\n")
+    enrich.save_stems(enrich.goal(), ["хат", "квартир", "ипотек", "жк", "новостро"])
+    asked = []
+
+    def judge_llm(system, user, info=None, **kw):
+        me = user.split("►", 1)[-1].split("\n", 1)[0]
+        asked.append(me)
+        if "(Олег)" in me:
+            return '{"lead": true, "score": 88, "why": "ответил «да» на вопрос про хату", "evidence": ["#1", 2], "facts": {}, "note": "- хочет хату"}'
+        return '{"lead": false, "score": 5, "why": "не про покупку"}'
+    llm.chat = judge_llm
+    out = run_script("enrich-analyze.py", "--chat", "ev_chat")
+    check(any("к модели не идут: 2" in o for o in out) and not any("Болельщик" in a or "Фанат" in a for a in asked),
+          f"авторы без слов темы в окне к модели не идут, «да» рядом с «хату» — идёт: {[o for o in out if 'модели' in o]}")
+    oleg = enrich.load_leads().get("802", {})
+    ev = (oleg.get("chats") or [{}])[-1].get("evidence") or []
+    check([m["id"] for m in ev] == [1, 2] and ev[0]["text"].startswith("Олег, хату") and ev[1]["mine"],
+          f"у лида сохранены сообщения-триггеры с автором и текстом: {ev}")
+
     print("\n▸ поиск чатов: ключевики")
     llm.chat = lambda *a, **k: 'Вот список: ["ЖК Академ", "ипотека екб", "ЖК Академ", "новостройки екб"]'
     run_script("enrich-find.py", "--keywords", "--topic", "Квартиры в Екатеринбурге")
@@ -470,9 +503,10 @@ def main():
     llm.chat = wordy
     run_script("enrich-find.py", "--keywords", "--topic", "Квартиры в Екатеринбурге")
     kw = enrich.read_json(enrich.KEYWORDS, {})
-    check(len(kw.get("items", [])) == 122 and len(rounds) == 3,
-          f"из обрезанного ответа взято что успело, раунды без повторов: {len(kw.get('items', []))} за {len(rounds)}")
-    check(all(r[1] >= 150 and r[2] <= 2 for r in rounds) and rounds[1][3],
+    kwr = [r for r in rounds if r[0] == 12000]            # последний вызов — корни слов темы
+    check(len(kw.get("items", [])) == 122 and len(kwr) == 3,
+          f"из обрезанного ответа взято что успело, раунды без повторов: {len(kw.get('items', []))} за {len(kwr)}")
+    check(all(r[1] >= 150 and r[2] <= 2 for r in kwr) and kwr[1][3],
           f"длинный ответ — свой таймаут и мало повторов, второй раунд знает, что уже есть: {rounds}")
 
     print("\n▸ поиск чатов: ключевик и похожие каналы")
@@ -649,6 +683,55 @@ def main():
         real_llm.subprocess.run, real_llm._ENV = old_run, old_env
     check(got == "[0, 2]" and [x[0] for x in seen_limits] == [400, 4000] and seen_limits[1][1] == "180",
           f"пустой ответ из-за лимита — повтор с лимитом побольше: {seen_limits}")
+
+    print("\n▸ ГигаЧат: вход, кеш токена, протухший токен, фильтр тем, кончились токены")
+    giga = importlib.reload(llm)
+    calls_g = []
+    plan_g = {"chat": []}
+
+    def giga_run(cmd, **kw):
+        url = next(x for x in cmd if x.startswith("https://"))
+        calls_g.append(url.rsplit("/", 1)[-1])
+        if "oauth" in url:
+            assert any(x.startswith("Authorization: Basic ") for x in cmd)
+            return _t.SimpleNamespace(stdout=json.dumps({"access_token": f"tok{len(calls_g)}",
+                                                          "expires_at": int((time.time() + 1800) * 1000)}) + "\n200",
+                                      returncode=0, stderr="")
+        body = json.loads(cmd[cmd.index("-d") + 1])
+        assert body["temperature"] > 0
+        code, reply = plan_g["chat"].pop(0)
+        return _t.SimpleNamespace(stdout=json.dumps(reply) + f"\n{code}", returncode=0, stderr="")
+    ok_reply = {"choices": [{"message": {"content": "работает"}, "finish_reason": "stop"}]}
+    giga._ENV = {"GIGACHAT_CREDENTIALS": "dGVzdDp0ZXN0"}
+    giga.GIGA_TOKEN = TMP / ".gigachat-token.json"
+    old_run = giga.subprocess.run
+    giga.subprocess.run = giga_run
+    try:
+        plan_g["chat"] = [("200", ok_reply), ("200", ok_reply)]
+        a = giga.chat("s", "u", temperature=0, provider="gigachat")
+        b = giga.chat("s", "u", provider="gigachat")
+        check(a == b == "работает" and calls_g.count("oauth") == 1,
+              f"токен берётся один раз и живёт в кеше: {calls_g}")
+        calls_g.clear()
+        plan_g["chat"] = [("401", {"message": "Token has expired"}), ("200", ok_reply)]
+        check(giga.chat("s", "u", provider="gigachat") == "работает" and calls_g.count("oauth") == 1,
+              f"протухший токен — новый и повтор: {calls_g}")
+        info = {}
+        plan_g["chat"] = [("200", {"choices": [{"message": {"content": "Не люблю менять тему"},
+                                                "finish_reason": "blacklist"}]})]
+        check(giga.chat("s", "u", provider="gigachat", info=info) is None and info.get("code") == "400",
+              f"фильтр тем ГигаЧата — отказ в этом запросе (400): {giga.LAST_ERR}")
+        info = {}
+        plan_g["chat"] = [("402", {"message": "Payment Required"})]
+        check(giga.chat("s", "u", provider="gigachat", info=info) is None and info.get("code") == "402",
+              f"кончились токены — 402, разбор поймёт это как простой: {giga.LAST_ERR}")
+    finally:
+        giga.subprocess.run = old_run
+    os.environ["GIGACHAT_CREDENTIALS"] = "x"
+    check(enrich.llm_provider() == "gigachat", "ключ ГигаЧата есть — обогащение идёт через него")
+    os.environ["ENRICH_LLM"] = "openrouter"
+    check(enrich.llm_provider() is None, "ENRICH_LLM=openrouter — общая модель панели")
+    del os.environ["GIGACHAT_CREDENTIALS"], os.environ["ENRICH_LLM"]
 
     print("\n▸ панель пишет очередь через enrich.py")
     f = TMP / "links.txt"
