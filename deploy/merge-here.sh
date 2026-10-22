@@ -57,8 +57,9 @@ else
 fi
 
 # Данные, которые лежат в репозитории как образец, а на сервере правятся в
-# панели: их не сравниваем и не возим (push.sh их тоже не берёт)
-is_data() { case "$1" in message.txt) return 0 ;; esac; return 1; }
+# панели: их не сравниваем и не возим (push.sh их тоже не берёт). .gitignore
+# панели не нужен вовсе — на сервере остаётся какой есть
+is_data() { case "$1" in message.txt|chat-priority.txt|.gitignore) return 0 ;; esac; return 1; }
 
 say "2/5  Что менялось на сервере после базы"
 changed=()
@@ -99,6 +100,7 @@ for f in "${changed[@]}" "${extra[@]}"; do
   mkdir -p "$OUT/work/$(dirname "$f")"
   cp -p "$LIVE/$f" "$OUT/work/$f"
 done
+[ -f "$LIVE/.gitignore" ] && cp -p "$LIVE/.gitignore" "$OUT/work/.gitignore"   # чтобы выкладка его не подменила
 
 say "3/5  Накладываю изменения ветки"
 # версию кеша (?v=rN) поднимает каждый, кто правит веб, — эти строки иначе
@@ -109,7 +111,8 @@ for f in "$OUT"/work/web/*.html; do
   [ -n "$b" ] && [ "$(printf '%s\n' "$b" | wc -l)" = 1 ] && sed -i -E "s/\?v=r[0-9]+/?v=r$b/g" "$f"
 done
 ln -s "$SRC" "$OUT/new"
-(cd "$OUT" && diff -ruN base new > branch.patch) || [ $? -eq 1 ] || die "не собрал разницу ветки"
+(cd "$OUT" && diff -ruN -x .gitignore -x message.txt -x chat-priority.txt base new > branch.patch) \
+  || [ $? -eq 1 ] || die "не собрал разницу ветки"
 rm "$OUT/new"
 echo "  файлов в правке ветки: $(grep -c '^diff ' "$OUT/branch.patch" || true)"
 if ! patch -p1 -d "$OUT/work" --dry-run < "$OUT/branch.patch" > "$OUT/dry.txt" 2>&1; then
