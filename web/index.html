@@ -2,7 +2,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>Telegram — панель</title>
-<link rel="stylesheet" href="/app.css?v=r107">
+<link rel="stylesheet" href="/app.css?v=r108">
 <div class="app">
 
   <!-- ЛЕВАЯ ПАНЕЛЬ РЕЖИМОВ -->
@@ -216,23 +216,29 @@
     <!-- ═══════════ ЛИДЫ: обогащение ═══════════ -->
     <section class="view" data-view="leads">
       <div class="card">
-        <div class="cardtitle">Как это работает</div>
-        <p class="hint" style="margin:0">Читатели вступают в чаты, выкачивают историю за 90 дней и выходят. Модель разбирает
-          каждого автора: все его сообщения и по 10 соседних, даже чужих. Так «да» в ответ на «хату берёшь?» тоже
-          считается. В лиды попадают только те, кто ищет жильё, с заметкой обо всём, что о них видно. Сырые сообщения
-          после разбора удаляются. Пишут лидам писатели — обычной рассылкой по чатам.</p>
-        <div id="ld-runbar" style="margin-top:12px"></div>
-      </div>
-
-      <div class="card" style="margin-top:14px">
-        <div class="cardtitle">1. Читатели</div>
-        <p class="hint" style="margin:0 0 8px">Отметь аккаунты, которые только читают чаты: не греются и никому не пишут.
-          Подойдут старые и дешёвые. Писатели и читатели — разные аккаунты.</p>
+        <div class="cardtitle">Автопилот</div>
+        <p class="hint" style="margin:0 0 10px">Напиши, кого ищем, отметь аккаунты — и всё. Модель сама подберёт сотни
+          ключевиков, панель найдёт чаты и похожие каналы, прочитает переписку за 90 дней, отберёт людей с настоящим
+          намерением, посмотрит их профили и личные каналы. На выходе — лиды с фактами о каждом. Писать им — отдельной
+          кнопкой ниже.</p>
+        <div class="frow ld-row"><span style="min-width:130px">Кого ищем</span>
+          <input id="ap-query" class="ftext" placeholder="например: хочет купить квартиру в Екатеринбурге"></div>
+        <div class="fh" style="margin-top:6px">Аккаунты, которые ищут и читают</div>
+        <p class="hint" style="margin:0 0 8px">Они только читают чаты: не греются и никому не пишут. Подойдут старые и
+          дешёвые — не те, что пишут людям.</p>
         <div id="ld-readers" class="crewgrid"></div>
+        <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin-top:12px">
+          <button class="primary" id="ap-run">Запустить автопилот</button>
+          <span id="ap-note" class="hint"></span>
+        </div>
+        <div id="ld-runbar" style="margin-top:12px"></div>
+        <div id="ap-steps" class="ap-steps"></div>
       </div>
 
+      <details class="ld-manual" id="ld-manual" style="margin-top:14px">
+        <summary>Вручную, по шагам — ключевики, ссылки на чаты, очередь чатов</summary>
       <div class="card" style="margin-top:14px">
-        <div class="cardtitle">2. Что ищем и где</div>
+        <div class="cardtitle">1. Что ищем и где</div>
         <div class="frow ld-row"><span style="min-width:130px">Кого ищем</span>
           <input id="ld-goal" class="ftext" placeholder="хочет купить квартиру или другое жильё (новостройку, вторичку, дом), в том числе в ипотеку">
           <button class="ghost" id="ld-goal-save">Сохранить</button></div>
@@ -257,7 +263,7 @@
       </div>
 
       <div class="card" style="margin-top:14px">
-        <div class="cardtitle">3. Собрать лидов</div>
+        <div class="cardtitle">2. Собрать лидов</div>
         <div class="nums" id="ld-counts"></div>
         <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin-top:12px">
           <button class="primary" id="ld-run">Собрать лидов</button>
@@ -266,8 +272,10 @@
         <div class="tblwrap" style="margin-top:12px"><table id="ld-chats"></table></div>
       </div>
 
+      </details>
+
       <div class="card" style="margin-top:14px">
-        <div class="cardtitle">4. Лиды</div>
+        <div class="cardtitle">Лиды</div>
         <p class="hint" style="margin:0 0 10px">Пишут им писатели, отмеченные на вкладке «Рассылка по чатам», — тем же текстом,
           с теми же паузами, лимитами и проверкой SpamBot. Людям без @username писатель напишет через их сообщение в чате.</p>
         <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap">
@@ -824,4 +832,4 @@
 
   </main>
 </div>
-<script src="/app.js?v=r107"></script>
+<script src="/app.js?v=r108"></script>

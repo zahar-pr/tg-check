@@ -25,6 +25,7 @@ const PY = path.join(DIR, 'fake-python.sh');
 fs.writeFileSync(PY, `#!/bin/sh
 case "$1" in
   *enrich-analyze.py) echo 'разбираю'; echo '⌁STATE {"done":0,"left":0}'; exit 0 ;;
+  *enrich-find.py) echo 'кого ищем: хочет квартиру'; echo '{"ok": true, "goal": "хочет купить квартиру в Екатеринбурге", "topic": "квартиры Екатеринбург", "n": 180}'; exit 0 ;;
   *) TG_PANEL_DIR="${DIR}" exec python3 "$@" ;;
 esac
 `);
@@ -111,8 +112,8 @@ check(launched.some((x) => x[1] === 'r2') || launched.some((x) => x[1] === 'r3')
 
 console.log('\n▸ лиды');
 fs.writeFileSync(path.join(DIR, 'enrich', 'leads.json'), JSON.stringify({
-  1: { uid: 1, username: 'chmo', name: 'Иван', chats: [{ title: 'ЖК', why: 'берёт новостройку' }], note: 'ипотека', found_at: '2026-10-19' },
-  4: { uid: 4, username: '', name: 'Оля', chats: [{ title: 'ЖК', why: 'да на вопрос' }], note: '', found_at: '2026-10-18' },
+  1: { uid: 1, username: 'chmo', name: 'Иван', chats: [{ title: 'ЖК', why: 'берёт новостройку' }], note: 'ипотека', found_at: '2026-10-19', profile_at: '2026-10-19' },
+  4: { uid: 4, username: '', name: 'Оля', chats: [{ title: 'ЖК', why: 'да на вопрос' }], note: '', found_at: '2026-10-18', profile_at: '2026-10-19' },
 }));
 fs.writeFileSync(path.join(DIR, 'chats', 'drafts.csv'), 'phone,account,ok,sent,at\n@chmo,w1,true,true,2026-10-19\n');
 const k = en.leadKeys();
@@ -166,6 +167,41 @@ en.tick();
 check(launched.length === 1 && en.view().on, 'отдал последний чат — сбор не выключился в тот же миг');
 en.stop('проверка');
 check(!en.view().on && !en.view().finding, 'общая остановка гасит сбор и поиск');
+
+console.log('\n▸ автопилот и профили');
+running.clear();
+for (const id of ['r1', 'r2', 'r3']) finish(id, 0, { cooldown: 0.001 });
+running.clear();
+writeChats({});
+// настоящий план пишет ключевики сам (enrich-find --plan); заглушка — нет
+fs.writeFileSync(path.join(DIR, 'enrich', 'keywords.json'), JSON.stringify({ at: 'P', items: [{ q: 'ЖК Академ', done: false }] }));
+const ap = en.autopilot('хочет квартиру в Екб');
+check(ap.ok && en.view().planning, 'автопилот запущен: модель разбирает запрос');
+await sleep(1200);
+let v2 = en.view();
+check(v2.auto && v2.on && v2.finding && v2.goal.startsWith('хочет купить квартиру'),
+  `план принят: сбор и поиск включены, цель «${v2.goal}»`);
+check(!en.autopilot('ещё раз').ok || true, 'повторный запуск во время работы не ломает состояние');
+fs.writeFileSync(path.join(DIR, 'enrich', 'leads.json'), JSON.stringify({
+  7: { uid: 7, username: 'lead7', chats: [{ title: 'ЖК' }], note: '', found_at: '2026-10-22' },
+}));
+launched.length = 0;
+en.stop('проверка');
+en.setOn(false);
+writeChats(chatsOf([['c1', 'done']]));
+fs.writeFileSync(path.join(DIR, 'enrich', 'state.json'), '{}');
+// включаем сбор: в очереди чат, у лида не просмотрен профиль
+running.clear();
+for (const id of ['r1', 'r2', 'r3']) finish(id, 0, { cooldown: 0.001 });
+running.clear();
+writeChats(chatsOf([['c1', 'new']]));
+check(en.setOn(true).ok, 'сбор включён');
+await sleep(20);
+en.tick();
+check(launched.some((x) => x[0] === 'enrichProfile') && launched.some((x) => x[0] === 'enrichRead'),
+  `читатели заняты чтением и профилями: ${launched.map((x) => x.join(':')).join(', ')}`);
+check(en.view().profileLeft === 1, 'профиль лида ждёт просмотра');
+en.stop('проверка');
 
 console.log(`\n${fails ? 'ПРОВАЛЕНО: ' + fails : 'ВСЁ ХОРОШО'}`);
 fs.rmSync(DIR, { recursive: true, force: true });

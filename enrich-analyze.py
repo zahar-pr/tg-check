@@ -43,23 +43,33 @@ SYSTEM = """Ты разбираешь переписку из Telegram-чата 
 соседних сообщений других людей. Формат строки: #id [дата] @ник (имя): текст,
 «↩#id» — ответ на сообщение с этим id.
 
-Реши, относится ли ЦЕЛЬ к тем, кто {goal}. Читай контекст, а не ключевые слова:
-- короткий ответ «да», «+», «и я тоже», «тоже ищу», «интересует» на вопрос или
-  реплику про покупку — это интерес ЦЕЛИ;
-- вопросы про ипотеку, планировки, сдачу дома, застройщика, район «для себя» —
-  скорее интерес;
-- НЕ лид: риелторы, агенты, застройщики, продавцы, реклама, боты; те, кто уже
-  купил и просто делится (если не ищет ещё); обсуждение цен без намерения;
-  те, кто продаёт или сдаёт своё жильё.
-Сомневаешься — lead=false.
+Реши, относится ли ЦЕЛЬ к тем, кто {goal}. Читай смысл и контекст, а не ключевые слова:
+- короткий ответ ЦЕЛИ («да», «+», «и я тоже», «тоже ищу», «интересует») на чужой
+  вопрос или реплику по теме — это интерес ЦЕЛИ, хотя ключевых слов у неё нет;
+- вопросы «для себя» по теме (цены, условия, сроки, где выбрать) — скорее интерес;
+- НЕ лид: те, кто сам продаёт или предлагает это за деньги (продавцы, агенты,
+  посредники, реклама, боты); кто уже получил своё и просто делится; кто
+  обсуждает тему без своего намерения; кто спрашивает за другого без интереса;
+- если в цели есть место (город, район), а человек явно хочет в другом месте —
+  не лид.
+
+score — уверенность от 0 до 100, что ЦЕЛЬ относится к тем, кто {goal}:
+90+ прямо говорит о своём намерении; 60–89 — намерение видно из контекста;
+ниже 60 — догадки. Сомневаешься — lead=false.
 
 Ответь СТРОГО одним JSON без пояснений вокруг:
-{{"lead": true|false, "why": "одна короткая фраза", "note": "заметка"}}
+{{"lead": true|false, "score": 0-100, "why": "одна короткая фраза",
+  "facts": {{"поле": "значение"}}, "note": "заметка"}}
 
-note — только для лида, в markdown: всё, что видно о человеке. Имя, чем
-занимается и кем работает, район и ЖК, бюджет, комнатность, сроки, ипотека
-или наличные, семья и дети, откуда переезжает, что для него важно, как
-связаться, плюс 1–3 короткие цитаты с датой. Чего нет — не выдумывай."""
+facts — только для лида: короткие факты о человеке, полезные для личного
+письма. Поля по смыслу цели, например: «что ищет», «город», «район», «бюджет»,
+«сроки», «способ оплаты», «работа», «семья», «откуда», «что важно»,
+«возражения», «как связаться». Только то, что видно из переписки, без догадок;
+неизвестное не пиши вовсе.
+note — только для лида, в markdown: всё, что видно о человеке, плюс 1–3
+короткие цитаты с датой. Чего нет — не выдумывай."""
+
+MIN_SCORE = 60          # ниже — не лид: релевантность важнее количества
 
 
 def line(m, me):
@@ -123,34 +133,54 @@ def chunks(msgs, spans, me):
     return parts
 
 
+def _clean(d):
+    """Вердикт из словаря модели: lead, score 0–100, why, facts (строка -> строка), note."""
+    lead = d.get("lead") is True or str(d.get("lead")).lower() == "true"
+    try:
+        score = max(0, min(100, int(float(d.get("score")))))
+    except (TypeError, ValueError):
+        score = 70 if lead else 0
+    facts = {}
+    if isinstance(d.get("facts"), dict):
+        for k, v in d["facts"].items():
+            k, v = " ".join(str(k).split())[:40], " ".join(str(v).split())[:300]
+            if k and v and v.lower() not in ("нет", "неизвестно", "-", "—", "null", "none"):
+                facts[k] = v
+    return {"lead": lead, "score": score, "why": str(d.get("why") or "")[:300],
+            "facts": facts, "note": str(d.get("note") or "")}
+
+
+_DEC = json.JSONDecoder()
+
+
 def verdict(out):
     """
     JSON-вердикт из ответа модели. Модели с рассуждениями пишут ход мыслей
     прямо в ответ (TECH-BASE.md, §8), и фигурные скобки бывают и там — поэтому
-    берём ПОСЛЕДНИЙ объект с полем lead, а не первый попавшийся.
+    берём ПОСЛЕДНИЙ объект, который начинается с "lead" и честно разбирается
+    как JSON (внутри него бывают вложенные facts — регулярка их не осилит).
+    Строку формата из промпта («true|false») вердиктом не считаем.
     """
-    found = None
-    for m in re.finditer(r"\{[^{}]*\"lead\"[^{}]*\}", out or "", re.S):
+    out = out or ""
+    starts = list(re.finditer(r'\{\s*"lead"\s*:\s*(true|false)\b(?!\s*\|)', out))
+    for m in reversed(starts):
         try:
-            d = json.loads(m.group(0))
-        except Exception:
+            d, _ = _DEC.raw_decode(out, m.start())
+        except ValueError:
             continue
         if isinstance(d, dict) and "lead" in d:
-            found = d
-    if found is None:
-        # ответ обрезан на длинной заметке: JSON не закрыт, но «lead» уже сказан.
-        # Берём ПОСЛЕДНЕЕ начало вердикта, и не строку формата из промпта
-        # («true|false»), которую модель любит повторять в рассуждениях
-        starts = list(re.finditer(r'\{\s*"lead"\s*:\s*(true|false)\b(?!\s*\|)', out or ""))
-        if not starts:
-            return None
-        m = starts[-1]
-        why = re.compile(r'"why"\s*:\s*"((?:[^"\\]|\\.)*)').search(out, m.end())
-        note = re.compile(r'"note"\s*:\s*"((?:[^"\\]|\\.)*)', re.S).search(out, m.end())
-        found = {"lead": m.group(1) == "true", "why": why.group(1) if why else "",
-                 "note": (note.group(1).replace("\\n", "\n") + " …") if note else ""}
-    return {"lead": found.get("lead") is True or str(found.get("lead")).lower() == "true",
-            "why": str(found.get("why") or "")[:300], "note": str(found.get("note") or "")}
+            return _clean(d)
+    if not starts:
+        return None
+    # ответ обрезан на длинной заметке: JSON не закрыт, но «lead» уже сказан
+    m = starts[-1]
+    def field(name):
+        f = re.compile(r'"%s"\s*:\s*"((?:[^"\\]|\\.)*)' % name, re.S).search(out, m.end())
+        return f.group(1).replace("\\n", "\n") if f else ""
+    sc = re.compile(r'"score"\s*:\s*(\d+)').search(out, m.end())
+    note = field("note")
+    return _clean({"lead": m.group(1) == "true", "score": sc.group(1) if sc else None,
+                   "why": field("why"), "note": (note + " …") if note else ""})
 
 
 class Fail:
@@ -175,7 +205,7 @@ ACCOUNT_CODES = {"401", "402", "403", "429", ""}
 
 def ask(system, text):
     """Вердикт модели по одному куску окон — или Fail."""
-    for tokens in (900, 2000):
+    for tokens in (1200, 2500):
         info = {}
         out = llm.chat(system, text, max_tokens=tokens, temperature=0.2, info=info)
         if out is None:
@@ -207,10 +237,17 @@ def judge(system, msgs, me):
         if isinstance(v, Fail):
             return v
         verdicts.append(v)
-    yes = [v for v in verdicts if v["lead"]]
+    # лид — если хоть один кусок уверенно говорит «да» (score не ниже MIN_SCORE)
+    yes = [v for v in verdicts if v["lead"] and v["score"] >= MIN_SCORE]
     if not yes:
-        return {"lead": False, "why": verdicts[0]["why"] if verdicts else "", "note": ""}
-    return {"lead": True, "why": yes[0]["why"], "note": "\n\n".join(v["note"] for v in yes if v["note"]),
+        best = max(verdicts, key=lambda v: v["score"]) if verdicts else {"why": "", "score": 0}
+        return {"lead": False, "score": best["score"], "why": best["why"], "note": ""}
+    facts = {}
+    for v in yes:                       # факты из всех кусков, поздние уточняют ранние
+        facts.update(v["facts"])
+    top = max(yes, key=lambda v: v["score"])
+    return {"lead": True, "score": top["score"], "why": top["why"], "facts": facts,
+            "note": "\n\n".join(v["note"] for v in yes if v["note"]),
             "msg_ids": [msgs[i]["id"] for i in pos],
             "quotes": [str(msgs[i].get("text"))[:200] for i in pos[-3:]]}
 
@@ -318,7 +355,7 @@ def main():
             who = f"@{a['un']}" if a.get("un") else f"id{uid} ({a.get('name', '')})"
             if v["lead"]:
                 stats["leads"] += 1
-                say(f"  ✔ лид {who}: {v['why']}")
+                say(f"  ✔ лид {who} ({v['score']}): {v['why']}")
                 if dry:
                     say("    " + v["note"].replace("\n", "\n    "))
                 else:
@@ -326,7 +363,8 @@ def main():
                     enrich.add_lead(uid, a.get("un", ""), a.get("name", ""),
                                     {"chat_id": ch.get("chat_id"), "ref": ch.get("read_ref") or ch.get("ref", ""),
                                      "title": title},
-                                    v["msg_ids"], v["why"], v["note"], v["quotes"])
+                                    v["msg_ids"], v["why"], v["note"], v["quotes"],
+                                    facts=v["facts"], score=v["score"])
             if not dry:
                 progress[str(uid)] = bool(v["lead"])
                 enrich.write_json(prog_file, progress)

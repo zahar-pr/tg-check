@@ -216,8 +216,12 @@ def fake_llm(system, user, max_tokens=400, temperature=0.8, tries=5, model=None,
         elif re.fullmatch(r"(да|\+|и я тоже|да, и я тоже)[.!]?", text.strip(), re.I) and i and buy.search(lines[i - 1]):
             lead, why = True, "ответил «да» на вопрос про покупку"
     note = "- район: Академический\n- ипотека" if lead else ""
+    facts = {"район": "Академический", "оплата": "ипотека"} if lead else {}
+    # «Вася» спрашивает про хату — для песка это слабый интерес: оценка ниже порога
+    score = 85 if lead else (40 if "хату брать будешь" in user else 5)
     return ("Думаю {вслух}: смотрю на ► …\n" +
-            json.dumps({"lead": lead, "why": why, "note": note}, ensure_ascii=False))
+            json.dumps({"lead": lead or score == 40, "score": score, "why": why, "facts": facts, "note": note},
+                       ensure_ascii=False))
 
 
 def main():
@@ -367,6 +371,10 @@ def main():
     check(not enrich.progress_path(CHAT_ID).exists(), "прогресс удалён")
     olya = next(v for v in leads.values() if v.get("name") == "Оля")
     check(olya["chats"][0]["msg_ids"] and "Академический" in olya["note"], "у лида msg_id и заметка")
+    check(olya.get("facts", {}).get("район") == "Академический" and olya.get("score") == 85,
+          f"у лида факты по полям и уверенность: {olya.get('facts')}, {olya.get('score')}")
+    check(not any(v.get("username") == "vasya" for v in leads.values()),
+          "«да, лид» с уверенностью 40 (ниже порога) в лиды не попал")
     rows = tglib.read_csv(tglib.CHAT_RESULTS)
     keys = {r["phone"] for r in rows}
     check({"@chmo", "@mraz", "id:4"} <= keys, f"лиды в очереди рассылки по чатам: {sorted(keys)}")
@@ -457,6 +465,62 @@ def main():
     out = run_script("enrich-find.py", "--account", "r1", client=Client())
     check(not enrich.similar_seeds() and any("искать нечего" in o for o in out),
           "дальше второго шага не идём, поиск заканчивается")
+
+    print("\n▸ профиль лида: «о себе», личный канал, продавцы")
+
+    class FullU:
+        def __init__(self, uid):
+            seller = uid == 2
+            self.full_user = type("FU", (), {
+                "about": "Агентство недвижимости, подберу квартиру" if seller else "Инженер, двое детей",
+                "birthday": types.Birthday(day=5, month=3), "personal_channel_id": 950 + uid,
+                "business_intro": None, "business_location": None})()
+            self.users = [u(uid) if uid in USERS else types.User(id=uid, first_name="Гость", access_hash=1)]
+            self.chats = [chan(950 + uid, f"pch{uid}", f"Канал {uid}")]
+
+    class ProfClient(Client):
+        async def get_messages(self, entity, limit=None, offset_id=0, ids=None):
+            if getattr(entity, "id", 0) >= 950:
+                posts = ["Продаю двушку, комиссия 0%"] if entity.id == 952 else ["Сходили в ЖК Академ, понравились планировки"]
+                return [type("P", (), {"message": t, "date": NOW})() for t in posts]
+            return await super().get_messages(entity, limit=limit, offset_id=offset_id, ids=ids)
+
+        async def __call__(self, req):
+            if isinstance(req, functions.users.GetFullUserRequest):
+                self.calls.append("GetFullUserRequest")
+                return FullU(req.id.user_id)
+            return await super().__call__(req)
+
+        async def get_input_entity(self, ent):
+            if isinstance(ent, int):
+                return types.InputPeerUser(ent, ent * 10)    # читатель видел — в кеше сессии
+            return await super().get_input_entity(ent)
+
+    def prof_llm(system, user, **kw):
+        seller = "Продаю" in user or "Агентство" in user
+        return json.dumps({"seller": seller, "facts": {} if seller else {"работа": "инженер", "дети": "двое"},
+                           "note": "- инженер, двое детей"}, ensure_ascii=False)
+    llm.chat = prof_llm
+    pc = ProfClient()
+    run_script("enrich-profile.py", "--account", "r1", client=pc)
+    L = enrich.load_leads()
+    olya, mraz = L["4"], L["2"]
+    check(olya.get("profile_at") and olya["facts"].get("работа") == "инженер" and olya["facts"].get("район"),
+          f"профиль дописал факты к фактам из чата: {olya.get('facts')}")
+    check(olya.get("profile", {}).get("channel", {}).get("posts") == 1 and "### Профиль" in olya["note"],
+          "личный канал прочитан, заметка о профиле в карточке")
+    check(mraz.get("excluded") and "@mraz" not in enrich.lead_refs(), "продавец по профилю исключён и писать ему не будем")
+    check(not enrich.profile_todo(), "профили всех лидов посмотрены")
+
+    print("\n▸ автопилот: одна фраза → цель, тема, ключевики")
+    llm.chat = lambda *a, **k: ('Думаю… {"goal": "хочет купить квартиру в Екатеринбурге", "topic": "квартиры Екатеринбург", '
+                                '"keywords": ["ЖК Академ", "новостройки екб", "ЖК Академ", "ипотека екб"]}')
+    out = run_script("enrich-find.py", "--plan", "--query", "хочет квартиру в Екб")
+    last = json.loads(next(o for o in reversed(out) if o.startswith("{")))
+    kw = enrich.read_json(enrich.KEYWORDS, {})
+    check(last.get("goal", "").startswith("хочет купить квартиру") and last.get("n") == 3
+          and kw.get("topic") == "квартиры Екатеринбург" and len(kw.get("items", [])) == 3,
+          f"план автопилота: {last}")
 
     print("\n▸ панель пишет очередь через enrich.py")
     f = TMP / "links.txt"

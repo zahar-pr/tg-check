@@ -494,3 +494,21 @@ details.fieldset[open] > summary.fh::before{content:'▾'}
 .ld-note{white-space:pre-wrap;margin:8px 0 4px;padding:10px 12px;border-radius:10px;background:rgba(120,164,255,.06);font-size:13px}
 #ld-counts{margin-top:4px}
 @media (max-width:700px){#ld-counts{grid-template-columns:repeat(3,1fr)}}
+
+/* ——— автопилот лидов ——— */
+.ap-steps{display:grid;gap:6px;margin-top:12px}
+.ap-step{display:grid;grid-template-columns:14px 120px 1fr;gap:8px;align-items:baseline;font-size:13px;color:var(--mut)}
+.ap-step b{color:var(--ink);font-weight:600}
+.ap-dot{width:8px;height:8px;border-radius:50%;background:var(--line);display:inline-block}
+.ap-step.ap-run .ap-dot{background:var(--acc);box-shadow:0 0 0 3px rgba(90,162,255,.2)}
+.ap-step.ap-wait .ap-dot{background:#e9c46a}
+.ap-step.ap-ok .ap-dot{background:var(--ok)}
+@media (max-width:700px){.ap-step{grid-template-columns:14px 1fr}.ap-step span:last-child{grid-column:2}}
+.ld-manual{border:1px solid var(--glass-brd);border-radius:16px;padding:10px 14px;background:rgba(120,164,255,.03)}
+.ld-manual>summary{cursor:pointer;font-weight:600;padding:4px 0}
+.ld-manual[open]>summary{margin-bottom:6px}
+.ld-score{font-size:11px;font-weight:700;color:#03122e;background:var(--ok);border-radius:999px;padding:1px 7px}
+.ld-facts{display:flex;flex-wrap:wrap;gap:4px 6px;margin-top:4px;flex-basis:100%}
+.ld-fact{font-size:12px;border:1px solid var(--line);border-radius:8px;padding:1px 7px;color:var(--ink)}
+.ld-fact i{font-style:normal;color:var(--mut)}
+.ld-out{opacity:.55}

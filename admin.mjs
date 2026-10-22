@@ -406,7 +406,7 @@ setInterval(() => {
 const TRAFFIC_TASK = {
   'draft-messages': 'рассылка', 'warmup-activity': 'прогрев', followup: 'смотрит ответы',
   'check-batch': 'проверка номеров', 'parse-chat': 'разбор чатов',
-  'enrich-read': 'лиды: чтение чатов', 'enrich-find': 'лиды: поиск чатов',
+  'enrich-read': 'лиды: чтение чатов', 'enrich-find': 'лиды: поиск чатов', 'enrich-profile': 'лиды: профили',
   profile: 'профиль', stats: 'сводка', 'cleanup-contacts': 'уборка контактов',
 };
 function trafficView(read = readRaw) {
@@ -471,6 +471,8 @@ const TASKS = {
   enrichRead: { title: 'Чтение чата',  cmd: ['enrich-read.py'],     py: true },
   // поиск чатов по ключевикам — порция запросов за заход
   enrichFind: { title: 'Поиск чатов',  cmd: ['enrich-find.py'],     py: true },
+  // профили лидов: «о себе», бизнес, личный канал — порция за заход
+  enrichProfile: { title: 'Профили лидов', cmd: ['enrich-profile.py'], py: true },
 };
 
 /**
@@ -598,6 +600,21 @@ function manualHold() {
 /* ═══════════ ЗАПУСК ЗАДАЧ — порождение процесса и разбор его вывода ═══════════ */
 
 /**
+ * Читатель (обогащение): только читает чаты — не греется, не пишет людям.
+ * Из идущей рассылки уходит сразу, иначе прогон звал бы его к письмам.
+ */
+function makeReader(acc) {
+  if (acc.role === 'read') return;
+  accounts.setField(acc.id, { role: 'read' });
+  if (auto.ids.includes(acc.id)) {
+    auto.ids = auto.ids.filter((x) => x !== acc.id);
+    auto.sets.delete(acc.id);
+    auto.per.delete(acc.id);
+  }
+  events.note('📖', 'стал читателем: читает чаты для поиска лидов, людям не пишет', acc.title);
+}
+
+/**
  * Обогащение — поиск лидов «хочет квартиру» по чатам (server/enrich.mjs).
  * Читатели берут чаты по одному, разбор идёт следом; задачи запускаем как
  * автоматику (launchedBy = 'auto'), иначе каждый заход читателя ставил бы
@@ -664,7 +681,7 @@ function start(name, opts, onDone) {
 
   // задачи, которым нужна живая сессия: без входа запускать бессмысленно —
   // раньше это молча падало «нет сессии» и путало (проверка/рассылка вхолостую)
-  const NEEDS_SESSION = ['check', 'drafts', 'stats', 'clean', 'parse', 'follow', 'enrichRead', 'enrichFind'];
+  const NEEDS_SESSION = ['check', 'drafts', 'stats', 'clean', 'parse', 'follow', 'enrichRead', 'enrichFind', 'enrichProfile'];
   if (NEEDS_SESSION.includes(name) && !accounts.hasSession(acc)) {
     return { ok: false, reason: `«${acc.title}» не вошёл — сначала войди по QR или залей сессию (шаг 1)` };
   }
@@ -4100,16 +4117,8 @@ async function handler(req, res) {
       const { id, role, set: want } = await body(req);
       const acc = accounts.list().find((a) => a.id === id);
       if (!acc) return json(res, 200, { ok: false, reason: 'аккаунт не найден' });
-      // читатель (обогащение): только читает чаты — не греется, не пишет людям.
-      // Из идущей рассылки уходит сразу, иначе прогон звал бы его к письмам
       if (role === 'read') {
-        accounts.setField(id, { role: 'read' });
-        if (auto.ids.includes(id)) {
-          auto.ids = auto.ids.filter((x) => x !== id);
-          auto.sets.delete(id);
-          auto.per.delete(id);
-        }
-        events.note('📖', 'стал читателем: читает чаты для поиска лидов, людям не пишет', acc.title);
+        makeReader(acc);
         return json(res, 200, { ok: true });
       }
       const send = role === 'send';
@@ -4241,6 +4250,20 @@ async function handler(req, res) {
       if (what === 'chats-cmd') return json(res, 200, await enrich.chatsCmd(o.cmd, o.keys));
       if (what === 'goal') return json(res, 200, enrich.setGoal(o.goal));
       if (what === 'run') return json(res, 200, enrich.setOn(o.on !== false));
+      // автопилот: одна фраза + отмеченные аккаунты — дальше всё само
+      if (what === 'auto') {
+        if (o.on === false) { enrich.stop('автопилот остановлен вручную'); return json(res, 200, { ok: true }); }
+        const ids = Array.isArray(o.accounts) ? o.accounts.map(String) : [];
+        const picked = accounts.list().filter((a) => ids.includes(a.id));
+        if (!picked.length) return json(res, 200, { ok: false, reason: 'отметь аккаунты, которые будут искать и читать чаты' });
+        const busy = picked.filter((a) => auto.on && auto.ids.includes(a.id));
+        if (busy.length) {
+          return json(res, 200, { ok: false, reason: `${busy.map((a) => '«' + (a.name || a.title) + '»').join(', ')} ` +
+            'сейчас в рассылке — сними их с рассылки или отметь другие аккаунты' });
+        }
+        for (const a of picked) makeReader(a);
+        return json(res, 200, enrich.autopilot(o.query));
+      }
       // «Написать лидам» — обычный автопрогон по чатам, только по лидам.
       // Настройки (тексты, паузы, лимиты, кто пишет) — с вкладки «Рассылка по чатам»
       if (what === 'write') {

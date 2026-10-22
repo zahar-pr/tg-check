@@ -222,7 +222,7 @@ def load_leads():
     return read_json(LEADS, {})
 
 
-def add_lead(uid, username, name, chat, msg_ids, why, note, quotes):
+def add_lead(uid, username, name, chat, msg_ids, why, note, quotes, facts=None, score=None):
     """
     Лид в leads.json. Один человек — одна карточка, сколько бы чатов его ни
     показали: заметка по новому чату дописывается, ссылки на сообщения копятся.
@@ -256,6 +256,10 @@ def add_lead(uid, username, name, chat, msg_ids, why, note, quotes):
         block = f"### {title}\n{note.strip()}"
         if block not in lead["note"]:
             lead["note"] = (lead["note"].rstrip() + "\n\n" + block).strip()
+        # факты по полям — для личного письма: свежий чат уточняет старые значения
+        lead["facts"] = {**(lead.get("facts") or {}), **(facts or {})}
+        if score is not None:
+            lead["score"] = max(int(lead.get("score") or 0), int(score))
         data[k] = lead
         write_json(LEADS, data)
     if new:
@@ -266,11 +270,47 @@ def lead_refs():
     """Ключ получателя -> лид: по нему писатель найдёт человека без @username."""
     out = {}
     for lead in load_leads().values():
+        if lead.get("excluded"):
+            continue                # профиль показал риелтора/продавца — писать не будем
         for k in {lead.get("key"), tglib.member_key(lead.get("username"), lead.get("uid")),
                   f"id:{lead.get('uid')}"}:
             if k and k != "id:None":
                 out[k] = lead
     return out
+
+
+PROFILE_TRIES = 2           # столько раз профиль не дался — больше не пробуем
+
+
+def profile_todo():
+    """Лиды, чей профиль (описание, личный канал) ещё не смотрели."""
+    return [v for v in load_leads().values()
+            if not v.get("profile_at") and not v.get("excluded")
+            and int(v.get("profile_tries") or 0) < PROFILE_TRIES]
+
+
+def save_profile(uid, profile=None, facts=None, note="", excluded="", err=""):
+    """
+    Итог шага «профиль» в карточку лида. err — не вышло (попытка считается);
+    excluded — по профилю видно, что это продавец/агент: из лидов его убираем.
+    """
+    with locked(LEADS):
+        data = load_leads()
+        lead = data.get(str(uid))
+        if not lead:
+            return
+        if err:
+            lead["profile_tries"] = int(lead.get("profile_tries") or 0) + 1
+            lead["profile_err"] = err[:200]
+        else:
+            lead["profile_at"] = now_iso()
+            lead["profile"] = profile or {}
+            lead["facts"] = {**(lead.get("facts") or {}), **(facts or {})}
+            if note.strip() and "### Профиль" not in lead.get("note", ""):
+                lead["note"] = (lead.get("note", "").rstrip() + "\n\n### Профиль\n" + note.strip()).strip()
+            if excluded:
+                lead["excluded"] = excluded[:200]
+        write_json(LEADS, data)
 
 
 def retry(keys):

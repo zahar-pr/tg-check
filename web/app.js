@@ -2685,12 +2685,43 @@ async function leadsView(force) {
 
   // что сейчас происходит — одной строкой сверху
   const busy = d.readers.filter((r) => r.busy).map((r) => `${esc(r.name)}: ${esc(r.busy.replace(/ — .*/, ''))}`);
-  runbar('#ld-runbar', d.on || d.finding,
-    d.on ? '<b>Сбор лидов идёт</b>' : d.finding ? '<b>Идёт поиск чатов</b>' : '<b>Сбор лидов выключен</b>',
+  const working = d.on || d.finding || d.planning;
+  runbar('#ld-runbar', working,
+    d.planning ? '<b>Автопилот: модель разбирает запрос</b>'
+      : d.auto ? '<b>Автопилот работает</b>'
+      : d.on ? '<b>Сбор лидов идёт</b>' : d.finding ? '<b>Идёт поиск чатов</b>' : '<b>Сбор лидов выключен</b>',
     [d.analyzer ? `разбирает «${esc(d.analyzer.title)}»` : '', ...busy,
      d.finding ? `ключевиков осталось ${d.keywords.left}` : ''].filter(Boolean).join(' · ')
-      || (d.on ? 'ждёт свободного читателя' : 'добавь чаты и нажми «Собрать лидов»'));
-  navLamp('leads', d.on || d.finding);
+      || (d.planning ? 'подбирает ключевики — минута-две' : working ? 'ждёт свободного читателя'
+        : 'напиши, кого ищем, отметь аккаунты и запусти автопилот'));
+  navLamp('leads', working);
+
+  // автопилот: запрос, кнопка и ход работы по шагам
+  const aq = $('#ap-query');
+  if (free(aq) && !aq.dataset.touched) aq.value = d.query || '';
+  const ab = $('#ap-run');
+  if (ab) {
+    const on = d.auto || d.planning;
+    ab.textContent = on ? 'Остановить автопилот' : 'Запустить автопилот';
+    ab.classList.toggle('danger', on);
+  }
+  const c0 = d.counts || {};
+  const step = (state, name, text) => `<div class="ap-step${state ? ' ap-' + state : ''}"><span class="ap-dot"></span><b>${name}</b><span>${text}</span></div>`;
+  const stF = d.finding ? 'run' : d.keywords.total && !d.keywords.left && !d.similarLeft ? 'ok' : '';
+  const reading = (c0.reading || 0), queued = (c0.new || 0), inAnalysis = (c0.downloaded || 0) + (c0.analyzing || 0);
+  const apSteps = $('#ap-steps');
+  if (apSteps) apSteps.innerHTML = (d.auto || d.planning || d.goal) ? [
+    step(d.planning ? 'run' : d.goal ? 'ok' : '', 'План', d.planning ? 'модель разбирает запрос и подбирает ключевики'
+      : d.goal ? `ищем тех, кто ${esc(d.goal)}` : '—'),
+    step(stF, 'Поиск чатов', d.keywords.total ? `ключевиков ${d.keywords.total}, осталось ${d.keywords.left}` +
+      (d.similarLeft ? ` · каналов для похожих ${d.similarLeft}` : '') : '—'),
+    step(reading ? 'run' : queued ? 'wait' : (c0.done ? 'ok' : ''), 'Чтение', `в очереди ${queued}, читается ${reading}`),
+    step(d.analyzer ? 'run' : inAnalysis ? 'wait' : (c0.done ? 'ok' : ''), 'Разбор',
+      d.analyzer ? `разбирается «${esc(d.analyzer.title)}»` : `разобрано чатов ${c0.done || 0}` + (inAnalysis ? `, ждут ${inAnalysis}` : '')),
+    step(d.profileBusy ? 'run' : d.profileLeft ? 'wait' : (d.leadsTotal ? 'ok' : ''), 'Профили',
+      d.profileLeft ? `осталось посмотреть ${d.profileLeft}` : d.leadsTotal ? 'посмотрены' : '—'),
+    step(d.leadsTotal ? 'ok' : '', 'Лиды', `${d.leadsTotal}` + (d.leadsExcluded ? ` · исключено продавцов ${d.leadsExcluded}` : '')),
+  ].join('') : '';
 
   // читатели — галочки по всем вошедшим; занятые рассылкой не отмечаются
   const rd = $('#ld-readers');
@@ -2752,18 +2783,25 @@ async function leadsView(force) {
   if (free(lb)) {
     const open = new Set([...lb.querySelectorAll('details[open]')].map((x) => x.dataset.key));
     lb.innerHTML = d.leads.length ? d.leads.map((l) => `
-      <details class="ld-lead" data-key="${esc(l.key)}" ${open.has(l.key) ? 'open' : ''}>
+      <details class="ld-lead${l.excluded ? ' ld-out' : ''}" data-key="${esc(l.key)}" ${open.has(l.key) ? 'open' : ''}>
         <summary><b>${l.username ? '@' + esc(l.username) : esc(l.name || 'id ' + l.uid)}</b>
           ${l.username && l.name ? `<span class="hint">${esc(l.name)}</span>` : ''}
+          ${l.score ? `<span class="ld-score" title="уверенность модели">${l.score}</span>` : ''}
           <span class="tag">${esc(l.status)}</span>
+          ${l.profile ? `<span class="tag" title="профиль посмотрен">профиль${l.profile.channel ? ' + канал' : ''}</span>` : ''}
           <span class="hint">${esc(l.chats.join(', '))}</span>
-          <div class="hint">${esc(l.why)}</div></summary>
+          <div class="hint">${esc(l.excluded || l.why)}</div>
+          ${Object.keys(l.facts || {}).length ? `<div class="ld-facts">${Object.entries(l.facts).slice(0, 8)
+            .map(([k, v]) => `<span class="ld-fact"><i>${esc(k)}</i> ${esc(v)}</span>`).join('')}</div>` : ''}</summary>
+        ${l.profile?.about ? `<div class="hint" style="margin-top:6px">О себе: ${esc(l.profile.about)}</div>` : ''}
+        ${l.profile?.channel ? `<div class="hint">Личный канал: ${esc(l.profile.channel.title || '')}${l.profile.channel.username
+          ? ' (@' + esc(l.profile.channel.username) + ')' : ''}${l.profile.channel.posts ? ', постов прочитано ' + l.profile.channel.posts : ''}</div>` : ''}
         <div class="ld-note">${mdLite(l.note)}</div>
       </details>`).join('') : '<div class="hint">пока нет — лиды появятся по мере разбора чатов</div>';
   }
 }
 
-['#ld-goal', '#ld-topic', '#ld-kw'].forEach((id) => $(id)?.addEventListener('input', (e) => { e.target.dataset.touched = '1'; }));
+['#ld-goal', '#ld-topic', '#ld-kw', '#ap-query'].forEach((id) => $(id)?.addEventListener('input', (e) => { e.target.dataset.touched = '1'; }));
 const ldDo = async (url, data, note) => {
   let r;
   try { r = await post(url, data); } catch (err) { alert(err.message); return null; }
@@ -2812,6 +2850,15 @@ $('#ld-links-add')?.addEventListener('click', async () => {
   if (r?.ok) { $('#ld-links-note').textContent = `добавлено ${r.added} из ${r.given}` + (r.given > r.added ? ' (остальные уже в очереди)' : ''); t.value = ''; }
 });
 $('#ld-run')?.addEventListener('click', () => ldDo('/api/enrich/run', { on: !ld?.on }));
+$('#ap-run')?.addEventListener('click', async () => {
+  if (ld?.auto || ld?.planning) { await ldDo('/api/enrich/auto', { on: false }); return; }
+  const q = $('#ap-query');
+  const ids = [...document.querySelectorAll('#ld-readers input[data-reader]:checked')].map((i) => i.dataset.reader);
+  if (!q.value.trim()) { alert('Напиши, кого ищем: например «хочет купить квартиру в Екатеринбурге»'); return; }
+  if (!ids.length) { alert('Отметь аккаунты, которые будут искать и читать чаты'); return; }
+  const r = await ldDo('/api/enrich/auto', { query: q.value, accounts: ids });
+  if (r?.ok) { delete q.dataset.touched; $('#ap-note').textContent = 'запущен — модель подбирает ключевики'; }
+});
 $('#ld-chats')?.addEventListener('click', (e) => {
   const b = e.target.closest('[data-ldcmd]'); if (!b) return;
   ldDo('/api/enrich/chats-cmd', { cmd: b.dataset.ldcmd, keys: [b.dataset.key] });
