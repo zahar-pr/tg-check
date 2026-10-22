@@ -261,7 +261,7 @@ def fit(topic, cands):
     info = {}
     out = llm.chat("Отвечай строго в формате, который просят.",
                    FIT_PROMPT.format(goal=enrich.goal(), topic=topic, items=items),
-                   max_tokens=400, temperature=0, info=info)
+                   max_tokens=1500, temperature=0, info=info)
     if out is None:
         # отказ из-за САМИХ названий (модерация, «Content Exists Risk», длинно)
         # повторится — это как непонятный ответ: после двух раз ключевик пропустим

@@ -47,6 +47,9 @@ def _cfg(k, d=""):
     return os.environ.get(k) or _ENV.get(k, d)
 
 
+MAX_TOKENS_UP = 16000      # потолок, до которого поднимаем лимит при пустом ответе
+
+
 def chat(system, user, max_tokens=400, temperature=0.8, tries=5, model=None, info=None, timeout=90):
     """Один запрос к модели через curl (надёжно тоннелит HTTPS через прокси).
     Возвращает текст ответа или None (мягкий фейл, причина в LAST_ERR).
@@ -55,7 +58,11 @@ def chat(system, user, max_tokens=400, temperature=0.8, tries=5, model=None, inf
     Свой словарь на вызов: LAST_ERR общий и в потоках перемешивается.
     model — своя модель для задачи (комментарии); имя вида «провайдер/модель»
     понимает только агрегатор (OpenRouter), у прямого провайдера берём LLM_MODEL.
-    timeout — секунд на один ответ: длинный список модель пишет дольше 90 с."""
+    timeout — секунд на один ответ: длинный список модель пишет дольше 90 с.
+
+    «Думающая» модель тратит max_tokens и на рассуждения: при маленьком лимите
+    до ответа она не доходит (пусто, finish_reason=length). Тогда повторяем сами
+    с лимитом побольше (до MAX_TOKENS_UP) — платим за потраченное, не за потолок."""
     global LAST_ERR
     LAST_ERR = ""
     base = _cfg("LLM_BASE_URL", "https://api.deepseek.com").rstrip("/")
@@ -67,19 +74,26 @@ def chat(system, user, max_tokens=400, temperature=0.8, tries=5, model=None, inf
     if not key:
         LAST_ERR = "нет LLM_API_KEY в .env"
         return None
-    body = json.dumps({
-        "model": model,
-        "messages": [{"role": "system", "content": system}, {"role": "user", "content": user}],
-        "max_tokens": max_tokens, "temperature": temperature,
-    })
-    cmd = ["curl", "-s", "-m", str(int(timeout)), "-X", "POST", base + "/chat/completions",
-           "-H", "Authorization: Bearer " + key, "-H", "Content-Type: application/json",
-           "-H", "X-Title: tg-panel", "-H", "HTTP-Referer: https://bqa.egor-kochnev.ru",
-           "-d", body]
-    if proxy:
-        cmd[1:1] = ["--proxy", proxy]
+    def command(limit, wait):
+        body = json.dumps({
+            "model": model,
+            "messages": [{"role": "system", "content": system}, {"role": "user", "content": user}],
+            "max_tokens": limit, "temperature": temperature,
+        })
+        cmd = ["curl", "-s", "-m", str(int(wait)), "-X", "POST", base + "/chat/completions",
+               "-H", "Authorization: Bearer " + key, "-H", "Content-Type: application/json",
+               "-H", "X-Title: tg-panel", "-H", "HTTP-Referer: https://bqa.egor-kochnev.ru",
+               "-d", body]
+        if proxy:
+            cmd[1:1] = ["--proxy", proxy]
+        return cmd
+
+    cmd = command(max_tokens, timeout)
     delay = 3
-    for i in range(tries):
+    raised = 0
+    i = 0
+    while i < tries:
+        i += 1
         try:
             out = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout + 10).stdout
             d = json.loads(out)
@@ -87,7 +101,7 @@ def chat(system, user, max_tokens=400, temperature=0.8, tries=5, model=None, inf
             LAST_ERR = f"{type(e).__name__}: {str(e)[:120]}"
             if info is not None:
                 info["code"] = "net"
-            if i < tries - 1:
+            if i < tries:
                 time.sleep(delay); delay *= 2; continue
             return None
         if isinstance(d, dict) and d.get("choices"):
@@ -97,6 +111,13 @@ def chat(system, user, max_tokens=400, temperature=0.8, tries=5, model=None, inf
                 # модели с рассуждениями тратят лимит токенов на «подумать» и
                 # до ответа не доходят: finish_reason=length — дело в лимите
                 why = ch.get("finish_reason") or ""
+                if why == "length" and max_tokens < MAX_TOKENS_UP and raised < 2:
+                    raised += 1
+                    max_tokens = min(MAX_TOKENS_UP, max(max_tokens * 4, 4000))
+                    timeout = max(timeout, 180)
+                    cmd = command(max_tokens, timeout)
+                    i -= 1                      # это не сбой — попытку не тратим
+                    continue
                 LAST_ERR = ("пустой ответ: модель потратила весь лимит токенов на рассуждения"
                             if why == "length" else f"пустой ответ ({why or 'без причины'})")
             return text
@@ -105,7 +126,7 @@ def chat(system, user, max_tokens=400, temperature=0.8, tries=5, model=None, inf
         LAST_ERR = str(err.get("message") or d)[:180]
         if info is not None:
             info["code"] = str(code or "")
-        if str(code) in ("429", "500", "502", "503") and i < tries - 1:
+        if str(code) in ("429", "500", "502", "503") and i < tries:
             time.sleep(delay); delay *= 2; continue
         return None
     return None

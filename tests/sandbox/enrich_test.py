@@ -626,6 +626,30 @@ def main():
     check(any(o.startswith("exit модель не разобрала") for o in out) and enrich.read_json(enrich.KEYWORDS, {}).get("topic")
           == "дома Екб", f"шаблон «...» из ответа модели — не план, ключевики не тронуты: {out[-1:]}")
 
+    print("\n▸ llm.chat: «думающая» модель с маленьким лимитом")
+    import importlib
+    import types as _t
+    real_llm = importlib.reload(llm)          # настоящий chat, без подмен выше
+    seen_limits = []
+
+    def fake_run(cmd, **kw):
+        body = json.loads(cmd[cmd.index("-d") + 1])
+        seen_limits.append((body["max_tokens"], cmd[cmd.index("-m") + 1]))
+        empty = body["max_tokens"] < 4000
+        return _t.SimpleNamespace(stdout=json.dumps({"choices": [{
+            "message": {"content": "" if empty else "[0, 2]"},
+            "finish_reason": "length" if empty else "stop"}]}))
+    old_env = real_llm._ENV
+    real_llm._ENV = {"LLM_API_KEY": "test", "LLM_BASE_URL": "https://openrouter.ai/api/v1"}
+    old_run = real_llm.subprocess.run
+    real_llm.subprocess.run = fake_run
+    try:
+        got = real_llm.chat("s", "u", max_tokens=400, temperature=0)
+    finally:
+        real_llm.subprocess.run, real_llm._ENV = old_run, old_env
+    check(got == "[0, 2]" and [x[0] for x in seen_limits] == [400, 4000] and seen_limits[1][1] == "180",
+          f"пустой ответ из-за лимита — повтор с лимитом побольше: {seen_limits}")
+
     print("\n▸ панель пишет очередь через enrich.py")
     f = TMP / "links.txt"
     f.write_text("t.me/new_chat\nt.me/akadem_sosedi\n", "utf-8")
