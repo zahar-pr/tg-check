@@ -610,11 +610,21 @@ def main():
     check(last.get("goal", "").startswith("хочет купить квартиру") and last.get("n") == 15
           and kw.get("topic") == "квартиры Екатеринбург" and len(kw.get("items", [])) == 15,
           f"план автопилота: {last}")
+    calls = []
+
+    def blank_first(system, user, **k):
+        calls.append(1)
+        return "" if len(calls) == 1 else ('{"goal": "хочет дом", "topic": "дома Екб", "keywords": '
+                                           + json.dumps([f"посёлок {i}" for i in range(12)], ensure_ascii=False) + '}')
+    llm.chat = blank_first
+    out = run_script("enrich-find.py", "--plan", "--query", "хочет дом")
+    last = next((o for o in reversed(out) if o.startswith("{")), "")
+    check('"ok": true' in last and "хочет дом" in last, f"пустой ответ модели — ещё попытка, план принят: {out[-1:]}")
     llm.chat = lambda *a, **k: ('Формат: {"goal": "...", "topic": "...", "keywords": ["...", "..."]}\n'
                                 '{"goal": "хочет авто", "topic": "авто", "keywords": ["тойота", "лада')
     out = run_script("enrich-find.py", "--plan", "--query", "хочет авто")
     check(any(o.startswith("exit модель не разобрала") for o in out) and enrich.read_json(enrich.KEYWORDS, {}).get("topic")
-          == "квартиры Екатеринбург", f"шаблон «...» из ответа модели — не план, ключевики не тронуты: {out[-1:]}")
+          == "дома Екб", f"шаблон «...» из ответа модели — не план, ключевики не тронуты: {out[-1:]}")
 
     print("\n▸ панель пишет очередь через enrich.py")
     f = TMP / "links.txt"

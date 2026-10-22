@@ -91,7 +91,15 @@ def chat(system, user, max_tokens=400, temperature=0.8, tries=5, model=None, inf
                 time.sleep(delay); delay *= 2; continue
             return None
         if isinstance(d, dict) and d.get("choices"):
-            return (d["choices"][0]["message"]["content"] or "").strip()
+            ch = d["choices"][0]
+            text = (ch.get("message", {}).get("content") or "").strip()
+            if not text:
+                # модели с рассуждениями тратят лимит токенов на «подумать» и
+                # до ответа не доходят: finish_reason=length — дело в лимите
+                why = ch.get("finish_reason") or ""
+                LAST_ERR = ("пустой ответ: модель потратила весь лимит токенов на рассуждения"
+                            if why == "length" else f"пустой ответ ({why or 'без причины'})")
+            return text
         err = (d.get("error") or {}) if isinstance(d, dict) else {}
         code = err.get("code") or (err.get("metadata") or {}).get("provider_error_code")
         LAST_ERR = str(err.get("message") or d)[:180]

@@ -40,8 +40,8 @@ FLOOD_MAX = 120
 KW_ROUND = 60             # ключевиков за один запрос
 KW_TARGET = 180           # всего: раунды идут, пока не наберём или не иссякнет
 KW_ROUNDS = 5
-KW_TOKENS = 4000
-KW_TIMEOUT = 150          # сек на один ответ модели
+KW_TOKENS = 12000         # потолок, а не плата: «думающая» модель тратит часть на рассуждения
+KW_TIMEOUT = 180          # сек на один ответ модели
 
 KW_PROMPT = """Тема: «{topic}».{goal}
 Составь {n} поисковых запросов, по которым в поиске Telegram найдутся
@@ -116,6 +116,17 @@ def word_list(out):
     return [w for w in words if isinstance(w, str) and w.strip(' .…"\'«»')]
 
 
+def ask_text(prompt, temperature):
+    """Ответ модели на длинную генерацию; пустой — ещё одна попытка."""
+    out = None
+    for _ in range(2):
+        out = llm.chat("Отвечай строго в формате, который просят.", prompt,
+                       max_tokens=KW_TOKENS, temperature=temperature, tries=2, timeout=KW_TIMEOUT)
+        if out:
+            break
+    return out
+
+
 def gather(topic, goal="", seed=()):
     """
     Ключевики раундами по KW_ROUND: каждый следующий просит других, не тех,
@@ -135,11 +146,9 @@ def gather(topic, goal="", seed=()):
         if len(words) >= KW_TARGET:
             break
         have = ("\nУже есть — НЕ повторяй их, дай другие: " + ", ".join(words))[:4000] if words else ""
-        out = llm.chat("Отвечай строго в формате, который просят.",
-                       KW_PROMPT.format(topic=topic, goal=f"\nИщем людей, которые {goal}." if goal else "",
-                                        n=KW_ROUND, have=have),
-                       max_tokens=KW_TOKENS, temperature=0.7, tries=2, timeout=KW_TIMEOUT)
-        if out is None:
+        out = ask_text(KW_PROMPT.format(topic=topic, goal=f"\nИщем людей, которые {goal}." if goal else "",
+                                        n=KW_ROUND, have=have), 0.7)
+        if not out:
             say(f"  модель не ответила ({llm.LAST_ERR or 'нет ответа'}) — беру, что есть")
             break
         n = take(word_list(out))
@@ -211,8 +220,7 @@ def make_plan(query):
     разбора, тема для поиска чатов и ключевики. Последней строкой — JSON для
     панели: цель и тему она сохраняет в enrich/state.json сама.
     """
-    out = llm.chat("Отвечай строго в формате, который просят.", PLAN_PROMPT.format(query=query),
-                   max_tokens=KW_TOKENS, temperature=0.5, tries=2, timeout=KW_TIMEOUT)
+    out = ask_text(PLAN_PROMPT.format(query=query), 0.5)
     plan = (parse_plan(out) or salvage_plan(out)) if out else None
     if not plan:
         why = llm.LAST_ERR or ("пустой ответ" if out == "" else (out or "")[:120])
