@@ -5,6 +5,7 @@
 #     bash deploy/push.sh root@1.2.3.4
 #     bash deploy/push.sh panel@example.com --key ~/.ssh/id_ed25519 --port 2222 --voice
 #     bash deploy/push.sh --dry-run        собрать архив и проверить состав, никуда не ходя
+#     bash deploy/push.sh --here --code-only   уже на сервере: обновить из этой папки
 #
 # Что уезжает: код панели. Что НЕ уезжает никогда: сессии Telegram, реестр
 # аккаунтов, пароль от панели, базы и результаты. Это же правило делает
@@ -18,6 +19,9 @@
 #   --no-password   не спрашивать вход в панель — его задаст хозяин сам
 #   --code-only     только обновить код и перезапустить службу, без установки
 #   --dry-run       только собрать архив и проверить, что в него не попали данные
+#   --here          ставить на ЭТОТ компьютер, без SSH — когда push.sh запущен
+#                   на самом сервере из свежей копии репозитория
+#   --force         с --code-only: не ждать паузы в задачах (обычно не нужно)
 #
 set -euo pipefail
 
@@ -29,6 +33,8 @@ REMOTE=/opt/tg-panel
 FLAGS=""
 CODE_ONLY=0
 DRY=0
+HERE=0
+FORCE=0
 
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -38,6 +44,8 @@ while [ $# -gt 0 ]; do
     --tdata|--voice|--no-password) FLAGS="$FLAGS $1" ;;
     --code-only) CODE_ONLY=1 ;;
     --dry-run) DRY=1 ;;
+    --here) HERE=1 ;;
+    --force) FORCE=1 ;;
     -*) echo "не знаю ключ: $1"; exit 1 ;;
     *) TARGET="$1" ;;
   esac
@@ -47,11 +55,15 @@ done
 say() { printf '\n\033[1m%s\033[0m\n' "$*"; }
 die() { printf '\n\033[31m%s\033[0m\n' "$*" >&2; exit 1; }
 
-[ -n "$TARGET" ] || [ "$DRY" = 1 ] || die "куда ставим? bash deploy/push.sh root@адрес-сервера"
+[ -n "$TARGET" ] || [ "$DRY" = 1 ] || [ "$HERE" = 1 ] || die "куда ставим? bash deploy/push.sh root@адрес-сервера"
+[ "$HERE" = 0 ] || [ -z "$TARGET" ] || die "--here ставит на этот компьютер — адрес сервера тогда не нужен"
 [ -f "$DIR/router.mjs" ] || die "запускать из папки панели"
 
 SSH=(ssh -p "$PORT" -o ConnectTimeout=15)
 [ -n "$KEY" ] && SSH+=(-i "$KEY")
+
+# Команда «на сервере»: по SSH или, с --here, прямо тут
+on() { if [ "$HERE" = 1 ]; then bash -c "$1"; else "${SSH[@]}" "$TARGET" "$1"; fi; }
 
 # tar на macOS иначе тащит служебные метки Apple, а tar на сервере ругается
 # на них десятком строк за файл — в выводе тонет всё остальное
@@ -165,11 +177,15 @@ if [ "$DRY" = 1 ]; then
   exit 0
 fi
 
-say "2/3  Проверяю связь с $TARGET и копирую код в $REMOTE"
+if [ "$HERE" = 1 ]; then
+  say "2/3  Копирую код в $REMOTE на этом компьютере"
+else
+  say "2/3  Проверяю связь с $TARGET и копирую код в $REMOTE"
+fi
 # Пароль по SSH запрещаем явно: ему не место ни в скрипте, ни в переписке.
 # А вот «сервер видим впервые, принять его ключ?» спросить можно — на новом
 # сервере это первое, что спрашивает ssh, и молча падать тут незачем.
-if ! "${SSH[@]}" -o PasswordAuthentication=no -o KbdInteractiveAuthentication=no \
+if [ "$HERE" = 0 ] && ! "${SSH[@]}" -o PasswordAuthentication=no -o KbdInteractiveAuthentication=no \
      "$TARGET" true; then
   die "не пускает по ключу.
 Вход по паролю тут не годится — пароли не место в скриптах и переписке.
@@ -178,12 +194,12 @@ if ! "${SSH[@]}" -o PasswordAuthentication=no -o KbdInteractiveAuthentication=no
     ssh-copy-id -p $PORT $TARGET     (спросит пароль сервера один раз)
 и запусти push.sh снова."
 fi
-USER_REMOTE="$("${SSH[@]}" "$TARGET" 'id -un')"
+USER_REMOTE="$(on 'id -un')"
 echo "  вошли как $USER_REMOTE"
 
 # Готовим место. Под root заводим отдельного пользователя: службе ни к чему
 # права, которых она не использует.
-OWNER_REMOTE="$("${SSH[@]}" "$TARGET" '
+OWNER_REMOTE="$(on '
   if [ "$(id -u)" = 0 ]; then
     id tgpanel >/dev/null 2>&1 || useradd -m -s /bin/bash tgpanel
     echo tgpanel
@@ -191,23 +207,35 @@ OWNER_REMOTE="$("${SSH[@]}" "$TARGET" '
     id -un
   fi')"
 [ -n "$OWNER_REMOTE" ] || die "не смог завести пользователя на сервере"
-"${SSH[@]}" "$TARGET" "\$( [ \"\$(id -u)\" = 0 ] || echo sudo ) mkdir -p '$REMOTE'"
+on "\$( [ \"\$(id -u)\" = 0 ] || echo sudo ) mkdir -p '$REMOTE'"
 echo "  папка готова, владелец $OWNER_REMOTE"
 
-"${SSH[@]}" "$TARGET" "tar xzf - --no-same-owner -C '$REMOTE'" < "$TMP_ARCHIVE"
+# Обновление кода перезапускает службу, а с ней гибнут идущие задачи (письмо на
+# полпути, вступление в чат). Ждём паузы: между задачами панель делает перерывы.
+if [ "$CODE_ONLY" = 1 ] && [ "$FORCE" = 0 ]; then
+  busy() { on "pgrep -u '$OWNER_REMOTE' -f '[p]ython.*\\.py' | wc -l" | tr -d ' '; }
+  n="$(busy)"; waited=0
+  [ "$n" = 0 ] || echo "  сейчас идут задачи ($n) — жду паузы, до 10 минут…"
+  while [ "$n" != 0 ] && [ "$waited" -lt 600 ]; do sleep 5; waited=$((waited + 5)); n="$(busy)"; done
+  [ "$n" = 0 ] || die "задачи так и идут ($n) — ничего не менял.
+Останови рассылку в панели (или дождись ночи) и запусти снова.
+Не ждать паузы: добавь --force (идущие задачи оборвутся)."
+fi
+
+on "tar xzf - --no-same-owner -C '$REMOTE'" < "$TMP_ARCHIVE"
 # tar под root восстановил бы владельца из архива — то есть номер пользователя
 # с ЭТОГО компьютера, которого на сервере нет. Поэтому и --no-same-owner,
 # и явный chown: иначе установка спотыкается о владельца «UNKNOWN».
-"${SSH[@]}" "$TARGET" "\$( [ \"\$(id -u)\" = 0 ] || echo sudo ) chown -R '$OWNER_REMOTE' '$REMOTE'"
+on "\$( [ \"\$(id -u)\" = 0 ] || echo sudo ) chown -R '$OWNER_REMOTE' '$REMOTE'"
 # Папку закрываем от посторонних: внутри сессии Telegram и реестр аккаунтов.
 # Это же разделяет профили — соседняя панель работает от другого пользователя
 # и в эту папку не заглянет.
-"${SSH[@]}" "$TARGET" "\$( [ \"\$(id -u)\" = 0 ] || echo sudo ) chmod 700 '$REMOTE'"
+on "\$( [ \"\$(id -u)\" = 0 ] || echo sudo ) chmod 700 '$REMOTE'"
 echo "  код на месте"
 
 if [ "$CODE_ONLY" = 1 ]; then
   say "3/3  Перезапускаю службу"
-  "${SSH[@]}" "$TARGET" "\$( [ \"\$(id -u)\" = 0 ] || echo sudo ) systemctl restart tg-panel && \
+  on "\$( [ \"\$(id -u)\" = 0 ] || echo sudo ) systemctl restart tg-panel && \
     \$( [ \"\$(id -u)\" = 0 ] || echo sudo ) systemctl is-active tg-panel"
   echo "  готово — данные на сервере не тронуты"
   exit 0
@@ -219,7 +247,8 @@ case "$FLAGS" in
   *) echo "  Сейчас сервер спросит логин и пароль для входа в панель — набирай их"
      echo "  здесь, они никуда больше не уходят." ;;
 esac
-"${SSH[@]}" -t "$TARGET" "cd '$REMOTE' && \$( [ \"\$(id -u)\" = 0 ] || echo sudo ) bash deploy/install.sh$FLAGS"
+INSTALL="cd '$REMOTE' && \$( [ \"\$(id -u)\" = 0 ] || echo sudo ) bash deploy/install.sh$FLAGS"
+if [ "$HERE" = 1 ]; then bash -c "$INSTALL"; else "${SSH[@]}" -t "$TARGET" "$INSTALL"; fi
 
 cat <<TXT
 

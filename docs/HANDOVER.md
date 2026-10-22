@@ -200,7 +200,16 @@ cd ~/Projects/tg-check && bash deploy/push.sh root@46.16.15.238 --code-only
 ```
 
 Копирует **только код**: сессии, реестр, базы, `.env` и прочие данные остаются
-на сервере нетронутыми. Служба перезапускается.
+на сервере нетронутыми. Служба перезапускается. Перед этим `--code-only` ждёт
+до 10 минут, пока не будет идущих задач (не ждать — `--force`).
+
+Если под рукой только консоль сервера (Termius), то же самое — прямо там, из
+свежей копии репозитория:
+
+```bash
+rm -rf /root/tg-check-src && git clone -q -b web-refactor https://github.com/zahar-pr/tg-check /root/tg-check-src
+bash /root/tg-check-src/deploy/push.sh --here --code-only
+```
 
 Три правила, выученных на практике:
 
