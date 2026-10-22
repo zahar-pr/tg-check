@@ -1416,12 +1416,14 @@ function work(set = baseSet) {
   for (const r of log) if (!written.has(r.phone)) dtries[r.phone] = (dtries[r.phone] || 0) + 1;
   // «только лиды»: остальные люди из чатов этому режиму не работа
   const leadKeys = enrich.leadKeys();
+  const excluded = enrich.excludedKeys();     // лиды-продавцы: им не пишет ни один режим
   const onlyLeads = set === 'chats' && !!auto.opts.chats?.leadsOnly;
   // лиды, которых сегодня кто-то отложил (вступления кончились) — какому
   // писателю они не работа, решают pickJob и проверка конца прогона
   const offAny = set === 'chats' ? enrich.putOffAny() : new Set();
   const free = res.filter((r) => r.tg === 'true' && !written.has(r.phone)
     && (dtries[r.phone] || 0) < MAX_TRIES && !held.has(r.phone)
+    && !(r.by === 'lead' && excluded.has(r.phone))
     && (!onlyLeads || leadKeys.has(r.phone)));
 
   /**
@@ -4262,7 +4264,7 @@ async function handler(req, res) {
             'сейчас в рассылке — сними их с рассылки или отметь другие аккаунты' });
         }
         for (const a of picked) makeReader(a);
-        return json(res, 200, enrich.autopilot(o.query));
+        return json(res, 200, enrich.autopilot(o.query, o.queue));
       }
       // «Написать лидам» — обычный автопрогон по чатам, только по лидам.
       // Настройки (тексты, паузы, лимиты, кто пишет) — с вкладки «Рассылка по чатам»

@@ -1414,6 +1414,10 @@ def can_write(row, acc_id) -> bool:
     аккаунт-сборщик написал бы ему без всяких проблем.
     """
     key = str(row.get("phone", ""))
+    # лид, которого профиль показал продавцом: в очереди он уже лежит (разбор
+    # кладёт лидов сразу), но писать ему не будет ни одна рассылка
+    if row.get("by", "") == "lead" and key in lead_excluded():
+        return False
     # человек лежит в контактах проверившего аккаунта — пишет только он:
     # чужой потратил бы квоту на повторное добавление
     if row.get("kept") == "1":
@@ -1428,20 +1432,30 @@ def can_write(row, acc_id) -> bool:
     return row.get("by", "") == "lead" and key in lead_refs()
 
 
-_LEADS_CACHE = {"mtime": None, "refs": {}}
+_LEADS_CACHE = {"mtime": None, "refs": {}, "excluded": set()}
 
 
-def lead_refs():
-    """Ключ получателя -> карточка лида (leads.json); перечитываем при правке файла."""
+def _leads_cache():
+    """leads.json раскладом для рассылки; перечитываем при правке файла."""
     f = DIR / "enrich" / "leads.json"
     try:
         mtime = f.stat().st_mtime
     except OSError:
-        return {}
+        return {"refs": {}, "excluded": set()}
     if mtime != _LEADS_CACHE["mtime"]:
         import enrich          # здесь, а не наверху: enrich сам импортирует tglib
-        _LEADS_CACHE.update(mtime=mtime, refs=enrich.lead_refs())
-    return _LEADS_CACHE["refs"]
+        _LEADS_CACHE.update(mtime=mtime, refs=enrich.lead_refs(), excluded=enrich.excluded_keys())
+    return _LEADS_CACHE
+
+
+def lead_refs():
+    """Ключ получателя -> карточка лида (leads.json), без исключённых."""
+    return _leads_cache()["refs"]
+
+
+def lead_excluded():
+    """Ключи лидов, которых профиль показал продавцами."""
+    return _leads_cache()["excluded"]
 
 
 def now_iso():

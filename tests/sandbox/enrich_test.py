@@ -331,8 +331,20 @@ def main():
     ns_a = {"__name__": "analyze_test"}
     src_a = (REPO / "enrich-analyze.py").read_text("utf-8").rsplit("\nmain()", 1)[0]
     exec(compile(src_a, "enrich-analyze.py", "exec"), ns_a)
-    v = ns_a["verdict"]('думаю {так}\n{"lead": true, "why": "берёт двушку", "note": "- **Район:** Академ\\n- бюджет до 7')
-    check(v and v["lead"] and "Академ" in v["note"], f"лид из обрезанного JSON: {v}")
+    v = ns_a["verdict"]('думаю {так}\n{"lead": true, "score": 85, "why": "берёт двушку", '
+                        '"facts": {"район": "Академ", "бюджет": "7 млн"}, "note": "- **Район:** Академ\\n- бюджет до 7')
+    check(v and v["lead"] and "Академ" in v["note"] and v["facts"].get("бюджет") == "7 млн",
+          f"лид из обрезанного JSON, факты целы: {v}")
+    check(ns_a["verdict"]('{"lead": true, "score": 85, "why": "x", "note": "обрез', final=False) is None,
+          "обрезанный ответ не на последней попытке — повтор с запасом токенов")
+    v = ns_a["verdict"]('{"lead": true, "score": 9')
+    check(v is None, f"лид без целой оценки («9» от «90») не спасаем: {v}")
+    v = ns_a["verdict"]('Черновик: {"lead": false, "score": 30, "why": "просто спрашивает"} — но нет.\n'
+                        '{"lead": true, "score": 92, "why": "ищет", "facts": {"a": "b"}, "note": "x')
+    check(v and v["lead"] and v["score"] == 92, f"черновик в рассуждениях не перебивает итоговый вердикт: {v}")
+    v = ns_a["verdict"]('{"lead": true, "score": 90, "why": "ищет", "facts": {"бюджет": "8 млн"}, "note": "- Оля\n- ипотека"}')
+    check(v and v["facts"].get("бюджет") == "8 млн" and "ипотека" in v["note"] and "…" not in v["note"],
+          f"перенос строки внутри заметки — не мусор: {v}")
     v = ns_a["verdict"]('Формат: {"lead": true|false, "why": "фраза"}. Тут «Продаю двушку» — это риелтор.\n'
                         '{"lead": false, "why": "продаёт", "note": "')
     check(v and v["lead"] is False and v["why"] == "продаёт", f"строка формата из промпта не делает лида: {v}")
@@ -511,16 +523,69 @@ def main():
           "личный канал прочитан, заметка о профиле в карточке")
     check(mraz.get("excluded") and "@mraz" not in enrich.lead_refs(), "продавец по профилю исключён и писать ему не будем")
     check(not enrich.profile_todo(), "профили всех лидов посмотрены")
+    check(tglib.can_write({"phone": "@mraz", "by": "lead", "tg": "true"}, "w1") is False,
+          "исключённому продавцу не пишет и обычная рассылка по чатам")
+    check(tglib.can_write({"phone": "@chmo", "by": "lead", "tg": "true"}, "w1") is True, "остальным лидам — пишет")
+
+    print("\n▸ профиль: отказ модели по одному человеку не стопорит очередь")
+    for uid, un in ((61, "risky"), (62, "calm")):
+        enrich.add_lead(uid, un, un, {"chat_id": CHAT_ID, "ref": "@akadem_sosedi", "title": "ЖК Академ"},
+                        [1], f"ищет ({un})", "- ищет", [], facts={}, score=80)
+
+    def refusing(system, user, info=None, **kw):
+        if user == "ок":
+            return "ок"
+        if "(risky)" in user:
+            llm.LAST_ERR = "400: Content Exists Risk"
+            if info is not None:
+                info["code"] = "400"
+            return None
+        return prof_llm(system, user)
+    llm.chat = refusing
+    out = run_script("enrich-profile.py", "--account", "r1", client=ProfClient())
+    L = enrich.load_leads()
+    check(L["62"].get("profile_at") and not L["61"].get("profile_at") and L["61"].get("profile_tries") == 1,
+          f"после отказа по @risky очередь пошла дальше: {out[-4:]}")
+    run_script("enrich-profile.py", "--account", "r1", client=ProfClient())
+    check(not enrich.profile_todo(), "после второго отказа лид идёт без профиля, автопилот не висит")
+
+    print("\n▸ профиль: лид из закрытого чата другого читателя")
+    (TMP / "accounts.json").write_text(json.dumps([acc, {"id": "r2", "title": "читатель 2", "role": "read"}]), "utf-8")
+    enrich.add_chats([{"ref": "t.me/+Closed9", "chat_id": 909, "title": "Закрытый"}], source="вручную")
+    enrich.set_chat("+Closed9", reader="r2")
+    key909 = next(k for k, v in enrich.load_chats().items() if v.get("chat_id") == 909)
+    enrich.set_chat(key909, reader="r2")
+    enrich.add_lead(63, "", "Без ника", {"chat_id": 909, "ref": "t.me/+Closed9", "title": "Закрытый"},
+                    [5], "ищет", "- ищет", [], facts={}, score=80)
+
+    class NoCache(ProfClient):
+        async def get_input_entity(self, ent):
+            if ent == 63:
+                raise ValueError("Could not find the input entity")
+            return await super().get_input_entity(ent)
+    llm.chat = prof_llm
+    out = run_script("enrich-profile.py", "--account", "r1", client=NoCache())
+    check(not enrich.load_leads()["63"].get("profile_tries") and any("закрытых чатов" in o for o in out),
+          f"чужого лида из закрытого чата не трогаем и попытку не тратим: {out[-3:]}")
+    (TMP / "accounts.json").write_text(json.dumps([acc]), "utf-8")
+    enrich.save_profile(63, err="тест")
+    enrich.save_profile(63, err="тест")
 
     print("\n▸ автопилот: одна фраза → цель, тема, ключевики")
+    many = ["ЖК Академ", "новостройки екб", "ЖК Академ", "ипотека екб"] + [f"ЖК {i}" for i in range(12)]
     llm.chat = lambda *a, **k: ('Думаю… {"goal": "хочет купить квартиру в Екатеринбурге", "topic": "квартиры Екатеринбург", '
-                                '"keywords": ["ЖК Академ", "новостройки екб", "ЖК Академ", "ипотека екб"]}')
+                                '"keywords": ' + json.dumps(many, ensure_ascii=False) + '}')
     out = run_script("enrich-find.py", "--plan", "--query", "хочет квартиру в Екб")
     last = json.loads(next(o for o in reversed(out) if o.startswith("{")))
     kw = enrich.read_json(enrich.KEYWORDS, {})
-    check(last.get("goal", "").startswith("хочет купить квартиру") and last.get("n") == 3
-          and kw.get("topic") == "квартиры Екатеринбург" and len(kw.get("items", [])) == 3,
+    check(last.get("goal", "").startswith("хочет купить квартиру") and last.get("n") == 15
+          and kw.get("topic") == "квартиры Екатеринбург" and len(kw.get("items", [])) == 15,
           f"план автопилота: {last}")
+    llm.chat = lambda *a, **k: ('Формат: {"goal": "...", "topic": "...", "keywords": ["...", "..."]}\n'
+                                '{"goal": "хочет авто", "topic": "авто", "keywords": ["тойота", "лада')
+    out = run_script("enrich-find.py", "--plan", "--query", "хочет авто")
+    check(any(o.startswith("exit модель не разобрала") for o in out) and enrich.read_json(enrich.KEYWORDS, {}).get("topic")
+          == "квартиры Екатеринбург", f"шаблон «...» из ответа модели — не план, ключевики не тронуты: {out[-1:]}")
 
     print("\n▸ панель пишет очередь через enrich.py")
     f = TMP / "links.txt"

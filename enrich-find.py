@@ -95,26 +95,52 @@ def save_keywords(topic, words):
     return items
 
 
+PLAN_MIN = 10       # меньше ключевиков — это не план, а обрывок или шаблон
+
+
+def _blank(s):
+    return not str(s or "").strip(" .…\"'«»")
+
+
+def parse_plan(out):
+    """
+    (goal, topic, keywords) из ответа модели — или None. Модели с рассуждениями
+    повторяют в ответе шаблон из промпта ({"goal": "...", …}) и потом пишут
+    настоящий JSON, который бывает обрезан. Поэтому идём с конца и берём только
+    объект, похожий на план: цель и тема не «...», ключевики — список настоящих
+    строк, и их не меньше PLAN_MIN.
+    """
+    dec = json.JSONDecoder(strict=False)
+    for m in reversed(list(re.finditer(r'\{\s*"goal"', out or ""))):
+        try:
+            plan, _ = dec.raw_decode(out, m.start())
+        except ValueError:
+            continue
+        if not isinstance(plan, dict) or not isinstance(plan.get("keywords"), list):
+            continue
+        words = [w for w in plan["keywords"] if isinstance(w, str) and not _blank(w)]
+        if _blank(plan.get("goal")) or _blank(plan.get("topic")) or len({w.lower() for w in words}) < PLAN_MIN:
+            continue
+        return (" ".join(str(plan["goal"]).split())[:300], " ".join(str(plan["topic"]).split())[:100], words)
+    return None
+
+
 def make_plan(query):
     """
     Автопилот: из одной фразы владельца («хочет квартиру в Екб») — цель для
     разбора, тема для поиска чатов и ключевики. Последней строкой — JSON для
     панели: цель и тему она сохраняет в enrich/state.json сама.
     """
-    out = llm.chat("Отвечай строго в формате, который просят.", PLAN_PROMPT.format(query=query),
-                   max_tokens=5000, temperature=0.5)
-    plan = None
-    for m in reversed(list(re.finditer(r'\{\s*"goal"', out or ""))):
-        try:
-            plan, _ = json.JSONDecoder().raw_decode(out, m.start())
+    plan = out = None
+    for tokens in (5000, 9000):         # двести ключевиков плюс рассуждения — бывает и мало
+        out = llm.chat("Отвечай строго в формате, который просят.", PLAN_PROMPT.format(query=query),
+                       max_tokens=tokens, temperature=0.5)
+        plan = parse_plan(out) if out is not None else None
+        if plan or out is None:
             break
-        except ValueError:
-            continue
-    words = [w for w in (plan or {}).get("keywords") or [] if isinstance(w, str)]
-    if not plan or not words:
+    if not plan:
         raise SystemExit(f"модель не разобрала запрос: {llm.LAST_ERR or (out or '')[:120]}")
-    goal = " ".join(str(plan.get("goal") or query).split())[:300]
-    topic = " ".join(str(plan.get("topic") or query).split())[:100]
+    goal, topic, words = plan
     items = save_keywords(topic, words)
     say(f"кого ищем: {goal}")
     say(f"тема поиска: {topic} · ключевиков: {len(items)}")

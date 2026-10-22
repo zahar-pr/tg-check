@@ -2705,14 +2705,16 @@ async function leadsView(force) {
     ab.textContent = on ? 'Остановить автопилот' : 'Запустить автопилот';
     ab.classList.toggle('danger', on);
   }
+  const an = $('#ap-note');
+  if (an) an.textContent = d.planning ? 'модель разбирает запрос и подбирает ключевики…' : d.planErr || '';
   const c0 = d.counts || {};
   const step = (state, name, text) => `<div class="ap-step${state ? ' ap-' + state : ''}"><span class="ap-dot"></span><b>${name}</b><span>${text}</span></div>`;
   const stF = d.finding ? 'run' : d.keywords.total && !d.keywords.left && !d.similarLeft ? 'ok' : '';
   const reading = (c0.reading || 0), queued = (c0.new || 0), inAnalysis = (c0.downloaded || 0) + (c0.analyzing || 0);
   const apSteps = $('#ap-steps');
-  if (apSteps) apSteps.innerHTML = (d.auto || d.planning || d.goal) ? [
-    step(d.planning ? 'run' : d.goal ? 'ok' : '', 'План', d.planning ? 'модель разбирает запрос и подбирает ключевики'
-      : d.goal ? `ищем тех, кто ${esc(d.goal)}` : '—'),
+  if (apSteps) apSteps.innerHTML = (d.auto || d.planning || d.goal || d.planErr) ? [
+    step(d.planning ? 'run' : d.planErr ? 'err' : d.goal ? 'ok' : '', 'План', d.planning ? 'модель разбирает запрос и подбирает ключевики'
+      : d.planErr ? esc(d.planErr) : d.goal ? `ищем тех, кто ${esc(d.goal)}` : '—'),
     step(stF, 'Поиск чатов', d.keywords.total ? `ключевиков ${d.keywords.total}, осталось ${d.keywords.left}` +
       (d.similarLeft ? ` · каналов для похожих ${d.similarLeft}` : '') : '—'),
     step(reading ? 'run' : queued ? 'wait' : (c0.done ? 'ok' : ''), 'Чтение', `в очереди ${queued}, читается ${reading}`),
@@ -2805,7 +2807,7 @@ async function leadsView(force) {
 const ldDo = async (url, data, note) => {
   let r;
   try { r = await post(url, data); } catch (err) { alert(err.message); return null; }
-  if (r && r.ok === false) alert(r.reason || 'не получилось');
+  if (r && r.ok === false && !r.ask) alert(r.reason || 'не получилось');
   else if (note && $(note)) $(note).textContent = '';
   leadsRaw = ''; await leadsView(true);
   return r;
@@ -2856,8 +2858,15 @@ $('#ap-run')?.addEventListener('click', async () => {
   const ids = [...document.querySelectorAll('#ld-readers input[data-reader]:checked')].map((i) => i.dataset.reader);
   if (!q.value.trim()) { alert('Напиши, кого ищем: например «хочет купить квартиру в Екатеринбурге»'); return; }
   if (!ids.length) { alert('Отметь аккаунты, которые будут искать и читать чаты'); return; }
-  const r = await ldDo('/api/enrich/auto', { query: q.value, accounts: ids });
-  if (r?.ok) { delete q.dataset.touched; $('#ap-note').textContent = 'запущен — модель подбирает ключевики'; }
+  let r = await ldDo('/api/enrich/auto', { query: q.value, accounts: ids });
+  if (r?.ask === 'queue') {
+    // в очереди остались чаты прошлого запроса — решает владелец
+    const clear = confirm(`В очереди ${r.n} чатов от прошлого запроса «${r.prev}».\n\n` +
+      'ОК — отложить их и искать только по новому запросу (вернуть можно кнопкой «перечитать»).\n' +
+      'Отмена — оставить: читатели сначала дочитают их.');
+    r = await ldDo('/api/enrich/auto', { query: q.value, accounts: ids, queue: clear ? 'clear' : 'keep' });
+  }
+  if (r?.ok) delete q.dataset.touched;
 });
 $('#ld-chats')?.addEventListener('click', (e) => {
   const b = e.target.closest('[data-ldcmd]'); if (!b) return;

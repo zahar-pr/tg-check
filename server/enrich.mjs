@@ -30,6 +30,12 @@ export function makeEnrich({ DIR, CODE, accounts, running, launch, pythonCmd, pu
 
   // вкл/выкл и цель переживают перезапуск панели
   const st = { on: false, finding: false, goal: '', topic: '', ...read(STATE, {}) };
+  // панель перезапустилась, пока модель разбирала запрос автопилота: план умер
+  // вместе с ней — не делаем вид, что автопилот работает
+  if (st.auto && !st.on && !st.finding) {
+    st.auto = false;
+    st.planErr = 'панель перезапускалась, пока модель разбирала запрос — запусти автопилот снова';
+  }
   const save = () => {
     fs.mkdirSync(ROOT, { recursive: true });
     const tmp = `${STATE}.${process.pid}.tmp`;
@@ -44,6 +50,7 @@ export function makeEnrich({ DIR, CODE, accounts, running, launch, pythonCmd, pu
   let releasing = false;          // панель возвращает в очередь чаты упавших читателей
   let findHold = 0;               // заходы «только похожие» — не чаще раза в 5 минут
   let planJob = null;             // автопилот: модель разбирает запрос владельца
+  let planChild = null;           // её процесс — «Остановить» его гасит
   const busyWith = (re) => [...running.values()].some((r) => re.test(r.title || ''));
   /** Лиды, чей профиль ещё не смотрели (то же правило, что enrich.profile_todo). */
   const profileLeft = () => leads().list.filter((l) => !l.profile_at && !l.excluded
@@ -59,27 +66,29 @@ export function makeEnrich({ DIR, CODE, accounts, running, launch, pythonCmd, pu
   const findLeft = () => kwLeft() + simLeft();
 
   /** Лиды по ключу получателя (@ник и id:<id>) — тот же расклад, что в enrich.lead_refs. */
-  let leadsCache = { mtime: -1, list: [], keys: new Set() };
+  let leadsCache = { mtime: -1, list: [], keys: new Set(), excluded: new Set() };
   function leads() {
     // свой файл в enrich/: в корне бывает leads.json убранного поиска горячих
     // лидов — те же id, другая форма записей
     const f = path.join(ROOT, 'leads.json');
     let mtime = 0;
-    try { mtime = fs.statSync(f).mtimeMs; } catch { return leadsCache = { mtime: 0, list: [], keys: new Set() }; }
+    try { mtime = fs.statSync(f).mtimeMs; } catch { return leadsCache = { mtime: 0, list: [], keys: new Set(), excluded: new Set() }; }
     if (mtime !== leadsCache.mtime) {
       const list = Object.values(read(f, {}));
       const keys = new Set();
+      const excluded = new Set();                   // по профилю — продавец: писать не будем
       for (const l of list) {
-        if (l.excluded) continue;                   // по профилю — продавец: писать не будем
-        if (l.key) keys.add(l.key);                 // под этим ключом лид лежит в очереди
-        if (l.username) keys.add('@' + String(l.username).replace(/^@/, ''));
-        if (l.uid) keys.add(`id:${l.uid}`);
+        const to = l.excluded ? excluded : keys;
+        if (l.key) to.add(l.key);                   // под этим ключом лид лежит в очереди
+        if (l.username) to.add('@' + String(l.username).replace(/^@/, ''));
+        if (l.uid) to.add(`id:${l.uid}`);
       }
-      leadsCache = { mtime, list, keys };
+      leadsCache = { mtime, list, keys, excluded };
     }
     return leadsCache;
   }
   const leadKeys = () => leads().keys;
+  const excludedKeys = () => leads().excluded;
 
   /**
    * Лиды, которых сегодня отложили ВСЕ эти писатели (вступления кончились —
@@ -110,8 +119,9 @@ export function makeEnrich({ DIR, CODE, accounts, running, launch, pythonCmd, pu
 
   /** Python-помощник (enrich.py, enrich-find.py) без аккаунта: вернёт последнюю JSON-строку. */
   function py(args, onLine) {
-    return new Promise((done) => {
-      const c = spawn(pythonCmd(), args.map((a, i) => (i === 0 ? path.join(CODE, a) : a)), { cwd: DIR });
+    let child = null;
+    const job = new Promise((done) => {
+      const c = child = spawn(pythonCmd(), args.map((a, i) => (i === 0 ? path.join(CODE, a) : a)), { cwd: DIR });
       let out = '';
       const feed = (b) => {
         out += b;
@@ -126,6 +136,8 @@ export function makeEnrich({ DIR, CODE, accounts, running, launch, pythonCmd, pu
         done({ code, res, out });
       });
     });
+    job.child = child;
+    return job;
   }
 
   /** Кто может читать прямо сейчас: роль «читатель», вошёл, свободен, прокси жив. */
@@ -238,7 +250,13 @@ export function makeEnrich({ DIR, CODE, accounts, running, launch, pythonCmd, pu
     // профили лидов (описание, личный канал): одним читателем, порциями. Если
     // свободный читатель один и чаты ждут чтения — сначала чтение
     if (profileLeft() && !busyWith(/^Профили лидов/) && free.length && (free.length > 1 || !fresh)) {
-      const a = free.shift();
+      // лучше тот, кто читал их чаты: людей оттуда он уже знает, а лида из
+      // закрытого чата без @ника видит только он
+      const readerOf = new Map(all.filter((v) => v.chat_id).map((v) => [String(v.chat_id), v.reader]));
+      const owners = new Set(leads().list.filter((l) => !l.profile_at && !l.excluded
+        && (Number(l.profile_tries) || 0) < 2).flatMap((l) => (l.chats || []).map((c) => readerOf.get(String(c.chat_id)))));
+      const i = free.findIndex((x) => owners.has(x.id));
+      const [a] = free.splice(i >= 0 ? i : 0, 1);
       launch('enrichProfile', { account: a.id }, after(a.id, 'профили'));
     }
     const live = (v) => (v.status === 'reading' ? running.has(v.reader) : IN_WORK.includes(v.status));
@@ -257,7 +275,7 @@ export function makeEnrich({ DIR, CODE, accounts, running, launch, pythonCmd, pu
     }
     // очередь пуста и всё разобрано — выключаемся сами, чтобы не крутиться вхолостую.
     // inWork — уже после раздачи этого захода: последний чат только что ушёл читателю
-    if (!fresh && !inWork && !orphans.length && !st.finding && !analyzer
+    if (!fresh && !inWork && !orphans.length && !st.finding && !analyzer && !planJob
         && !profileLeft() && !busyWith(/^Профили лидов/)) {
       const wasAuto = st.auto;
       st.on = false; st.auto = false; save();
@@ -307,7 +325,8 @@ export function makeEnrich({ DIR, CODE, accounts, running, launch, pythonCmd, pu
     const ready = new Set(readers().map((a) => a.id));     // один раз: отлёжка считается по журналу
     return {
       on: st.on, finding: st.finding, goal: st.goal, topic: st.topic || kw.topic || '',
-      auto: !!st.auto, query: st.query || '', planning: !!planJob,
+      auto: !!st.auto && (st.on || st.finding || !!planJob), query: st.query || '', planning: !!planJob,
+      planErr: st.planErr || '', planOk: !!st.goal && st.planFor === st.query,
       profileLeft: profileLeft(), profileBusy: busyWith(/^Профили лидов/),
       kwBusy: !!kwJob,
       keywords: { total: (kw.items || []).length, left: kwLeft(), list: (kw.items || []).map((i) => i.q) },
@@ -328,7 +347,12 @@ export function makeEnrich({ DIR, CODE, accounts, running, launch, pythonCmd, pu
   }
 
   function leadsCsv() {
-    const q = (s) => `"${String(s ?? '').replace(/"/g, '""')}"`;
+    // Excel считает формулой и поле в кавычках, если оно начинается с = + - @:
+    // а «о себе» и название канала пишет сам человек
+    const q = (s) => {
+      const v = String(s ?? '');
+      return `"${(/^[=+\-@\t\r]/.test(v) ? "'" + v : v).replace(/"/g, '""')}"`;
+    };
     const rows = [['ключ', 'username', 'id', 'имя', 'уверенность', 'факты', 'о себе', 'личный канал', 'чаты',
       'почему', 'заметка', 'статус', 'исключён', 'найден']];
     const ls = leadStatus();
@@ -346,9 +370,12 @@ export function makeEnrich({ DIR, CODE, accounts, running, launch, pythonCmd, pu
 
   /** Остановить всё обогащение: общая кнопка «Остановить», полная чистка. */
   function stop(why) {
-    const was = st.on || st.finding || st.auto;
+    const was = st.on || st.finding || st.auto || !!planJob;
     st.on = false; st.finding = false; st.auto = false; save();
     if (analyzer) { try { analyzer.child.kill('SIGTERM'); } catch {} }
+    // модель ещё думает над запросом: гасим, иначе она перепишет ключевики
+    // остановленного запроса и кнопка будет висеть до её ответа
+    if (planChild) { try { planChild.kill('SIGTERM'); } catch {} }
     if (was) note('⏸', `сбор лидов и поиск чатов остановлены${why ? ' — ' + why : ''}`);
   }
 
@@ -360,8 +387,12 @@ export function makeEnrich({ DIR, CODE, accounts, running, launch, pythonCmd, pu
    * разворачивает её в цель разбора, тему и сотни ключевиков (enrich-find
    * --plan), дальше само: поиск чатов и похожих, чтение, разбор, профили.
    * Кончается на готовых лидах; писать им — отдельной кнопкой.
+   *
+   * queue — что делать с чатами прошлого запроса, до которых не дошли:
+   * 'clear' — в «пропущен» (на новый запрос не тратим вступления и разбор),
+   * 'keep' — оставить. Не сказано, а такие есть — спросим владельца.
    */
-  function autopilot(query) {
+  function autopilot(query, queue) {
     query = String(query || '').trim().slice(0, 300);
     if (!query) return { ok: false, reason: 'напиши, кого ищем: например «хочет купить квартиру в Екатеринбурге»' };
     if (planJob) return { ok: false, reason: 'автопилот уже разбирает запрос — подожди минуту' };
@@ -369,19 +400,34 @@ export function makeEnrich({ DIR, CODE, accounts, running, launch, pythonCmd, pu
     if (!readers().length) {
       return { ok: false, reason: 'среди отмеченных нет готовых аккаунтов: нужны вошедшие, свежим — сутки отлёжки' };
     }
-    st.query = query; st.auto = true; st.finding = false; save();
+    const left = Object.values(chats()).filter((v) => v.status === 'new').length;
+    // прошлый запрос — тот, чей план приняли (остановленный на полпути не в счёт)
+    const prev = st.planFor || st.goal || '';
+    if (left && prev && prev !== query && !['clear', 'keep'].includes(queue)) {
+      return { ok: false, ask: 'queue', n: left, prev };
+    }
+    st.query = query; st.auto = true; st.finding = false; st.planErr = ''; save();
     push(`\n▶ Автопилот: «${query}»`);
-    planJob = py(['enrich-find.py', '--plan', '--query', query], (l) => {
+    const job = py(['enrich-find.py', '--plan', '--query', query], (l) => {
       if (!l.startsWith('\u2301STATE') && !l.startsWith('{')) push(`[автопилот] ${l}`);
-    }).then(({ code, res }) => {
-      planJob = null;
-      if (!st.auto) return;                          // пока модель думала, автопилот остановили
+    });
+    planChild = job.child;
+    planJob = job.then(async ({ code, res, out }) => {
+      if (!st.auto) { planJob = planChild = null; return; }     // пока модель думала, автопилот остановили
       if (code !== 0 || !res?.ok) {
-        st.auto = false; save();
+        planJob = planChild = null;
+        const why = String(out || '').trim().split('\n').filter((l) => !l.startsWith('\u2301')).pop() || '';
+        st.auto = false; st.planErr = `модель не разобрала запрос${why ? ': ' + why.slice(0, 160) : ''}`; save();
         note('⚠', 'автопилот: модель не разобрала запрос — смотри журнал, попробуй ещё раз');
         return;
       }
-      st.goal = res.goal; st.topic = res.topic; st.on = true; st.finding = true; save();
+      if (queue === 'clear' && left) {
+        const r = await py(['enrich.py', 'skip-new', `прошлый запрос: ${prev}`.slice(0, 200)]);
+        if (r.res?.n) note('🧹', `чаты прошлого запроса отложены: ${r.res.n} (вернуть — «перечитать»)`);
+      }
+      planJob = planChild = null;
+      if (!st.auto) return;
+      st.goal = res.goal; st.topic = res.topic; st.planFor = query; st.on = true; st.finding = true; save();
       note('🤖', `автопилот: ищу тех, кто ${res.goal} · ключевиков ${res.n}`);
       setTimeout(tick, 500);
     });
@@ -393,7 +439,9 @@ export function makeEnrich({ DIR, CODE, accounts, running, launch, pythonCmd, pu
     if (on && !Object.values(chats()).some((v) => ['new', ...IN_WORK].includes(v.status))) {
       return { ok: false, reason: 'очередь чатов пуста — добавь ссылки или найди чаты по ключевикам' };
     }
-    st.on = !!on; save();
+    st.on = !!on;
+    if (!on) st.auto = false;          // остановили сбор руками — автопилот больше не ведёт
+    save();
     note(on ? '🎯' : '⏸', on ? 'сбор лидов включён' : 'сбор лидов остановлен');
     if (on) setTimeout(tick, 500);
     return { ok: true, on: st.on };
@@ -427,6 +475,7 @@ export function makeEnrich({ DIR, CODE, accounts, running, launch, pythonCmd, pu
     topic = String(topic || '').trim();
     if (!topic) return { ok: false, reason: 'напиши тему, например «Квартиры в Екатеринбурге»' };
     if (kwJob) return { ok: false, reason: 'ключевики уже подбираются — подожди минуту' };
+    if (planJob) return { ok: false, reason: 'автопилот разбирает запрос — подожди или останови его' };
     if (st.finding) return { ok: false, reason: 'идёт поиск по старым ключевикам — сначала останови его' };
     st.topic = topic; save();
     push(`\n▶ Ключевики по теме «${topic}»`);
@@ -441,6 +490,7 @@ export function makeEnrich({ DIR, CODE, accounts, running, launch, pythonCmd, pu
   }
 
   function saveKeywords(list) {
+    if (planJob) return { ok: false, reason: 'автопилот разбирает запрос — подожди или останови его' };
     if (st.finding) return { ok: false, reason: 'идёт поиск — сначала останови его' };
     const old = keywords();
     const done = new Map((old.items || []).map((i) => [i.q.toLowerCase(), i]));
@@ -468,6 +518,7 @@ export function makeEnrich({ DIR, CODE, accounts, running, launch, pythonCmd, pu
         'у каналов поиск спросит похожие' };
     }
     if (kwJob) return { ok: false, reason: 'ключевики ещё подбираются — подожди' };
+    if (planJob) return { ok: false, reason: 'автопилот разбирает запрос — подожди или останови его' };
     if ([...running.values()].some((r) => /^Поиск чатов/.test(r.title || ''))) {
       return { ok: false, reason: 'прошлый поиск ещё заканчивает ключевик — подожди минуту' };
     }
@@ -479,6 +530,6 @@ export function makeEnrich({ DIR, CODE, accounts, running, launch, pythonCmd, pu
   }
 
   // tick — наружу только для песочницы (tests/sandbox/enrich_sched_test.mjs)
-  return { view, leadsCsv, leadKeys, putOffAll, putOffAny, autopilot, setOn, setGoal, addChats, chatsCmd, makeKeywords, saveKeywords, find, tick, stop,
+  return { view, leadsCsv, leadKeys, excludedKeys, putOffAll, putOffAny, autopilot, setOn, setGoal, addChats, chatsCmd, makeKeywords, saveKeywords, find, tick, stop,
            status: () => ({ on: st.on, finding: st.finding }) };
 }

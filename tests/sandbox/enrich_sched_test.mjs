@@ -25,7 +25,8 @@ const PY = path.join(DIR, 'fake-python.sh');
 fs.writeFileSync(PY, `#!/bin/sh
 case "$1" in
   *enrich-analyze.py) echo 'разбираю'; echo '⌁STATE {"done":0,"left":0}'; exit 0 ;;
-  *enrich-find.py) echo 'кого ищем: хочет квартиру'; echo '{"ok": true, "goal": "хочет купить квартиру в Екатеринбурге", "topic": "квартиры Екатеринбург", "n": 180}'; exit 0 ;;
+  *enrich-find.py) case "$*" in *медленно*) exec python3 -c "import time; time.sleep(4); print('{}')" ;; esac
+    echo 'кого ищем: хочет квартиру'; echo '{"ok": true, "goal": "хочет купить квартиру в Екатеринбурге", "topic": "квартиры Екатеринбург", "n": 180}'; exit 0 ;;
   *) TG_PANEL_DIR="${DIR}" exec python3 "$@" ;;
 esac
 `);
@@ -52,7 +53,7 @@ const pushes = [];
 const writeChats = (obj) => fs.writeFileSync(path.join(DIR, 'enrich', 'chats.json'), JSON.stringify(obj));
 const chatsOf = (spec) => Object.fromEntries(spec.map(([k, status]) => [k, { ref: k, status, chat_id: k.length }]));
 
-const en = makeEnrich({
+const opts = {
   DIR, CODE, accounts, running, pythonCmd: () => PY, push: (l) => pushes.push(l), readRaw: makeReadCsv(DIR),
   launch: (name, opts, onDone) => {
     launched.push([name, opts.account]);
@@ -62,7 +63,8 @@ const en = makeEnrich({
   },
   note: (i, t) => notes.push(t), busy: () => false, proxyDown: () => false,
   resting: (a) => !!a.fresh, slots: () => slots,
-});
+};
+const en = makeEnrich(opts);
 let slots = 6;
 const finish = (id, code, st) => { running.delete(id); done.get(id)?.(code, st); };
 
@@ -202,6 +204,49 @@ check(launched.some((x) => x[0] === 'enrichProfile') && launched.some((x) => x[0
   `читатели заняты чтением и профилями: ${launched.map((x) => x.join(':')).join(', ')}`);
 check(en.view().profileLeft === 1, 'профиль лида ждёт просмотра');
 en.stop('проверка');
+
+console.log('\n▸ автопилот: прошлая очередь, остановка во время плана, ручной стоп');
+running.clear();
+writeChats(chatsOf([['o1', 'new'], ['o2', 'new']]));
+let r = en.autopilot('хочет авто в Казани');
+check(r.ask === 'queue' && r.n === 2, `в очереди чаты прошлого запроса — спросили владельца: ${JSON.stringify(r)}`);
+r = en.autopilot('хочет авто в Казани медленно', 'clear');
+check(r.ok && en.view().planning, 'план пошёл');
+en.stop('проверка');
+await sleep(800);
+let v3 = en.view();
+check(!v3.planning && !v3.auto && Object.values(JSON.parse(fs.readFileSync(path.join(DIR, 'enrich', 'chats.json'), 'utf8')))
+  .every((c) => c.status === 'new'), 'остановка во время плана гасит модель: план не применён, очередь цела');
+r = en.autopilot('хочет авто в Казани', 'clear');
+await sleep(2500);
+v3 = en.view();
+const left3 = JSON.parse(fs.readFileSync(path.join(DIR, 'enrich', 'chats.json'), 'utf8'));
+check(r.ok && v3.auto && v3.on && v3.planOk && left3.o1.status === 'skipped' && /прошлый запрос/.test(left3.o1.err),
+  `чаты прошлого запроса отложены, автопилот пошёл: ${left3.o1.status} ${left3.o1.err}`);
+en.setOn(false);
+check(!en.view().auto, '«Остановить сбор» руками снимает и автопилот');
+en.stop('проверка');
+
+console.log('\n▸ автопилот: сбор не выключается, пока модель думает');
+fs.writeFileSync(path.join(DIR, 'enrich', 'leads.json'), JSON.stringify({
+  8: { uid: 8, username: 'lead8', chats: [], note: '', profile_at: 'T', profile: { about: '=HYPERLINK("http://x")' } },
+}));
+writeChats(chatsOf([['n1', 'new']]));
+en.setOn(true);
+r = en.autopilot('хочет дом медленно', 'keep');
+writeChats(chatsOf([['n1', 'done']]));
+running.clear();
+en.tick();
+v3 = en.view();
+check(r.ok && v3.on && v3.auto && v3.planning, 'очередь пуста, но план ещё идёт — сбор не выключился');
+en.stop('проверка');
+await sleep(500);
+check(en.leadsCsv().includes(`"'=HYPERLINK(""http://x"")"`), 'в CSV «о себе» с = в начале — текст, а не формула Excel');
+
+console.log('\n▸ перезапуск панели посреди плана');
+fs.writeFileSync(path.join(DIR, 'enrich', 'state.json'), JSON.stringify({ auto: true, on: false, finding: false, query: 'q' }));
+const en2 = makeEnrich(opts);
+check(!en2.view().auto && /перезапуск/.test(en2.view().planErr), 'автопилот без живого плана не висит «работает»');
 
 console.log(`\n${fails ? 'ПРОВАЛЕНО: ' + fails : 'ВСЁ ХОРОШО'}`);
 fs.rmSync(DIR, { recursive: true, force: true });

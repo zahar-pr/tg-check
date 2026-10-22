@@ -503,6 +503,7 @@ details.fieldset[open] > summary.fh::before{content:'▾'}
 .ap-step.ap-run .ap-dot{background:var(--acc);box-shadow:0 0 0 3px rgba(90,162,255,.2)}
 .ap-step.ap-wait .ap-dot{background:#e9c46a}
 .ap-step.ap-ok .ap-dot{background:var(--ok)}
+.ap-step.ap-err .ap-dot{background:var(--no)}
 @media (max-width:700px){.ap-step{grid-template-columns:14px 1fr}.ap-step span:last-child{grid-column:2}}
 .ld-manual{border:1px solid var(--glass-brd);border-radius:16px;padding:10px 14px;background:rgba(120,164,255,.03)}
 .ld-manual>summary{cursor:pointer;font-weight:600;padding:4px 0}

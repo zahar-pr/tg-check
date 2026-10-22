@@ -266,17 +266,26 @@ def add_lead(uid, username, name, chat, msg_ids, why, note, quotes, facts=None, 
         tglib.add_recipients([{"username": username, "user_id": uid, "name": name}], by="lead")
 
 
+def _keys(lead):
+    """Все ключи, под которыми лид может лежать в очереди рассылки."""
+    return {k for k in {lead.get("key"), tglib.member_key(lead.get("username"), lead.get("uid")),
+                        f"id:{lead.get('uid')}"} if k and k != "id:None"}
+
+
 def lead_refs():
     """Ключ получателя -> лид: по нему писатель найдёт человека без @username."""
     out = {}
     for lead in load_leads().values():
         if lead.get("excluded"):
             continue                # профиль показал риелтора/продавца — писать не будем
-        for k in {lead.get("key"), tglib.member_key(lead.get("username"), lead.get("uid")),
-                  f"id:{lead.get('uid')}"}:
-            if k and k != "id:None":
-                out[k] = lead
+        for k in _keys(lead):
+            out[k] = lead
     return out
+
+
+def excluded_keys():
+    """Ключи исключённых лидов: в очереди рассылки они уже лежат, писать им нельзя."""
+    return {k for lead in load_leads().values() if lead.get("excluded") for k in _keys(lead)}
 
 
 PROFILE_TRIES = 2           # столько раз профиль не дался — больше не пробуем
@@ -311,6 +320,23 @@ def save_profile(uid, profile=None, facts=None, note="", excluded="", err=""):
             if excluded:
                 lead["excluded"] = excluded[:200]
         write_json(LEADS, data)
+
+
+def skip_new(why):
+    """
+    Новый запрос автопилота: чаты прошлого, до которых не дошли, — в «пропущен»
+    (кнопка «перечитать» вернёт), а у прошлых каналов похожие больше не ищем.
+    """
+    def fn(data):
+        n = 0
+        for v in data.values():
+            if v.get("status") == "new":
+                v.update(status="skipped", err=why, at=now_iso())
+                n += 1
+            if v.get("kind") == "channel" and not v.get("similar"):
+                v["similar"] = True
+        return n
+    return _update(fn)
 
 
 def retry(keys):
@@ -395,6 +421,7 @@ if __name__ == "__main__":
     #   python enrich.py retry <ключ> [ключ…]
     #   python enrich.py remove <ключ> [ключ…]
     #   python enrich.py release <ключ> <читатель> [ключ читатель…]
+    #   python enrich.py skip-new <причина>
     import sys
     cmd, rest = (sys.argv[1] if len(sys.argv) > 1 else ""), sys.argv[2:]
     if cmd == "add" and rest:
@@ -407,5 +434,7 @@ if __name__ == "__main__":
         print(json.dumps({"ok": True, "n": remove(rest)}))
     elif cmd == "release":
         print(json.dumps({"ok": True, "n": release(list(zip(rest[::2], rest[1::2])))}))
+    elif cmd == "skip-new":
+        print(json.dumps({"ok": True, "n": skip_new(" ".join(rest) or "прошлый запрос")}))
     else:
         print(json.dumps({"ok": False, "reason": "команды: add <файл> | retry <ключи> | remove <ключи>"}))

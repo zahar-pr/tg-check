@@ -150,37 +150,54 @@ def _clean(d):
             "facts": facts, "note": str(d.get("note") or "")}
 
 
-_DEC = json.JSONDecoder()
+# strict=False: заметку в markdown модели пишут с настоящими переносами строк
+# прямо внутри JSON-строки — строгий разбор счёл бы такой ответ мусором
+_DEC = json.JSONDecoder(strict=False)
 
 
-def verdict(out):
+def verdict(out, final=True):
     """
     JSON-вердикт из ответа модели. Модели с рассуждениями пишут ход мыслей
-    прямо в ответ (TECH-BASE.md, §8), и фигурные скобки бывают и там — поэтому
-    берём ПОСЛЕДНИЙ объект, который начинается с "lead" и честно разбирается
-    как JSON (внутри него бывают вложенные facts — регулярка их не осилит).
-    Строку формата из промпта («true|false») вердиктом не считаем.
+    прямо в ответ (TECH-BASE.md, §8), там бывают и черновые вердикты — поэтому
+    в счёт идёт только ПОСЛЕДНИЙ объект, который начинается с "lead" (внутри
+    него бывают вложенные facts — регулярка их не осилит). Строку формата из
+    промпта («true|false») вердиктом не считаем.
+
+    Последний объект не закрыт — ответ обрезан по токенам. Если это не последняя
+    попытка (final=False), вернём None: ask() повторит с запасом. На последней
+    спасаем что успели: lead, score, why, facts (они идут до заметки и обычно
+    целы) и начало заметки. Лид без целой оценки не спасаем — уверенности нет.
     """
     out = out or ""
     starts = list(re.finditer(r'\{\s*"lead"\s*:\s*(true|false)\b(?!\s*\|)', out))
-    for m in reversed(starts):
-        try:
-            d, _ = _DEC.raw_decode(out, m.start())
-        except ValueError:
-            continue
-        if isinstance(d, dict) and "lead" in d:
-            return _clean(d)
     if not starts:
         return None
-    # ответ обрезан на длинной заметке: JSON не закрыт, но «lead» уже сказан
     m = starts[-1]
+    try:
+        d, _ = _DEC.raw_decode(out, m.start())
+        if isinstance(d, dict) and "lead" in d:
+            return _clean(d)
+    except ValueError:
+        pass
+    if not final:
+        return None
     def field(name):
         f = re.compile(r'"%s"\s*:\s*"((?:[^"\\]|\\.)*)' % name, re.S).search(out, m.end())
         return f.group(1).replace("\\n", "\n") if f else ""
-    sc = re.compile(r'"score"\s*:\s*(\d+)').search(out, m.end())
+    lead = m.group(1) == "true"
+    sc = re.compile(r'"score"\s*:\s*(\d+)\s*[,}\s]').search(out, m.end())   # «9» от обрезанного «90» не в счёт
+    if lead and not sc:
+        return None
+    facts = None
+    f = re.compile(r'"facts"\s*:\s*(?=\{)').search(out, m.end())
+    if f:
+        try:
+            facts, _ = _DEC.raw_decode(out, f.end())
+        except ValueError:
+            pass
     note = field("note")
-    return _clean({"lead": m.group(1) == "true", "score": sc.group(1) if sc else None,
-                   "why": field("why"), "note": (note + " …") if note else ""})
+    return _clean({"lead": lead, "score": sc.group(1) if sc else 0, "why": field("why"),
+                   "facts": facts, "note": (note + " …") if note else ""})
 
 
 class Fail:
@@ -205,13 +222,14 @@ ACCOUNT_CODES = {"401", "402", "403", "429", ""}
 
 def ask(system, text):
     """Вердикт модели по одному куску окон — или Fail."""
-    for tokens in (1200, 2500):
+    budgets = (1200, 2500)
+    for n, tokens in enumerate(budgets):
         info = {}
         out = llm.chat(system, text, max_tokens=tokens, temperature=0.2, info=info)
         if out is None:
             code = str(info.get("code", ""))
             return Fail("req" if code in ("400", "413") else "out", code)
-        v = verdict(out)
+        v = verdict(out, final=n == len(budgets) - 1)
         if v:
             return v
     return Fail("bad")
