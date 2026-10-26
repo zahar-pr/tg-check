@@ -152,7 +152,7 @@ aside { border-left: 1px solid var(--line); background: var(--panel); overflow-y
     <span class="pill" id="ctx" title="Сколько памяти беседы занято. Ближе к 100% агент сожмёт начало — лучше начать новую беседу.">контекст —</span>
     <span class="pill" id="cost" title="Оценка по ценам API. Точно — platform.claude.com/usage">$0.00</span>
     <button class="btn" id="history">История</button>
-    <button class="btn" id="newchat">Новая беседа</button>
+    <button class="btn" id="newchat" title="Начать новую беседу">+ Новая</button>
     <button class="btn side-toggle" id="sidetog">Сервер ▸</button>
   </header>
   <div class="main">
@@ -384,7 +384,7 @@ function setState(s) {
   $('#models').querySelectorAll('button').forEach((b) => b.onclick = () => { send({ type: 'model', model: b.dataset.m }); toast('Модель: ' + b.textContent); });
   $('#auto').checked = !!s.auto;
   const c = s.cost, pct = Math.min(100, c.month / c.budget * 100);
-  $('#cost').innerHTML = `<b>$${c.session < 0.1 ? c.session.toFixed(3) : c.session.toFixed(2)}</b> беседа · <b>$${c.month.toFixed(2)}</b> из $${c.budget} за месяц<span class="bar"><i style="width:${pct}%;background:${pct > 80 ? 'var(--red)' : pct > 50 ? 'var(--yellow)' : 'var(--green)'}"></i></span>`;
+  $('#cost').innerHTML = `<b>$${c.session < 0.1 ? c.session.toFixed(3) : c.session.toFixed(2)}</b> беседа · <b>$${c.month.toFixed(2)}</b> / $${c.budget} мес.<span class="bar"><i style="width:${pct}%;background:${pct > 80 ? 'var(--red)' : pct > 50 ? 'var(--yellow)' : 'var(--green)'}"></i></span>`;
   $('#ctx').innerHTML = s.context == null ? 'контекст —' : `контекст <b style="color:${s.context > 75 ? 'var(--red)' : s.context > 50 ? 'var(--yellow)' : 'var(--text)'}">${Math.round(s.context)}%</b>`;
   $('#typing').classList.toggle('on', !!s.busy);
   const sb = $('#send'); sb.textContent = s.busy ? 'Стоп' : 'Отправить'; sb.classList.toggle('primary', !s.busy); sb.classList.toggle('danger', !!s.busy);
@@ -398,7 +398,7 @@ function setState(s) {
   $('#todocard').style.display = td.length ? '' : 'none';
   $('#todos').innerHTML = td.map((x) => `<div class="todo ${esc(x.status)}">${x.status === 'completed' ? '✔' : x.status === 'in_progress' ? '▸' : '○'} ${esc(x.status === 'in_progress' ? (x.activeForm || x.content) : x.content)}</div>`).join('');
   modal('#m-key', !s.key);
-  if (s.fake) $('.brand small').textContent = '· tg-panel · проверка без API';
+  if (s.fake) $('.brand small').textContent = '· тест';
 }
 
 // ── связь ──
