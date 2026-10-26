@@ -3,6 +3,8 @@
 # Работа с панелью прямо с ноутбука: код лежит тут, живёт на сервере.
 #
 #     ./tg pull            забрать с сервера свежий код (правки владельца вольются к твоим)
+#     ./tg data [--big]    копия данных сервера в server-data/ (.env, сессии, база…);
+#                          --big — и файлы больше 1 МБ
 #     ./tg ship            выложить на сервер то, что поменял ты
 #     ./tg ship --restart  то же и перезапустить панель, даже если менялся только Python
 #     ./tg status          что поменял ты и что нового на сервере — ничего не трогая
@@ -35,7 +37,7 @@ BACKUPS="${TG_BACKUPS:-/root/tg-ship-backups}"
 ME="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/$(basename "${BASH_SOURCE[0]}")"
 DIR="$(dirname "$ME")"
 # эти файлы нужны только тут: на сервер их не возим
-LOCAL_ONLY='^(tests/|\.claude/|\.tools/|CLAUDE\.md$|tg$|ai$|venv|node_modules/)'
+LOCAL_ONLY='^(tests/|\.claude/|\.tools/|server-data/|CLAUDE\.md$|tg$|ai$|venv|node_modules/)'
 
 say() { printf '\n\033[1m%s\033[0m\n' "$*"; }
 note() { printf '  %s\n' "$*"; }
@@ -169,7 +171,8 @@ cmd_init() {
   git -C "$DIR" init -q && git -C "$DIR" symbolic-ref HEAD refs/heads/main
   git -C "$DIR" config user.name >/dev/null || git -C "$DIR" config user.name "tg-panel"
   git -C "$DIR" config user.email >/dev/null || git -C "$DIR" config user.email "tg-panel@laptop"
-  printf '%s\n' 'venv*/' 'node_modules/' '__pycache__/' '*.pyc' '.claude/settings.local.json' >> "$DIR/.git/info/exclude"
+  printf '%s\n' 'venv*/' 'node_modules/' '__pycache__/' '*.pyc' '.claude/settings.local.json' '/server-data/' '/.server-data.*/' '/server-data.old/' \
+    >> "$DIR/.git/info/exclude"
   snapshot "сервер $(now)" >/dev/null
   git -C "$DIR" checkout -q -B main server
   note "файлов кода: $(G ls-files | wc -l | tr -d ' ')"
@@ -193,6 +196,8 @@ AI
     [ -f "$from/docs/NEXT.md" ] && mkdir -p "$DIR/docs" && cp "$from/docs/NEXT.md" "$DIR/docs/NEXT.md"
   fi
   git -C "$DIR" add -A && git -C "$DIR" commit -qm "инструменты для работы с ноутбука"
+  say "+    Данные сервера"
+  cmd_data
   say "3/3  Готово"
   cat <<TXT
   Папка: $DIR
@@ -202,6 +207,41 @@ AI
     ./ai             агент на кредиты Console: пиши, что сделать; выложить — «выложи»
     claude           то же в Claude Code (платит твоя подписка)
 TXT
+}
+
+# Данные сервера — копией в server-data/: .env, сессии, реестр, база, лиды,
+# второй профиль. Не в git (меняются каждую минуту) и на сервер не возятся
+# никогда. Отдельной папкой, а не поверх кода: панель или задача, запущенная
+# тут, иначе подхватила бы те же сессии — а один ключ Telegram сразу из двух
+# мест Telegram отзывает (AUTH_KEY_DUPLICATED), и аккаунт вылетает.
+cmd_data() {
+  local big=0; [ "${1:-}" = --big ] && big=1
+  local to="$DIR/server-data" tmp err lst rl="/tmp/tg-data-$$.list"
+  tmp="$(mktemp -d "$DIR/.server-data.XXXX")"; err="$(mktemp)"; lst="$(mktemp)"
+  # код уже лежит в git — второй раз его не тянем
+  G ls-tree -r --name-only server | sed 's|^|./|' > "$lst"
+  on "cat > $rl" < "$lst"; rm -f "$lst"
+  local remote="set -e; cd $(printf %q "$REMOTE"); big=\$(mktemp); trap 'rm -f \"\$big\" $rl' EXIT
+[ $big = 1 ] || find . \\( -name venv -o -name venv-tg -o -name node_modules -o -name .git -o -name __pycache__ \\) -prune \\
+  -o -type f -size +1M -printf '%P\\n' > \"\$big\"
+[ -s \"\$big\" ] && while IFS= read -r f; do printf 'BIG %s  %s\\n' \"\$(du -h \"\$f\" | cut -f1)\" \"\$f\" >&2; done < \"\$big\"
+tar czf - --warning=no-file-changed --anchored --no-wildcards --exclude-from=$rl \\
+  --no-anchored --wildcards --exclude-from=\"\$big\" --exclude=./venv --exclude=./venv-tg --exclude=node_modules \\
+  --exclude=__pycache__ --exclude='*.pyc' --exclude=.git . || [ \$? = 1 ]"
+  if ! on "$remote" 2>"$err" | tar xzf - -C "$tmp" 2>>"$err"; then
+    grep -v '^BIG ' "$err" >&2 || true
+    rm -rf "$tmp" "$err"; die "не смог забрать данные с сервера"
+  fi
+  chmod 700 "$tmp"
+  rm -rf "$to.old"; [ ! -e "$to" ] || mv "$to" "$to.old"; mv "$tmp" "$to"; rm -rf "$to.old"
+  note "данные — в server-data/: $(du -sh "$to" | cut -f1), файлов $(find "$to" -type f | wc -l | tr -d ' ')"
+  if grep -q '^BIG ' "$err"; then
+    note "не взял файлы больше 1 МБ (взять и их: ./tg data --big):"
+    grep '^BIG ' "$err" | cut -c5- | head -15 | sed 's/^/      /'
+    [ "$(grep -c '^BIG ' "$err")" -le 15 ] || note "    …и ещё $(( $(grep -c '^BIG ' "$err") - 15 ))"
+  fi
+  rm -f "$err"
+  note "это копия только для чтения: с этими сессиями отсюда в Telegram не ходи"
 }
 
 cmd_pull() {
@@ -438,5 +478,6 @@ case "${1:-}" in
   venv) cmd_venv ;;
   test) cmd_test ;;
   agent) cmd_agent ;;
-  *) sed -n '3,15p' "$ME" | sed 's/^# \{0,1\}//'; exit 1 ;;
+  data) shift; cmd_data "$@" ;;
+  *) sed -n '3,17p' "$ME" | sed 's/^# \{0,1\}//'; exit 1 ;;
 esac

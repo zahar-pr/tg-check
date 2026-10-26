@@ -35,8 +35,19 @@ CFG
   chmod 600 "$HOME/.ssh/config"
   echo "  в ~/.ssh/config добавлен tg-server"
 fi
-ssh -o BatchMode=yes -o ConnectTimeout=15 -o StrictHostKeyChecking=accept-new tg-server true \
-  || die "сервер не пускает по ключу ~/.ssh/id_ed25519. Проверь: ssh root@46.16.15.238 hostname"
+if ! out="$(ssh -o BatchMode=yes -o ConnectTimeout=15 -o StrictHostKeyChecking=accept-new tg-server true 2>&1)"; then
+  printf '%s\n' "$out" | tail -3 | sed 's/^/  /'
+  case "$out" in
+    *kex_exchange_identification*|*"closed by remote host"*|*"Connection reset"*)
+      die "сервер обрывает соединение ещё до проверки ключа. Так бывает, когда sshd
+  оштрафовал адрес за неудачные входы (OpenSSH 9.8+) или адрес в блоке — часто это
+  адрес VPN. Узнай свой адрес: curl -s https://ifconfig.me ; и разреши его на сервере
+  (в Термиусе) — команда в переписке с Claude. Потом запусти эту установку снова." ;;
+    *"Permission denied"*)
+      die "сервер не принял ключ ~/.ssh/id_ed25519 — его открытой части нет в /root/.ssh/authorized_keys" ;;
+    *) die "не подключился к серверу. Проверь: ssh root@46.16.15.238 hostname" ;;
+  esac
+fi
 echo "  пускает по ключу"
 
 say "2/3  Рабочая папка $TARGET"
