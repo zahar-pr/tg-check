@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 #
 # Один раз на ноутбуке: рабочая папка с кодом сервера, синхронизация и агент.
+# Запускать С ВЫКЛЮЧЕННЫМ VPN: сервер адрес VPN не пускает.
 #
 #     curl -fsSL https://raw.githubusercontent.com/zahar-pr/tg-check/<коммит>/deploy/laptop/setup.sh | bash -s -- <коммит>
 #
@@ -39,10 +40,9 @@ if ! out="$(ssh -o BatchMode=yes -o ConnectTimeout=15 -o StrictHostKeyChecking=a
   printf '%s\n' "$out" | tail -3 | sed 's/^/  /'
   case "$out" in
     *kex_exchange_identification*|*"closed by remote host"*|*"Connection reset"*)
-      die "сервер обрывает соединение ещё до проверки ключа. Так бывает, когда sshd
-  оштрафовал адрес за неудачные входы (OpenSSH 9.8+) или адрес в блоке — часто это
-  адрес VPN. Узнай свой адрес: curl -s https://ifconfig.me ; и разреши его на сервере
-  (в Термиусе) — команда в переписке с Claude. Потом запусти эту установку снова." ;;
+      die "сервер обрывает соединение ещё до проверки ключа. Почти всегда это VPN:
+  его адрес сервер не пускает. Выключи VPN и запусти установку снова.
+  Если и без VPN так же — пришли этот вывод Claude." ;;
     *"Permission denied"*)
       die "сервер не принял ключ ~/.ssh/id_ed25519 — его открытой части нет в /root/.ssh/authorized_keys" ;;
     *) die "не подключился к серверу. Проверь: ssh root@46.16.15.238 hostname" ;;
@@ -62,6 +62,8 @@ say "3/3  Агент"
 cat <<TXT
 
 Всё. Дальше:
-    cd $TARGET
-    ./ai          агент на кредиты Console (спросит API-ключ один раз)
+    включи VPN
+    cd $TARGET && ./ai      агент на кредиты Console (спросит API-ключ один раз)
+
+  Выложить то, что сделал агент: выключи VPN → cd $TARGET && ./tg ship → включи VPN
 TXT
