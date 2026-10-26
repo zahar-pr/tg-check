@@ -1,0 +1,520 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Агент · tg-panel</title>
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='8' fill='%235a68e8'/%3E%3Cpath d='M9 22l5-12h4l5 12h-3.5l-1-2.6h-5l-1 2.6z' fill='white'/%3E%3C/svg%3E">
+<style>
+:root {
+  --bg: #0e1120; --panel: #151a2e; --panel2: #1b2138; --line: #262d4a; --text: #e7e9f4; --muted: #99a0bb;
+  --accent: #7d8bff; --accent2: #5a68e8; --green: #3fcf8e; --red: #ff6b6b; --yellow: #f2c35b; --mono: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+}
+* { box-sizing: border-box; }
+html, body { height: 100%; margin: 0; background: var(--bg); color: var(--text); font: 15px/1.5 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; }
+button { font: inherit; color: inherit; cursor: pointer; }
+a { color: var(--accent); }
+.app { display: grid; grid-template-rows: auto 1fr; height: 100%; }
+header { display: flex; align-items: center; gap: 10px; padding: 10px 16px; border-bottom: 1px solid var(--line); background: var(--panel); flex-wrap: wrap; }
+.brand { font-weight: 700; letter-spacing: .2px; margin-right: 6px; white-space: nowrap; }
+.brand small { color: var(--muted); font-weight: 400; }
+.seg { display: inline-flex; background: var(--bg); border: 1px solid var(--line); border-radius: 10px; padding: 3px; }
+.seg button { border: 0; background: transparent; padding: 5px 11px; border-radius: 7px; color: var(--muted); white-space: nowrap; }
+.seg button.on { background: var(--accent2); color: #fff; }
+.pill { display: inline-flex; align-items: center; gap: 8px; padding: 5px 11px; border: 1px solid var(--line); border-radius: 999px; background: var(--bg); color: var(--muted); white-space: nowrap; font-size: 13.5px; }
+.pill b { color: var(--text); font-weight: 600; }
+.bar { width: 70px; height: 5px; background: var(--line); border-radius: 3px; overflow: hidden; }
+.bar i { display: block; height: 100%; background: var(--green); }
+.sw { display: inline-flex; align-items: center; gap: 8px; color: var(--muted); font-size: 13.5px; cursor: pointer; user-select: none; white-space: nowrap; }
+.sw input { display: none; }
+.sw span.t { width: 34px; height: 20px; background: var(--line); border-radius: 999px; position: relative; transition: .2s; }
+.sw span.t::after { content: ""; position: absolute; left: 3px; top: 3px; width: 14px; height: 14px; border-radius: 50%; background: #fff; transition: .2s; }
+.sw input:checked + span.t { background: var(--green); }
+.sw input:checked + span.t::after { left: 17px; }
+.grow { flex: 1; }
+.btn { border: 1px solid var(--line); background: var(--panel2); padding: 5px 11px; border-radius: 9px; white-space: nowrap; font-size: 14px; }
+.btn:hover { border-color: var(--accent); }
+.btn.primary { background: var(--accent2); border-color: var(--accent2); color: #fff; font-weight: 600; }
+.btn.danger { color: var(--red); }
+.btn:disabled { opacity: .45; cursor: default; }
+.btn.pulse { animation: pulse 1.6s infinite; }
+@keyframes pulse { 0%,100% { box-shadow: 0 0 0 0 rgba(125,139,255,.6);} 50% { box-shadow: 0 0 0 7px rgba(125,139,255,0);} }
+.main { display: grid; grid-template-columns: 1fr 370px; min-height: 0; }
+.chatcol { display: grid; grid-template-rows: 1fr auto; min-height: 0; }
+#chat { overflow-y: auto; padding: 22px 16px 12px; }
+.feed { max-width: 860px; margin: 0 auto; display: flex; flex-direction: column; gap: 10px; }
+.msg-user { align-self: flex-end; max-width: 80%; background: var(--accent2); color: #fff; padding: 9px 14px; border-radius: 16px 16px 4px 16px; white-space: pre-wrap; word-break: break-word; }
+.msg-user img { max-width: 220px; max-height: 160px; border-radius: 8px; display: block; margin-top: 6px; }
+.msg-ai { padding: 2px 2px; word-break: break-word; }
+.msg-ai p { margin: .45em 0; }
+.msg-ai h1, .msg-ai h2, .msg-ai h3 { font-size: 1.05em; margin: .8em 0 .3em; }
+.msg-ai code { font-family: var(--mono); font-size: .9em; background: var(--panel2); padding: 1px 5px; border-radius: 5px; }
+.msg-ai pre.code { background: #0a0d18; border: 1px solid var(--line); padding: 10px 12px; border-radius: 10px; overflow-x: auto; }
+.msg-ai pre.code code { background: none; padding: 0; }
+.msg-ai table { border-collapse: collapse; margin: .5em 0; font-size: .93em; display: block; overflow-x: auto; }
+.msg-ai th, .msg-ai td { border: 1px solid var(--line); padding: 5px 9px; text-align: left; vertical-align: top; }
+.msg-ai th { background: var(--panel2); }
+.msg-ai ul, .msg-ai ol { margin: .4em 0; padding-left: 1.4em; }
+.msg-ai blockquote { margin: .5em 0; padding-left: 12px; border-left: 3px solid var(--line); color: var(--muted); }
+.tool { border: 1px solid var(--line); background: var(--panel); border-radius: 10px; font-size: 13.5px; }
+.tool.sub { margin-left: 22px; opacity: .8; }
+.tool > .head { display: flex; gap: 9px; align-items: center; padding: 6px 10px; cursor: pointer; }
+.tool .ic { width: 20px; text-align: center; }
+.tool .nm { color: var(--muted); white-space: nowrap; }
+.tool .sm { font-family: var(--mono); font-size: 12.5px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; flex: 1; }
+.tool .st { font-size: 12px; color: var(--muted); }
+.tool .st.ok { color: var(--green); } .tool .st.err { color: var(--red); }
+.tool .body { display: none; border-top: 1px solid var(--line); padding: 8px 10px; }
+.tool.open .body { display: block; }
+.tool pre, .console pre, .diff { font-family: var(--mono); font-size: 12.5px; white-space: pre-wrap; word-break: break-word; margin: 0; max-height: 360px; overflow: auto; }
+.d-add { color: var(--green); } .d-del { color: var(--red); } .d-hunk { color: var(--accent); } .d-meta { color: var(--muted); }
+.ask { border: 1px solid var(--yellow); background: rgba(242,195,91,.07); border-radius: 12px; padding: 10px 12px; }
+.ask.risky { border-color: var(--red); background: rgba(255,107,107,.07); }
+.ask .q { font-weight: 600; margin-bottom: 4px; }
+.ask pre { font-family: var(--mono); font-size: 12.5px; white-space: pre-wrap; background: #0a0d18; padding: 8px 10px; border-radius: 8px; margin: 6px 0; }
+.ask .row { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; }
+.ask input { flex: 1; min-width: 160px; background: var(--bg); border: 1px solid var(--line); color: var(--text); padding: 6px 9px; border-radius: 8px; }
+.ask.done { opacity: .6; }
+.meta { color: var(--muted); font-size: 12.5px; align-self: flex-start; }
+.info { color: var(--muted); font-size: 13px; text-align: center; }
+.err { color: var(--red); font-size: 13.5px; border: 1px solid rgba(255,107,107,.4); padding: 7px 10px; border-radius: 9px; }
+.typing { color: var(--muted); font-size: 13.5px; display: none; }
+.typing.on { display: block; }
+.typing i { animation: blink 1.2s infinite; font-style: normal; }
+@keyframes blink { 50% { opacity: .2; } }
+.empty { color: var(--muted); text-align: center; margin-top: 12vh; }
+.empty h2 { color: var(--text); font-weight: 600; }
+.empty .ex { display: inline-block; margin: 4px; padding: 7px 12px; border: 1px solid var(--line); border-radius: 10px; cursor: pointer; background: var(--panel); color: var(--text); }
+.composer { border-top: 1px solid var(--line); padding: 10px 16px 14px; background: var(--panel); }
+.composer .box { max-width: 860px; margin: 0 auto; border: 1px solid var(--line); background: var(--bg); border-radius: 14px; padding: 8px; }
+.composer .box:focus-within { border-color: var(--accent); }
+.composer textarea { width: 100%; resize: none; border: 0; outline: 0; background: transparent; color: var(--text); font: inherit; min-height: 26px; max-height: 260px; padding: 4px 6px; }
+.composer .row { display: flex; align-items: center; gap: 8px; }
+.composer .hint { color: var(--muted); font-size: 12.5px; flex: 1; }
+.thumbs { display: flex; gap: 6px; flex-wrap: wrap; }
+.thumbs div { position: relative; }
+.thumbs img { height: 56px; border-radius: 7px; border: 1px solid var(--line); }
+.thumbs button { position: absolute; top: -6px; right: -6px; width: 20px; height: 20px; border-radius: 50%; border: 0; background: var(--red); color: #fff; font-size: 12px; line-height: 20px; padding: 0; }
+aside { border-left: 1px solid var(--line); background: var(--panel); overflow-y: auto; padding: 14px; display: flex; flex-direction: column; gap: 14px; }
+.card { border: 1px solid var(--line); border-radius: 12px; padding: 12px; background: var(--bg); }
+.card h3 { margin: 0 0 8px; font-size: 13px; text-transform: uppercase; letter-spacing: .6px; color: var(--muted); display: flex; align-items: center; gap: 8px; }
+.card h3 .grow { flex: 1; }
+.dot { width: 9px; height: 9px; border-radius: 50%; background: var(--muted); display: inline-block; }
+.dot.ok { background: var(--green); } .dot.bad { background: var(--red); } .dot.wait { background: var(--yellow); }
+.srv { display: flex; gap: 8px; align-items: center; font-size: 13.5px; margin-bottom: 10px; }
+.grid2 { display: grid; grid-template-columns: 1fr 1fr; gap: 7px; }
+.grid2 .btn { font-size: 13.5px; padding: 7px 8px; }
+.grid2 .wide { grid-column: span 2; }
+.files { display: flex; flex-direction: column; gap: 3px; font-size: 13px; }
+.files a { display: flex; gap: 8px; color: var(--text); text-decoration: none; padding: 3px 5px; border-radius: 6px; cursor: pointer; }
+.files a:hover { background: var(--panel2); }
+.files .p { font-family: var(--mono); font-size: 12.5px; flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.files .n { color: var(--green); font-size: 12px; } .files .m { color: var(--red); font-size: 12px; }
+.todo { font-size: 13.5px; display: flex; gap: 8px; padding: 2px 0; }
+.todo.completed { color: var(--muted); text-decoration: line-through; }
+.todo.in_progress { color: var(--yellow); }
+.console pre { background: #0a0d18; border-radius: 8px; padding: 8px 10px; max-height: 300px; color: #cfd3e6; }
+.muted { color: var(--muted); font-size: 13px; }
+.modal { position: fixed; inset: 0; background: rgba(5,7,15,.7); display: none; align-items: center; justify-content: center; padding: 16px; z-index: 20; }
+.modal.on { display: flex; }
+.modal .win { background: var(--panel); border: 1px solid var(--line); border-radius: 14px; width: min(860px, 100%); max-height: 86vh; display: flex; flex-direction: column; }
+.modal .win.small { width: min(460px, 100%); }
+.modal .top { display: flex; align-items: center; gap: 10px; padding: 12px 14px; border-bottom: 1px solid var(--line); font-weight: 600; }
+.modal .cnt { padding: 14px; overflow: auto; }
+.modal .bot { display: flex; gap: 8px; justify-content: flex-end; padding: 12px 14px; border-top: 1px solid var(--line); }
+.modal input[type=password], .modal input[type=text] { width: 100%; background: var(--bg); border: 1px solid var(--line); color: var(--text); padding: 9px 11px; border-radius: 9px; font: inherit; }
+.list a { display: block; padding: 8px 10px; border-radius: 8px; color: var(--text); text-decoration: none; cursor: pointer; }
+.list a:hover { background: var(--panel2); }
+.list small { color: var(--muted); display: block; }
+#toast { position: fixed; bottom: 18px; left: 50%; transform: translateX(-50%); background: var(--panel2); border: 1px solid var(--line); padding: 9px 16px; border-radius: 10px; display: none; z-index: 30; max-width: 90vw; }
+#toast.on { display: block; }
+.side-toggle { display: none; }
+@media (max-width: 980px) {
+  .main { grid-template-columns: 1fr; }
+  aside { position: fixed; right: 0; top: 0; bottom: 0; width: min(380px, 92vw); z-index: 15; transform: translateX(100%); transition: .2s; box-shadow: -10px 0 30px rgba(0,0,0,.4); }
+  aside.on { transform: none; }
+  .side-toggle { display: inline-block; }
+}
+@media (max-width: 700px) {
+  header { gap: 7px; padding: 8px 10px; }
+  #ctx, .brand small, .bar { display: none; }
+  .seg button { padding: 4px 8px; }
+}
+</style>
+</head>
+<body>
+<div class="app">
+  <header>
+    <div class="brand">Агент <small>· tg-panel</small></div>
+    <div class="seg" id="models"></div>
+    <label class="sw" title="Агент не спрашивает разрешения на обычные команды. Опасное (ssh, sudo, выкладка, удаление вне папки) спросит всё равно."><input type="checkbox" id="auto"><span class="t"></span>Без вопросов</label>
+    <div class="grow"></div>
+    <span class="pill" id="ctx" title="Сколько памяти беседы занято. Ближе к 100% агент сожмёт начало — лучше начать новую беседу.">контекст —</span>
+    <span class="pill" id="cost" title="Оценка по ценам API. Точно — platform.claude.com/usage">$0.00</span>
+    <button class="btn" id="history">История</button>
+    <button class="btn" id="newchat">Новая беседа</button>
+    <button class="btn side-toggle" id="sidetog">Сервер ▸</button>
+  </header>
+  <div class="main">
+    <div class="chatcol">
+      <div id="chat"><div class="feed" id="feed"></div><div class="feed"><div class="typing" id="typing"><i>агент работает…</i></div></div></div>
+      <div class="composer">
+        <div class="box">
+          <div class="thumbs" id="thumbs"></div>
+          <textarea id="input" rows="1" placeholder="Что сделать? Можно вставить скриншот (Ctrl+V)"></textarea>
+          <div class="row">
+            <span class="hint" id="hint">Enter — отправить · Shift+Enter — новая строка</span>
+            <button class="btn primary" id="send">Отправить</button>
+          </div>
+        </div>
+      </div>
+    </div>
+    <aside id="side">
+      <div class="card">
+        <h3>Сервер <span class="grow"></span><button class="btn" id="check" style="padding:2px 9px;font-size:12px">проверить</button></h3>
+        <div class="srv"><span class="dot" id="sdot"></span><span id="stext">связь не проверяли</span></div>
+        <div class="grid2">
+          <button class="btn primary wide" id="c-ship">Выложить на сервер</button>
+          <button class="btn" id="c-pull">Забрать код</button>
+          <button class="btn" id="c-logs">Журнал панели</button>
+          <button class="btn" id="c-data">Обновить данные</button>
+          <button class="btn" id="c-status">Что отличается</button>
+          <button class="btn danger wide" id="c-undo">Откатить последнюю выкладку</button>
+        </div>
+        <p class="muted" style="margin:10px 0 0">Сервер пускает только <b>без VPN</b>. Выключи VPN → нажми кнопку → дождись «готово» → включи VPN.</p>
+      </div>
+      <div class="card">
+        <h3>Ещё не на сервере <span class="grow"></span><button class="btn" id="refresh" style="padding:2px 9px;font-size:12px">обновить</button></h3>
+        <div class="files" id="files"><span class="muted">—</span></div>
+      </div>
+      <div class="card" id="todocard" style="display:none">
+        <h3>План агента</h3>
+        <div id="todos"></div>
+      </div>
+      <div class="card console">
+        <h3><span id="ctitle">Вывод команд</span><span class="grow"></span><span class="dot" id="cdot"></span></h3>
+        <pre id="cout"><span class="muted">здесь будет вывод «Выложить», «Забрать», «Журнал»…</span></pre>
+      </div>
+      <button class="btn" id="quit" style="align-self:flex-start">Выключить пульт</button>
+    </aside>
+  </div>
+</div>
+
+<div class="modal" id="m-key"><div class="win small">
+  <div class="top">API-ключ</div>
+  <div class="cnt">
+    <p class="muted" style="margin-top:0">Ключ из Console (platform.claude.com → API keys), начинается с <code>sk-ant-</code>. Хранится только на этом компьютере: <code>~/.tg-agent/key</code>.</p>
+    <input type="password" id="keyin" placeholder="sk-ant-…" autocomplete="off">
+    <p class="err" id="keyerr" style="display:none;margin-bottom:0"></p>
+  </div>
+  <div class="bot"><button class="btn primary" id="keysave">Сохранить</button></div>
+</div></div>
+
+<div class="modal" id="m-diff"><div class="win">
+  <div class="top"><span id="dtitle" class="grow" style="font-family:var(--mono);font-size:13px"></span><button class="btn" data-close>Закрыть</button></div>
+  <div class="cnt"><pre class="diff" id="dbody" style="max-height:none"></pre></div>
+</div></div>
+
+<div class="modal" id="m-hist"><div class="win small">
+  <div class="top"><span class="grow">Прошлые беседы</span><button class="btn" data-close>Закрыть</button></div>
+  <div class="cnt list" id="hlist"><span class="muted">загружаю…</span></div>
+</div></div>
+
+<div class="modal" id="m-confirm"><div class="win small">
+  <div class="top" id="cftitle"></div>
+  <div class="cnt" id="cfbody"></div>
+  <div class="bot"><button class="btn" data-close>Отмена</button><button class="btn primary" id="cfok">Поехали</button></div>
+</div></div>
+
+<div id="toast"></div>
+
+<script>
+const TOKEN = new URLSearchParams(location.search).get('t') || sessionStorage.getItem('tg-agent-t') || '';
+sessionStorage.setItem('tg-agent-t', TOKEN);
+const $ = (s) => document.querySelector(s);
+const esc = (s) => String(s ?? '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+let S = {}, ws, live = null, liveText = '', tools = {}, images = [], lastAssistant = '';
+
+async function api(path, opts = {}) {
+  const r = await fetch(path, { ...opts, headers: { 'X-Token': TOKEN, 'Content-Type': 'application/json', ...(opts.headers || {}) } });
+  let d = {}; try { d = await r.json(); } catch {}
+  if (!r.ok) d.error = d.error || ('ошибка ' + r.status);
+  return d;
+}
+function toast(t, ms = 3500) { const el = $('#toast'); el.textContent = t; el.classList.add('on'); clearTimeout(el._t); el._t = setTimeout(() => el.classList.remove('on'), ms); }
+function modal(id, on = true) { $(id).classList.toggle('on', on); }
+document.querySelectorAll('[data-close]').forEach((b) => b.onclick = () => b.closest('.modal').classList.remove('on'));
+document.querySelectorAll('.modal').forEach((m) => m.addEventListener('mousedown', (e) => { if (e.target === m && m.id !== 'm-key') m.classList.remove('on'); }));
+
+// ── markdown без библиотек: код, таблицы, списки, заголовки, цитаты ──
+function inline(s) {
+  return esc(s).replace(/`([^`]+)`/g, '<code>$1</code>').replace(/\*\*([^*]+)\*\*/g, '<b>$1</b>')
+    .replace(/(^|[\s(])\*([^*\s][^*]*?)\*(?=[\s).,!?:;]|$)/g, '$1<i>$2</i>')
+    .replace(/\[([^\]]+)\]\((https?:\/\/[^)\s]+)\)/g, '<a href="$2" target="_blank" rel="noopener">$1</a>');
+}
+function md(src) {
+  src = String(src || '');
+  if ((src.match(/```/g) || []).length % 2) src += '\n```';
+  const codes = [];
+  src = src.replace(/```[^\n`]*\n?([\s\S]*?)```/g, (m, code) => { codes.push(`<pre class="code"><code>${esc(code.replace(/\n$/, ''))}</code></pre>`); return `\n\u0000${codes.length - 1}\u0000\n`; });
+  const L = src.split('\n'), out = []; let i = 0;
+  const isRow = (s) => /^\s*\|.*\|\s*$/.test(s);
+  while (i < L.length) {
+    const l = L[i];
+    let m;
+    if (/^\u0000\d+\u0000$/.test(l.trim())) { out.push(codes[+l.trim().slice(1, -1)]); i++; continue; }
+    if (!l.trim()) { i++; continue; }
+    if ((m = l.match(/^(#{1,4})\s+(.*)/))) { out.push(`<h3>${inline(m[2])}</h3>`); i++; continue; }
+    if (/^\s*(---|\*\*\*)\s*$/.test(l)) { out.push('<hr>'); i++; continue; }
+    if (isRow(l) && i + 1 < L.length && /^\s*\|?\s*:?-{2,}/.test(L[i + 1])) {
+      const cells = (s) => s.trim().replace(/^\||\|$/g, '').split('|').map((c) => c.trim());
+      let h = '<table><tr>' + cells(l).map((c) => `<th>${inline(c)}</th>`).join('') + '</tr>'; i += 2;
+      while (i < L.length && isRow(L[i])) { h += '<tr>' + cells(L[i]).map((c) => `<td>${inline(c)}</td>`).join('') + '</tr>'; i++; }
+      out.push(h + '</table>'); continue;
+    }
+    if (/^\s*>\s?/.test(l)) { const b = []; while (i < L.length && /^\s*>\s?/.test(L[i])) b.push(L[i++].replace(/^\s*>\s?/, '')); out.push(`<blockquote>${b.map(inline).join('<br>')}</blockquote>`); continue; }
+    if (/^\s*([-*•]|\d+[.)])\s+/.test(l)) {
+      const ol = /^\s*\d+[.)]/.test(l), items = [];
+      while (i < L.length && /^\s*([-*•]|\d+[.)])\s+/.test(L[i])) {
+        const ind = L[i].match(/^\s*/)[0].length;
+        items.push(`<li style="margin-left:${Math.min(ind, 8) * 8}px">${inline(L[i].replace(/^\s*([-*•]|\d+[.)])\s+/, ''))}</li>`); i++;
+        while (i < L.length && L[i].trim() && /^\s{2,}\S/.test(L[i]) && !/^\s*([-*•]|\d+[.)])\s+/.test(L[i])) { items[items.length - 1] = items[items.length - 1].replace(/<\/li>$/, '<br>' + inline(L[i].trim()) + '</li>'); i++; }
+      }
+      out.push(ol ? `<ol>${items.join('')}</ol>` : `<ul>${items.join('')}</ul>`); continue;
+    }
+    const p = [];
+    while (i < L.length && L[i].trim() && !/^(#{1,4}\s|\s*([-*•]|\d+[.)])\s+|\s*>|\u0000)/.test(L[i]) && !(isRow(L[i]) && i + 1 < L.length && /^\s*\|?\s*:?-{2,}/.test(L[i + 1]))) p.push(L[i++]);
+    if (p.length) out.push(`<p>${p.map(inline).join('<br>')}</p>`); else i++;
+  }
+  return out.join('');
+}
+
+// ── лента ──
+const feed = $('#feed'), chat = $('#chat');
+function nearBottom() { return chat.scrollHeight - chat.scrollTop - chat.clientHeight < 160; }
+function add(el) { const stick = nearBottom(); $('.empty')?.remove(); feed.appendChild(el); if (stick) chat.scrollTop = chat.scrollHeight; return el; }
+function div(cls, html) { const d = document.createElement('div'); d.className = cls; if (html != null) d.innerHTML = html; return d; }
+function emptyState() {
+  if (feed.children.length) return;
+  const e = div('empty', `<h2>Что сделать с панелью?</h2><p>Агент правит код здесь, на ноутбуке. Выкладка — кнопкой справа.</p>
+    <div>${['Прочитай docs/NEXT.md и почини Лиды по пунктам 1–4', 'Объясни, как устроен поиск чатов в enrich-find.py', 'Что поменялось на сервере с прошлой выкладки?']
+      .map((t) => `<span class="ex">${esc(t)}</span>`).join('')}</div>`);
+  e.querySelectorAll('.ex').forEach((x) => x.onclick = () => { $('#input').value = x.textContent; $('#input').focus(); grow(); });
+  feed.appendChild(e);
+}
+const ICON = { Bash: '⌘', Read: '📄', Edit: '✎', MultiEdit: '✎', Write: '✚', Grep: '🔍', Glob: '🔍', WebFetch: '🌐', WebSearch: '🌐', Task: '🤖', Agent: '🤖', TodoWrite: '☑' };
+function toolBody(t) {
+  const i = t.input || {};
+  if (t.name === 'Edit' && (i.old_string || i.new_string)) {
+    return `<pre class="diff">${String(i.old_string || '').split('\n').map((x) => `<span class="d-del">- ${esc(x)}</span>`).join('\n')}\n${String(i.new_string || '').split('\n').map((x) => `<span class="d-add">+ ${esc(x)}</span>`).join('\n')}</pre>`;
+  }
+  if (t.name === 'Write' && i.content) return `<pre>${esc(String(i.content).slice(0, 3000))}</pre>`;
+  if (t.name === 'Bash') return `<pre>$ ${esc(i.command)}</pre>`;
+  if (t.name === 'TodoWrite') return (i.todos || []).map((x) => `<div class="todo ${esc(x.status)}">${x.status === 'completed' ? '✔' : x.status === 'in_progress' ? '▸' : '○'} ${esc(x.content)}</div>`).join('');
+  return `<pre>${esc(JSON.stringify(i, null, 1))}</pre>`;
+}
+function onEvent(e) {
+  switch (e.type) {
+    case 'reset': feed.innerHTML = ''; tools = {}; live = null; liveText = ''; emptyState(); break;
+    case 'user': {
+      const d = add(div('msg-user', esc(e.text)));
+      (e.images || []).forEach((u) => { const im = document.createElement('img'); im.src = u; d.appendChild(im); });
+      chat.scrollTop = chat.scrollHeight; break;
+    }
+    case 'delta':
+      if (!live) { live = add(div('msg-ai')); liveText = ''; }
+      liveText += e.text;
+      if (!live._raf) live._raf = requestAnimationFrame(() => { if (live) { live.innerHTML = md(liveText); live._raf = 0; if (nearBottom()) chat.scrollTop = chat.scrollHeight; } });
+      break;
+    case 'assistant':
+      if (live) { live.innerHTML = md(e.text); live = null; liveText = ''; } else add(div('msg-ai', md(e.text)));
+      lastAssistant = e.text; break;
+    case 'tool': {
+      if (live) { live = null; liveText = ''; }
+      const t = div('tool' + (e.sub ? ' sub' : ''));
+      t.innerHTML = `<div class="head"><span class="ic">${ICON[e.name] || '•'}</span><span class="nm">${esc(e.name)}</span><span class="sm">${esc(e.summary)}</span><span class="st">…</span></div><div class="body">${toolBody(e)}<div class="res"></div></div>`;
+      t.querySelector('.head').onclick = () => t.classList.toggle('open');
+      tools[e.id] = t; add(t); break;
+    }
+    case 'tool_result': {
+      const t = tools[e.id]; if (!t) break;
+      const st = t.querySelector('.st'); st.textContent = e.error ? 'ошибка' : 'готово'; st.className = 'st ' + (e.error ? 'err' : 'ok');
+      if (e.text) t.querySelector('.res').innerHTML = `<pre style="margin-top:6px;color:${e.error ? 'var(--red)' : 'var(--muted)'}">${esc(e.text)}</pre>`;
+      if (e.error) t.classList.add('open');
+      break;
+    }
+    case 'ask': {
+      const a = div('ask' + (e.risky ? ' risky' : ''));
+      a.dataset.id = e.id;
+      a.innerHTML = `<div class="q">${e.risky ? '⚠ Агент просит разрешения — это может тронуть сервер или систему' : 'Агент просит разрешения'}</div>
+        <div class="muted">${esc(e.tool)}</div><pre>${esc(e.summary)}</pre>
+        <div class="row"><button class="btn primary" data-d="allow">Разрешить</button><button class="btn" data-d="always">Разрешать в этой беседе</button>
+        <input placeholder="почему нет / что сделать вместо (не обязательно)"><button class="btn danger" data-d="deny">Запретить</button></div>`;
+      a.querySelectorAll('button').forEach((b) => b.onclick = () => { send({ type: 'answer', id: e.id, decision: b.dataset.d, why: a.querySelector('input').value }); a.classList.add('done'); a.querySelectorAll('button,input').forEach((x) => x.disabled = true); });
+      add(a); document.title = '❓ Агент ждёт ответа'; break;
+    }
+    case 'asked': { const a = feed.querySelector(`.ask[data-id="${e.id}"]`); if (a) { a.classList.add('done'); a.querySelectorAll('button,input').forEach((x) => x.disabled = true); const q = a.querySelector('.q'); q.textContent += e.decision === 'deny' ? ' — запрещено' : ' — разрешено'; } document.title = 'Агент · tg-panel'; break; }
+    case 'result':
+      add(div('meta', `${e.seconds} с · ответ $${e.cost.toFixed(3)} · беседа $${e.session < 0.1 ? e.session.toFixed(3) : e.session.toFixed(2)}${e.error ? ' · <span style="color:var(--red)">' + esc(e.subtype) + '</span>' : ''}`));
+      if (document.hidden) document.title = '● Готово — агент ответил';
+      if (/Готово к выкладке/i.test(lastAssistant)) $('#c-ship').classList.add('pulse');
+      loadChanges(); break;
+    case 'info': add(div('info', esc(e.text))); break;
+    case 'error': add(div('err', esc(e.text))); break;
+    case 'thinking': break;
+    case 'state': setState(e); break;
+    case 'cmd_start': $('#cout').textContent = ''; $('#ctitle').textContent = e.title; break;
+    case 'cmd_line': { const o = $('#cout'); o.textContent += e.line + '\n'; o.scrollTop = o.scrollHeight; break; }
+    case 'cmd_replay': $('#cout').textContent = e.lines.join('\n') + '\n'; break;
+    case 'cmd_done': {
+      const ok = e.code === 0;
+      if (e.name === 'ship' && ok) { toast('Выложено. VPN можно включать', 6000); $('#c-ship').classList.remove('pulse'); }
+      else if (ok) toast('Готово. VPN можно включать');
+      else toast('Не вышло — смотри вывод справа', 6000);
+      if (!ok) openSide();
+      loadChanges(); break;
+    }
+  }
+}
+document.addEventListener('visibilitychange', () => { if (!document.hidden && !document.title.startsWith('❓')) document.title = 'Агент · tg-panel'; });
+
+function setState(s) {
+  S = s;
+  $('#models').innerHTML = s.models.map(([id, name, price]) => `<button data-m="${id}" class="${id === s.model ? 'on' : ''}" title="${esc(price)} за миллион токенов (вход / выход)">${esc(name)}</button>`).join('');
+  $('#models').querySelectorAll('button').forEach((b) => b.onclick = () => { send({ type: 'model', model: b.dataset.m }); toast('Модель: ' + b.textContent); });
+  $('#auto').checked = !!s.auto;
+  const c = s.cost, pct = Math.min(100, c.month / c.budget * 100);
+  $('#cost').innerHTML = `<b>$${c.session < 0.1 ? c.session.toFixed(3) : c.session.toFixed(2)}</b> беседа · <b>$${c.month.toFixed(2)}</b> из $${c.budget} за месяц<span class="bar"><i style="width:${pct}%;background:${pct > 80 ? 'var(--red)' : pct > 50 ? 'var(--yellow)' : 'var(--green)'}"></i></span>`;
+  $('#ctx').innerHTML = s.context == null ? 'контекст —' : `контекст <b style="color:${s.context > 75 ? 'var(--red)' : s.context > 50 ? 'var(--yellow)' : 'var(--text)'}">${Math.round(s.context)}%</b>`;
+  $('#typing').classList.toggle('on', !!s.busy);
+  const sb = $('#send'); sb.textContent = s.busy ? 'Стоп' : 'Отправить'; sb.classList.toggle('primary', !s.busy); sb.classList.toggle('danger', !!s.busy);
+  $('#hint').textContent = s.busy ? 'агент работает — можно написать следующее, отправится после «Стоп» или ответа' : 'Enter — отправить · Shift+Enter — новая строка · Ctrl+V — скриншот · Esc — стоп';
+  const sv = s.server || {};
+  $('#sdot').className = 'dot ' + (sv.ok === true ? 'ok' : sv.ok === false ? 'bad' : '');
+  $('#stext').textContent = sv.ok === true ? 'доступен' : sv.ok === false ? 'нет связи — выключи VPN' : 'связь не проверяли';
+  ['ship', 'pull', 'logs', 'data', 'status', 'undo'].forEach((n) => $('#c-' + n).disabled = !!s.cmd);
+  $('#cdot').className = 'dot ' + (s.cmd ? 'wait' : '');
+  const td = s.todos || [];
+  $('#todocard').style.display = td.length ? '' : 'none';
+  $('#todos').innerHTML = td.map((x) => `<div class="todo ${esc(x.status)}">${x.status === 'completed' ? '✔' : x.status === 'in_progress' ? '▸' : '○'} ${esc(x.status === 'in_progress' ? (x.activeForm || x.content) : x.content)}</div>`).join('');
+  modal('#m-key', !s.key);
+  if (s.fake) $('.brand small').textContent = '· tg-panel · проверка без API';
+}
+
+// ── связь ──
+function connect() {
+  ws = new WebSocket(`ws://${location.host}/ws?t=${encodeURIComponent(TOKEN)}`);
+  ws.onmessage = (m) => { try { onEvent(JSON.parse(m.data)); } catch (err) { console.error(err); } };
+  ws.onclose = () => { $('#typing').classList.remove('on'); setTimeout(connect, 1500); };
+}
+function send(o) { if (ws && ws.readyState === 1) ws.send(JSON.stringify(o)); else toast('нет связи с пультом — перезапусти: ./ai'); }
+
+// ── ввод ──
+const input = $('#input');
+function grow() { input.style.height = 'auto'; input.style.height = Math.min(260, input.scrollHeight) + 'px'; }
+input.addEventListener('input', grow);
+input.addEventListener('keydown', (e) => { if (e.key === 'Enter' && !e.shiftKey && !e.isComposing) { e.preventDefault(); submit(); } });
+document.addEventListener('keydown', (e) => { if (e.key === 'Escape') { if (document.querySelector('.modal.on:not(#m-key)')) document.querySelectorAll('.modal.on:not(#m-key)').forEach((m) => m.classList.remove('on')); else if (S.busy) send({ type: 'stop' }); } });
+$('#send').onclick = () => S.busy ? send({ type: 'stop' }) : submit();
+function submit() {
+  const text = input.value.trim();
+  if (!text && !images.length) return;
+  if (S.busy) { toast('агент ещё работает — нажми «Стоп» или дождись'); return; }
+  send({ type: 'prompt', text, images: images.map(({ type, data }) => ({ type, data })) });
+  input.value = ''; images = []; drawThumbs(); grow();
+}
+function drawThumbs() {
+  $('#thumbs').innerHTML = images.map((im, i) => `<div><img src="${im.url}"><button data-i="${i}">×</button></div>`).join('');
+  $('#thumbs').querySelectorAll('button').forEach((b) => b.onclick = () => { images.splice(+b.dataset.i, 1); drawThumbs(); });
+}
+function addImage(file) {
+  const r = new FileReader();
+  r.onload = () => {
+    const img = new Image();
+    img.onload = () => {
+      // большие скриншоты ужимаем: модели хватает 1600 px, а платим за пиксели
+      const k = Math.min(1, 1600 / Math.max(img.width, img.height));
+      const c = document.createElement('canvas'); c.width = Math.round(img.width * k); c.height = Math.round(img.height * k);
+      c.getContext('2d').drawImage(img, 0, 0, c.width, c.height);
+      const url = c.toDataURL('image/png');
+      images.push({ type: 'image/png', data: url.split(',')[1], url }); drawThumbs();
+    };
+    img.src = r.result;
+  };
+  r.readAsDataURL(file);
+}
+input.addEventListener('paste', (e) => { for (const it of e.clipboardData.items) if (it.type.startsWith('image/')) { e.preventDefault(); addImage(it.getAsFile()); } });
+document.addEventListener('dragover', (e) => e.preventDefault());
+document.addEventListener('drop', (e) => { e.preventDefault(); for (const f of e.dataTransfer.files) if (f.type.startsWith('image/')) addImage(f); });
+
+// ── шапка ──
+$('#auto').onchange = (e) => { send({ type: 'auto', value: e.target.checked }); toast(e.target.checked ? 'Обычные команды — без вопросов. Опасное агент спросит.' : 'Агент будет спрашивать про каждую команду'); };
+$('#newchat').onclick = () => { if (S.busy && !confirm('Агент ещё работает. Остановить и начать новую беседу?')) return; send({ type: 'new' }); };
+$('#history').onclick = async () => {
+  modal('#m-hist'); $('#hlist').innerHTML = '<span class="muted">загружаю…</span>';
+  const d = await api('/api/sessions');
+  $('#hlist').innerHTML = (d.sessions || []).length ? d.sessions.map((s) => `<a data-id="${esc(s.id)}">${esc(s.title || 'без названия')}<small>${new Date(s.at).toLocaleString('ru')}${s.id === S.session ? ' · текущая' : ''}</small></a>`).join('') : '<span class="muted">прошлых бесед нет</span>';
+  $('#hlist').querySelectorAll('a').forEach((a) => a.onclick = () => { modal('#m-hist', false); send({ type: 'resume', id: a.dataset.id }); });
+};
+$('#keysave').onclick = async () => {
+  const d = await api('/api/key', { method: 'POST', body: JSON.stringify({ key: $('#keyin').value }) });
+  if (d.error) { $('#keyerr').textContent = d.error; $('#keyerr').style.display = ''; } else { $('#keyin').value = ''; toast('Ключ сохранён'); }
+};
+$('#quit').onclick = async () => { if (!confirm('Выключить пульт? Включить снова: ./ai')) return; await api('/api/quit', { method: 'POST' }); document.body.innerHTML = '<p style="padding:30px">Пульт выключен. Включить: <code>cd ~/tg-panel && ./ai</code></p>'; };
+function openSide() { $('#side').classList.add('on'); }
+$('#sidetog').onclick = () => $('#side').classList.toggle('on');
+$('#chat').addEventListener('click', () => $('#side').classList.remove('on'));
+
+// ── сервер ──
+async function check() {
+  $('#sdot').className = 'dot wait'; $('#stext').textContent = 'проверяю…';
+  const d = await api('/api/server', { method: 'POST' });
+  return !!d.ok;
+}
+$('#check').onclick = check;
+function confirmBox(title, html) {
+  return new Promise((res) => {
+    $('#cftitle').textContent = title; $('#cfbody').innerHTML = html; modal('#m-confirm');
+    $('#cfok').onclick = () => { modal('#m-confirm', false); res(true); };
+    $('#m-confirm').querySelector('[data-close]').onclick = () => { modal('#m-confirm', false); res(false); };
+  });
+}
+async function runCmd(name, title) {
+  if (S.cmd) return toast('уже идёт команда');
+  if (name === 'ship') {
+    const d = await api('/api/changes');
+    const f = d.files || [];
+    if (!f.length && !await confirmBox('Выложить на сервер', '<p>Изменений, которых нет на сервере, не видно. Всё равно проверить и выложить?</p>')) return;
+    if (f.length && !await confirmBox('Выложить на сервер', `<p>Уедут файлы (${f.length}):</p><div class="files">${f.slice(0, 30).map((x) => `<div class="p">${esc(x.path)}</div>`).join('')}</div><p class="muted">Правки владельца на сервере сначала вольются к тебе. Панель перезапустится, только если менялся её код (*.mjs), и только когда никто не пишет людям.</p>`)) return;
+  }
+  if (name === 'undo' && !await confirmBox('Откатить последнюю выкладку', '<p>Файлы на сервере вернутся к виду до последней выкладки.</p>')) return;
+  openSide();
+  if (!await check()) {
+    if (await confirmBox('Нет связи с сервером', '<p>Скорее всего, включён <b>VPN</b> — сервер его адрес не пускает.</p><p>Выключи VPN и нажми «Поехали». Пульт работает и без VPN.</p>')) return runCmd(name, title);
+    return;
+  }
+  const d = await api('/api/cmd', { method: 'POST', body: JSON.stringify({ cmd: name }) });
+  if (d.error) toast(d.error);
+}
+[['ship'], ['pull'], ['logs'], ['data'], ['status'], ['undo']].forEach(([n]) => $('#c-' + n).onclick = () => runCmd(n));
+
+async function loadChanges() {
+  const d = await api('/api/changes');
+  const f = d.files || [];
+  $('#files').innerHTML = f.length ? f.map((x) => `<a data-p="${esc(x.path)}"><span class="p">${esc(x.path)}</span>${x.add === 'new' ? '<span class="n">новый</span>' : `<span class="n">+${esc(x.add)}</span><span class="m">−${esc(x.del)}</span>`}</a>`).join('') : '<span class="muted">всё на сервере</span>';
+  $('#files').querySelectorAll('a').forEach((a) => a.onclick = () => showDiff(a.dataset.p));
+}
+$('#refresh').onclick = loadChanges;
+async function showDiff(p) {
+  $('#dtitle').textContent = p; $('#dbody').textContent = 'загружаю…'; modal('#m-diff');
+  const d = await api('/api/diff?f=' + encodeURIComponent(p));
+  $('#dbody').innerHTML = String(d.diff || d.error || 'нет отличий').split('\n').map((l) => {
+    const c = l.startsWith('+++') || l.startsWith('---') || l.startsWith('diff ') || l.startsWith('index ') ? 'd-meta' : l.startsWith('+') ? 'd-add' : l.startsWith('-') ? 'd-del' : l.startsWith('@@') ? 'd-hunk' : '';
+    return `<span class="${c}">${esc(l)}</span>`;
+  }).join('\n');
+}
+
+emptyState(); connect(); loadChanges(); input.focus();
+</script>
+</body>
+</html>

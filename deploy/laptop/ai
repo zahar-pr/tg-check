@@ -1,0 +1,13 @@
+#!/usr/bin/env bash
+# ./ai — пульт агента в браузере (подробно: .tools/agent/server.py).
+#     ./ai          открыть пульт (запустит, если ещё не запущен)
+#     ./ai stop     выключить пульт
+#     ./ai term     агент в терминале, как раньше
+# Агент платит ключом Console. Поставить или обновить: ./tg agent
+PY="$HOME/.tg-agent/venv/bin/python"
+D="$(cd "$(dirname "$0")" && pwd)"
+[ -x "$PY" ] || { echo "агент не поставлен: ./tg agent"; exit 1; }
+case "${1:-}" in
+  term) shift; exec "$PY" "$D/.tools/ai.py" "$@" ;;
+  *) exec "$PY" "$D/.tools/agent/server.py" "$@" ;;
+esac

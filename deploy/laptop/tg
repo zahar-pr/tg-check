@@ -14,6 +14,7 @@
 #     ./tg venv            поставить Python для тестов на этот компьютер
 #     ./tg test            тесты обогащения (нужен ./tg venv)
 #     ./tg agent           поставить (обновить) агента ./ai — он платит ключом Console
+#     ./tg tools [коммит]  обновить эти инструменты и пульт с GitHub
 #
 # Как это устроено. Папка — обычный git, только без GitHub. Ветка server —
 # снимки кода с сервера (без данных и секретов), ветка main — твоя работа.
@@ -213,20 +214,9 @@ cmd_init() {
   say "2/3  Кладу инструменты"
   cp "$ME" "$DIR/tg"; chmod +x "$DIR/tg"
   if [ -n "$from" ]; then
-    mkdir -p "$DIR/.claude" "$DIR/deploy"
-    cp "$from/deploy/laptop/CLAUDE.md" "$DIR/CLAUDE.md"
-    cp "$from/deploy/laptop/settings.json" "$DIR/.claude/settings.json"
-    mkdir -p "$DIR/.tools" && cp "$from/deploy/laptop/ai.py" "$DIR/.tools/ai.py"
-    cat > "$DIR/ai" <<'AI'
-#!/usr/bin/env bash
-# ./ai — агент на кредиты Console (подробно: .tools/ai.py). Поставить: ./tg agent
-PY="$HOME/.tg-agent/venv/bin/python"
-[ -x "$PY" ] || { echo "агент не поставлен: ./tg agent"; exit 1; }
-exec "$PY" "$(cd "$(dirname "$0")" && pwd)/.tools/ai.py" "$@"
-AI
-    chmod +x "$DIR/ai"
+    install_tools "$from"
+    mkdir -p "$DIR/deploy"
     cp "$from/deploy/push.sh" "$DIR/deploy/push.sh"       # списки данных и ожидание без пауз
-    [ -d "$from/tests" ] && cp -r "$from/tests" "$DIR/"
     [ -f "$from/docs/NEXT.md" ] && mkdir -p "$DIR/docs" && cp "$from/docs/NEXT.md" "$DIR/docs/NEXT.md"
   fi
   git -C "$DIR" add -A && git -C "$DIR" commit -qm "инструменты для работы с ноутбука"
@@ -237,8 +227,8 @@ AI
   Папка: $DIR
 
     cd $DIR
-    ./ai             агент (нужен VPN): пиши, что сделать
-    ./tg ship        выложить сделанное (без VPN)
+    ./ai             пульт агента в браузере (агенту нужен VPN)
+    ./tg ship        выложить сделанное (без VPN) — или кнопкой в пульте
 TXT
 }
 
@@ -460,6 +450,37 @@ REMOTE_SH
   merge_server
 }
 
+# Инструменты ноутбука из папки $1 (распакованный репозиторий): ./tg, пульт,
+# правила агента, тесты. Всё это живёт только тут и на сервер не ездит.
+install_tools() {
+  local from="$1"
+  mkdir -p "$DIR/.claude" "$DIR/.tools/agent"
+  # через mv, а не поверх: ./tg tools сам выполняется из этого файла, а bash
+  # дочитывает скрипт по ходу — запись поверх сломала бы ему остаток
+  cp "$from/deploy/laptop/tg" "$DIR/.tg.new" && chmod +x "$DIR/.tg.new" && mv -f "$DIR/.tg.new" "$DIR/tg"
+  cp "$from/deploy/laptop/ai" "$DIR/ai" && chmod +x "$DIR/ai"
+  cp "$from/deploy/laptop/ai.py" "$DIR/.tools/ai.py"
+  cp "$from/deploy/laptop/agent/server.py" "$from/deploy/laptop/agent/index.html" "$DIR/.tools/agent/"
+  cp "$from/deploy/laptop/CLAUDE.md" "$DIR/CLAUDE.md"
+  cp "$from/deploy/laptop/settings.json" "$DIR/.claude/settings.json"
+  [ ! -d "$from/tests" ] || { rm -rf "$DIR/tests"; cp -r "$from/tests" "$DIR/"; }
+}
+
+# ./tg tools [коммит] — обновить инструменты ноутбука с GitHub (код панели не трогает)
+cmd_tools() {
+  local ref="${1:-web-refactor}" tmp
+  tmp="$(mktemp -d)"
+  say "Обновляю инструменты ($ref)"
+  curl -fsSL "https://codeload.github.com/zahar-pr/tg-check/tar.gz/$ref" | tar xz -C "$tmp" --strip-components=1 \
+    || { rm -rf "$tmp"; die "не скачал инструменты ($ref)"; }
+  install_tools "$tmp"
+  rm -rf "$tmp"
+  if [ -n "$(G status --porcelain -- tg ai .tools .claude CLAUDE.md tests)" ]; then
+    G add -A -- tg ai .tools .claude CLAUDE.md tests && G commit -qm "инструменты обновлены ($ref)" -- tg ai .tools .claude CLAUDE.md tests
+  fi
+  cmd_agent
+}
+
 cmd_agent() {
   local venv="$HOME/.tg-agent/venv" py="" c
   for c in python3.13 python3.12 python3.11 python3.10 python3; do
@@ -469,18 +490,32 @@ cmd_agent() {
   done
   mkdir -p "$HOME/.tg-agent"
   say "Ставлю агента (Claude Agent SDK) в ~/.tg-agent"
-  if [ -n "$py" ] && "$py" -m venv "$venv" >/dev/null 2>&1 && "$venv/bin/pip" install -q --upgrade claude-agent-sdk; then
+  if [ -n "$py" ] && "$py" -m venv "$venv" >/dev/null 2>&1 && "$venv/bin/pip" install -q --upgrade claude-agent-sdk aiohttp; then
     :
   else
     rm -rf "$venv"
     # нет Python 3.10+ или модуля venv — берём uv: он сам привезёт нужный Python, без sudo
     command -v uv >/dev/null || [ -x "$HOME/.local/bin/uv" ] || curl -LsSf https://astral.sh/uv/install.sh | sh >/dev/null
     local uv; uv="$(command -v uv || echo "$HOME/.local/bin/uv")"
-    "$uv" venv -q --python 3.12 "$venv" && "$uv" pip install -q --python "$venv/bin/python" claude-agent-sdk \
+    "$uv" venv -q --python 3.12 "$venv" && "$uv" pip install -q --python "$venv/bin/python" claude-agent-sdk aiohttp \
       || die "не поставился claude-agent-sdk — пришли вывод"
   fi
   "$venv/bin/python" -c 'import claude_agent_sdk' || die "claude-agent-sdk не импортируется"
   note "готово: $("$venv/bin/python" -c 'import claude_agent_sdk as s; print("claude-agent-sdk", getattr(s, "__version__", ""))')"
+  # значок в меню приложений: «Агент tg-panel» открывает пульт без терминала
+  local app="$HOME/.local/share/applications/tg-agent.desktop"
+  mkdir -p "$(dirname "$app")"
+  cat > "$app" <<APP
+[Desktop Entry]
+Type=Application
+Name=Агент tg-panel
+Comment=Пульт агента: правки панели и выкладка на сервер
+Exec="$DIR/ai"
+Icon=utilities-terminal
+Terminal=false
+Categories=Development;
+APP
+  note "в меню приложений появился «Агент tg-panel» — открывает пульт"
 }
 
 cmd_logs() { on "journalctl -u tg-panel -n ${1:-80} --no-pager -o cat"; }
@@ -515,6 +550,7 @@ case "${1:-}" in
   venv) cmd_venv ;;
   test) cmd_test ;;
   agent) cmd_agent ;;
+  tools) shift; cmd_tools "$@" ;;
   data) shift; cmd_data "$@" ;;
-  *) sed -n '3,17p' "$ME" | sed 's/^# \{0,1\}//'; exit 1 ;;
+  *) sed -n '3,18p' "$ME" | sed 's/^# \{0,1\}//'; exit 1 ;;
 esac
