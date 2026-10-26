@@ -13,6 +13,9 @@
 #   3. агент ./ai на Claude Agent SDK в ~/.tg-agent (ключ спросит при первом запуске).
 #
 set -euo pipefail
+# Всё — в main(), вызов в самом конце: при «curl | bash» bash читает скрипт с
+# того же входа, что и ssh, и ssh иначе съел бы остаток скрипта.
+main() {
 REF="${1:-web-refactor}"
 TARGET="${TG_DIR:-$HOME/tg-panel}"
 
@@ -54,10 +57,10 @@ say "2/3  Рабочая папка $TARGET"
 TMP="$(mktemp -d)"; trap 'rm -rf "$TMP"' EXIT
 curl -fsSL "https://codeload.github.com/zahar-pr/tg-check/tar.gz/$REF" | tar xz -C "$TMP" --strip-components=1 \
   || die "не скачал инструменты ($REF)"
-bash "$TMP/deploy/laptop/tg" init "$TARGET" "$TMP"
+bash "$TMP/deploy/laptop/tg" init "$TARGET" "$TMP" < /dev/null
 
 say "3/3  Агент"
-(cd "$TARGET" && ./tg agent) || echo "  агент не встал — повтори потом: cd $TARGET && ./tg agent"
+(cd "$TARGET" && ./tg agent < /dev/null) || echo "  агент не встал — повтори потом: cd $TARGET && ./tg agent"
 
 cat <<TXT
 
@@ -67,3 +70,6 @@ cat <<TXT
 
   Выложить то, что сделал агент: выключи VPN → cd $TARGET && ./tg ship → включи VPN
 TXT
+}
+
+main "$@"

@@ -80,6 +80,24 @@ PULL_EXTRA=('*.log' '*.jsonl' '*.db' '*.sqlite' '*.sqlite3' '*.tgz' '*.tar' '*.g
 
 # ─────────────────────────── снимок кода с сервера ───────────────────────────
 
+# Код ли это? Белый список: в папке панели у владельца лежат и резервные копии
+# (.env.bak-…, results.csv.bak…), и выгрузки, и записи звонков — им место в
+# server-data/, а не в git с кодом.
+is_code() {
+  local p="$1" b="${1##*/}"
+  case "$b" in *.bak|*.bak[!a-z]*|*.orig|*.rej|*~|*.old|*.swp|*.tmp|*-backup*|*_backup*) return 1 ;; esac
+  case "$b" in
+    *.py|*.mjs|*.js|*.cjs|*.ts|*.html|*.htm|*.css|*.svg|*.ico|*.png|*.jpg|*.jpeg|*.webp|*.gif|*.woff|*.woff2|*.ttf) return 0 ;;
+    *.sh|*.bat|*.ps1|*.command|*.md|*.service|*.conf|*.ini|*.toml|*.yml|*.yaml|.gitignore|.editorconfig) return 0 ;;
+    package.json|package-lock.json|vercel.json|tsconfig.json|*.default.json|*.example.json) return 0 ;;
+    *.default.txt|*.example.txt|requirements*.txt|Makefile|Dockerfile|LICENSE) return 0 ;;
+  esac
+  case "$p" in kit/*.txt|deploy/*) return 0 ;; esac
+  # без расширения, но скрипт (#!…) — тоже код
+  [ "${b#*.}" = "$b" ] && [ "$(head -c 2 "$2" 2>/dev/null)" = '#!' ] && return 0
+  return 1
+}
+
 # Код сервера -> папка $1. Файлы больше мегабайта не берём (это не код) и
 # называем; найденное по списку данных выкидываем.
 fetch_into() {
@@ -103,17 +121,17 @@ tar czf - --warning=no-file-changed --exclude-from=\"\$big\" $(printf '%q ' "${e
     said="не взял файлы больше 1 МБ (не код): $(grep '^BIG ' "$err" | cut -c5- | head -8 | tr '\n' ' ')"
   fi
   rm -f "$err"
-  # данные, которых в коде быть не должно, — прочь из снимка
-  local f base pat dropped=""
+  # данные, которых в коде быть не должно, — прочь из снимка (они в server-data/)
+  local f base pat dropped=0
   while IFS= read -r -d '' f; do
     base="${f##*/}"
     for pat in "${DATA_GUARD[@]}"; do
       # shellcheck disable=SC2254
-      case "$base" in $pat) rm -rf "$f"; dropped="$dropped ${f#"$to"/}"; break ;; esac
+      case "$base" in $pat) rm -rf "$f"; dropped=$((dropped + 1)); continue 2 ;; esac
     done
+    [ -d "$f" ] || is_code "${f#"$to"/}" "$f" || { rm -f "$f"; dropped=$((dropped + 1)); }
   done < <(find "$to" -mindepth 1 -depth -print0 2>/dev/null)
-  [ -z "$dropped" ] || said="$said
-это данные, а не код — не взял:$dropped"
+  find "$to" -mindepth 1 -type d -empty -delete 2>/dev/null || true
   # Похожее на секрет в коде владельца: не останавливаемся (это не GitHub, всё
   # лежит только тут), но говорим, где оно, чтобы не показывать эти файлы.
   local sec
@@ -183,6 +201,8 @@ cmd_init() {
   [ -z "$(ls -A "$DIR")" ] || die "$DIR не пустая — укажи другую папку"
   say "1/3  Забираю код с сервера в $DIR"
   git -C "$DIR" init -q && git -C "$DIR" symbolic-ref HEAD refs/heads/main
+  # файлы — байт в байт как на сервере (иначе git «чинит» CRLF и правка уедет с чужими концами строк)
+  git -C "$DIR" config core.autocrlf false && git -C "$DIR" config core.safecrlf false
   git -C "$DIR" config user.name >/dev/null || git -C "$DIR" config user.name "tg-panel"
   git -C "$DIR" config user.email >/dev/null || git -C "$DIR" config user.email "tg-panel@laptop"
   printf '%s\n' 'venv*/' 'node_modules/' '__pycache__/' '*.pyc' '.claude/settings.local.json' '/server-data/' '/.server-data.*/' '/server-data.old/' \
