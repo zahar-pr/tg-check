@@ -147,7 +147,7 @@ aside { border-left: 1px solid var(--line); background: var(--panel); overflow-y
   <header>
     <div class="brand">Агент <small>· tg-panel</small></div>
     <div class="seg" id="models"></div>
-    <label class="sw" title="Агент не спрашивает разрешения на обычные команды. Опасное (ssh, sudo, выкладка, удаление вне папки) спросит всё равно."><input type="checkbox" id="auto"><span class="t"></span>Без вопросов</label>
+    <label class="sw" title="Агент сам подтверждает все свои действия и ничего не спрашивает. Выключен — спрашивает только про опасное: ssh, sudo, выкладку, удаление и чтение вне папки проекта. Стереть корень или домашнюю папку и выложить с --force нельзя даже на автопилоте."><input type="checkbox" id="auto"><span class="t"></span>Автопилот</label>
     <div class="grow"></div>
     <span class="pill" id="ctx" title="Сколько памяти беседы занято. Ближе к 100% агент сожмёт начало — лучше начать новую беседу.">контекст —</span>
     <span class="pill" id="cost" title="Оценка по ценам API. Точно — platform.claude.com/usage">$0.00</span>
@@ -382,7 +382,7 @@ function setState(s) {
   S = s;
   $('#models').innerHTML = s.models.map(([id, name, price]) => `<button data-m="${id}" class="${id === s.model ? 'on' : ''}" title="${esc(price)} за миллион токенов (вход / выход)">${esc(name)}</button>`).join('');
   $('#models').querySelectorAll('button').forEach((b) => b.onclick = () => { send({ type: 'model', model: b.dataset.m }); toast('Модель: ' + b.textContent); });
-  $('#auto').checked = !!s.auto;
+  $('#auto').checked = !!s.autopilot;
   const c = s.cost, pct = Math.min(100, c.month / c.budget * 100);
   $('#cost').innerHTML = `<b>$${c.session < 0.1 ? c.session.toFixed(3) : c.session.toFixed(2)}</b> беседа · <b>$${c.month.toFixed(2)}</b> / $${c.budget} мес.<span class="bar"><i style="width:${pct}%;background:${pct > 80 ? 'var(--red)' : pct > 50 ? 'var(--yellow)' : 'var(--green)'}"></i></span>`;
   $('#ctx').innerHTML = s.context == null ? 'контекст —' : `контекст <b style="color:${s.context > 75 ? 'var(--red)' : s.context > 50 ? 'var(--yellow)' : 'var(--text)'}">${Math.round(s.context)}%</b>`;
@@ -448,7 +448,7 @@ document.addEventListener('dragover', (e) => e.preventDefault());
 document.addEventListener('drop', (e) => { e.preventDefault(); for (const f of e.dataTransfer.files) if (f.type.startsWith('image/')) addImage(f); });
 
 // ── шапка ──
-$('#auto').onchange = (e) => { send({ type: 'auto', value: e.target.checked }); toast(e.target.checked ? 'Обычные команды — без вопросов. Опасное агент спросит.' : 'Агент будет спрашивать про каждую команду'); };
+$('#auto').onchange = (e) => { send({ type: 'autopilot', value: e.target.checked }); toast(e.target.checked ? 'Автопилот: агент сам подтверждает всё, ничего не спрашивает' : 'Автопилот выключен: агент спросит про опасное (ssh, sudo, выкладка, удаление вне папки)', 5000); };
 $('#newchat').onclick = () => { if (S.busy && !confirm('Агент ещё работает. Остановить и начать новую беседу?')) return; send({ type: 'new' }); };
 $('#history').onclick = async () => {
   modal('#m-hist'); $('#hlist').innerHTML = '<span class="muted">загружаю…</span>';

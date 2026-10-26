@@ -31,6 +31,7 @@ HERE = Path(__file__).resolve().parent                  # ~/tg-panel/.tools/agen
 PROJECT = Path(os.environ.get("TG_PROJECT") or HERE.parent.parent).resolve()
 HOME = Path.home() / ".tg-agent"
 KEY, STATE, RUN, LOG = HOME / "key", HOME / "state.json", HOME / "server.json", HOME / "server.log"
+TOKEN = HOME / "token"     # постоянный: перезапуск пульта не выкидывает открытую вкладку
 PORT = int(os.environ.get("TG_AGENT_PORT", "8765"))
 FAKE = os.environ.get("TG_AGENT_FAKE") == "1"           # для проверки страницы без API
 MODELS = [("opus", "Opus 5.5", "$4 / $20"), ("sonnet", "Sonnet 5.5", "$2 / $10"), ("haiku", "Haiku 5.5", "дешевле всех")]
@@ -46,6 +47,13 @@ DANGER = re.compile(r"""
   | (curl|wget)[^|]*\|\s*(ba|z)?sh
   | \bchmod\s+-R | \bchown\b
   | server-data/ | \.ssh/ | \.tg-agent/
+""", re.X)
+# Чего не делаем даже на автопилоте — отказ без вопроса, агенту объясняем почему:
+# стереть корень или домашнюю папку, отформатировать диск, оборвать рассылку
+NEVER = re.compile(r"""
+    \brm\s+(-\w+\s+)*(/|~|\$HOME|/home/[^/\s]+)/?(\s|$|[;&|])
+  | \bmkfs | \bdd\s+if= | :\(\)\s*\{
+  | \./tg\s+(ship|restart)\b[^;&|\n]*--force
 """, re.X)
 CMDS = {"ship": "Выложить на сервер", "pull": "Забрать код с сервера", "logs": "Журнал панели",
         "data": "Обновить данные", "status": "Что отличается", "undo": "Откатить выкладку"}
@@ -149,7 +157,7 @@ class Hub:
 
     def state(self):
         return {"type": "state", "model": self.st.get("model", "opus"), "models": MODELS,
-                "auto": self.st.get("auto", True), "busy": self.busy, "key": KEY.exists() or FAKE,
+                "autopilot": bool(self.st.get("autopilot")), "busy": self.busy, "key": KEY.exists() or FAKE,
                 "session": self.st.get("session"), "project": str(PROJECT),
                 "cost": {"session": round(self.session_cost, 4), "month": self.month(), "budget": BUDGET},
                 "context": self.context, "todos": self.todos, "server": self.server,
@@ -353,7 +361,16 @@ class Hub:
         from claude_agent_sdk.types import PermissionResultAllow, PermissionResultDeny
         risky = self.dangerous(tool, inp)
         summary = short(tool, inp)
-        if (self.st.get("auto", True) and not risky) or (tool, summary) in self.allowed:
+        if tool == "Bash" and NEVER.search(str(inp.get("command", ""))):
+            await self.emit({"type": "info", "text": f"не дал выполнить (опасно даже на автопилоте): {summary}"})
+            return PermissionResultDeny(message="Это запрещено в этом проекте даже на автопилоте "
+                                                "(стирание корня или домашней папки, форматирование, выкладка с --force). "
+                                                "Сделай по-другому или спроси хозяина в ответе.", interrupt=False)
+        if self.st.get("autopilot"):
+            if risky:                 # не спрашиваем, но и не молчим: видно в ленте
+                await self.emit({"type": "info", "text": f"автопилот разрешил: {tool} · {summary[:160]}"})
+            return PermissionResultAllow(updated_input=inp)
+        if not risky or (tool, summary) in self.allowed:
             return PermissionResultAllow(updated_input=inp)
         pid = secrets.token_hex(4)
         fut = asyncio.get_running_loop().create_future()
@@ -541,9 +558,13 @@ def make_app(hub, token):
                             except Exception:
                                 hub.client = None
                         await hub.push_state()
-                elif t == "auto":
-                    hub.st["auto"] = bool(d.get("value"))
+                elif t == "autopilot":
+                    hub.st["autopilot"] = bool(d.get("value"))
                     save_json(STATE, hub.st)
+                    if hub.st["autopilot"]:       # то, что уже ждёт ответа, — тоже разрешаем
+                        for f in list(hub.pending.values()):
+                            if not f.done():
+                                f.set_result(("allow", ""))
                     await hub.push_state()
                 elif t == "new":
                     await hub.new(None)
@@ -648,7 +669,16 @@ def running():
 
 def serve():
     from aiohttp import web
-    token = secrets.token_urlsafe(18)
+    token = ""
+    try:
+        token = TOKEN.read_text("utf-8").strip()
+    except OSError:
+        pass
+    if len(token) < 16:
+        token = secrets.token_urlsafe(18)
+        HOME.mkdir(parents=True, exist_ok=True)
+        TOKEN.write_text(token, "utf-8")
+        os.chmod(TOKEN, 0o600)
     hub = Hub()
     app = make_app(hub, token)
 

@@ -482,6 +482,13 @@ cmd_tools() {
       || note "инструменты положил, но не закоммитил — не страшно, закоммитит ./tg ship"
   fi
   cmd_agent
+  # пульт запущен — перезапускаем с новым кодом; открытая вкладка переподключится сама
+  if [ -f "$HOME/.tg-agent/server.json" ] && [ -x "$DIR/ai" ]; then
+    "$DIR/ai" stop >/dev/null 2>&1 || true
+    sleep 1
+    TG_AGENT_NO_BROWSER=1 "$DIR/ai" >/dev/null 2>&1 && note "пульт перезапущен — открытая вкладка переподключится сама" \
+      || note "пульт не поднялся — запусти: ./ai"
+  fi
 }
 
 cmd_agent() {
