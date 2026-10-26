@@ -1,0 +1,442 @@
+#!/usr/bin/env bash
+#
+# Работа с панелью прямо с ноутбука: код лежит тут, живёт на сервере.
+#
+#     ./tg pull            забрать с сервера свежий код (правки владельца вольются к твоим)
+#     ./tg ship            выложить на сервер то, что поменял ты
+#     ./tg ship --restart  то же и перезапустить панель, даже если менялся только Python
+#     ./tg status          что поменял ты и что нового на сервере — ничего не трогая
+#     ./tg undo            вернуть на сервере файлы, какими они были до последней выкладки
+#     ./tg logs [N]        последние N строк журнала панели (по умолчанию 80)
+#     ./tg sh              открыть терминал сервера в папке панели
+#     ./tg venv            поставить Python для тестов на этот компьютер
+#     ./tg test            тесты обогащения (нужен ./tg venv)
+#     ./tg agent           поставить (обновить) агента ./ai — он платит ключом Console
+#
+# Как это устроено. Папка — обычный git, только без GitHub. Ветка server —
+# снимки кода с сервера (без данных и секретов), ветка main — твоя работа.
+# pull и ship снимают свежий снимок и вливают его в main: правки владельца на
+# сервере попадают к тебе, а не затираются. На сервер уезжают ТОЛЬКО файлы,
+# которые в main отличаются от сервера, — данные сервера ship не трогает.
+#
+# Python-задачи панель запускает заново на каждую работу, поэтому правка .py
+# начинает действовать со следующего запуска — без перезапуска панели. Панель
+# перезапускается, только если менялся её собственный код (*.mjs и прочий
+# серверный JS), и только когда никто не пишет людям (как в deploy/push.sh).
+#
+#   TG_HOST    сервер для ssh (по умолчанию tg-server — запись в ~/.ssh/config)
+#   TG_REMOTE  папка панели на сервере (по умолчанию /opt/tg-panel)
+#
+set -euo pipefail
+
+HOST="${TG_HOST:-tg-server}"
+REMOTE="${TG_REMOTE:-/opt/tg-panel}"
+BACKUPS="${TG_BACKUPS:-/root/tg-ship-backups}"
+ME="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/$(basename "${BASH_SOURCE[0]}")"
+DIR="$(dirname "$ME")"
+# эти файлы нужны только тут: на сервер их не возим
+LOCAL_ONLY='^(tests/|\.claude/|\.tools/|CLAUDE\.md$|tg$|ai$|venv|node_modules/)'
+
+say() { printf '\n\033[1m%s\033[0m\n' "$*"; }
+note() { printf '  %s\n' "$*"; }
+die() { printf '\n\033[31m%s\033[0m\n' "$*" >&2; exit 1; }
+SSH=(ssh -o ConnectTimeout=15 -o ServerAliveInterval=30 -o BatchMode=yes)
+on() { "${SSH[@]}" "$HOST" "$@"; }
+now() { date '+%d.%m %H:%M'; }
+G() { git -C "$DIR" -c core.quotePath=false "$@"; }
+warn() { printf '  %s\n' "$*" >&2; }
+
+# Списки «что не код» живут в deploy/push.sh — один источник правды: сюда их
+# берём как есть, а не переписываем копией, которая потом разойдётся.
+load_lists() {
+  local src="${1:-$DIR/deploy/push.sh}"
+  [ -f "$src" ] || die "нет $src — списков данных не знаю, без них работать опасно"
+  eval "$(sed -n '/^EXCLUDES=(/,/^)/p; /^DATA_GUARD=(/,/^)/p; /^TOUCHY=/p' "$src")"
+  [ "${#EXCLUDES[@]}" -gt 10 ] && [ "${#DATA_GUARD[@]}" -gt 10 ] && [ -n "${TOUCHY:-}" ] \
+    || die "не разобрал списки в $src"
+}
+
+# Сверх того, что не возит push.sh, с сервера не тащим и тяжёлое или служебное:
+# журналы, базы, архивы, ключи, чужие git-папки.
+PULL_EXTRA=('*.log' '*.jsonl' '*.db' '*.sqlite' '*.sqlite3' '*.tgz' '*.tar' '*.gz' '*.zip' '*.7z'
+  '*.bak' '*.orig' '*.rej' '*.swp' '*.pem' '*.key' '*.crt' '*.p12' '*.session-journal' '*.pid' '*.lock' '*.tmp'
+  '*/.git' './.claude' './tg-merge' './backup*' './backups')
+
+# ─────────────────────────── снимок кода с сервера ───────────────────────────
+
+# Код сервера -> папка $1. Файлы больше мегабайта не берём (это не код) и
+# называем; найденное по списку данных выкидываем.
+fetch_into() {
+  local to="$1" ex=() e
+  for e in "${EXCLUDES[@]}" "${PULL_EXTRA[@]}"; do ex+=(--exclude="$e"); done
+  local remote_cmd
+  remote_cmd="set -e; cd $(printf %q "$REMOTE"); big=\$(mktemp); trap 'rm -f \"\$big\"' EXIT
+find . \\( -name venv -o -name venv-tg -o -name node_modules -o -name .git -o -name profiles -o -name sessions \\
+  -o -name enrich -o -name talks -o -name avatars -o -name uploads -o -name accounts -o -name personas \\) -prune \\
+  -o -type f -size +1M -printf '%P\\n' > \"\$big\"
+[ -s \"\$big\" ] && sed 's/^/BIG /' \"\$big\" >&2
+tar czf - --warning=no-file-changed --exclude-from=\"\$big\" $(printf '%q ' "${ex[@]}") . || [ \$? = 1 ]"
+  local err; err="$(mktemp)"
+  if ! on "$remote_cmd" 2>"$err" | tar xzf - -C "$to" 2>>"$err"; then
+    grep -v '^BIG ' "$err" >&2 || true
+    rm -f "$err"
+    die "не смог забрать код с сервера ($HOST:$REMOTE)"
+  fi
+  local said=""
+  if grep -q '^BIG ' "$err"; then
+    said="не взял файлы больше 1 МБ (не код): $(grep '^BIG ' "$err" | cut -c5- | head -8 | tr '\n' ' ')"
+  fi
+  rm -f "$err"
+  # данные, которых в коде быть не должно, — прочь из снимка
+  local f base pat dropped=""
+  while IFS= read -r -d '' f; do
+    base="${f##*/}"
+    for pat in "${DATA_GUARD[@]}"; do
+      # shellcheck disable=SC2254
+      case "$base" in $pat) rm -rf "$f"; dropped="$dropped ${f#"$to"/}"; break ;; esac
+    done
+  done < <(find "$to" -mindepth 1 -depth -print0 2>/dev/null)
+  [ -z "$dropped" ] || said="$said
+это данные, а не код — не взял:$dropped"
+  # Похожее на секрет в коде владельца: не останавливаемся (это не GitHub, всё
+  # лежит только тут), но говорим, где оно, чтобы не показывать эти файлы.
+  local sec
+  sec="$(grep -rlE --exclude-dir=.git \
+    'sk-or-v1-[0-9a-f]{20}|sk-ant-[A-Za-z0-9_-]{20}|-----BEGIN [A-Z ]*PRIVATE KEY|[0-9]{8,10}:AA[A-Za-z0-9_-]{30}|GIGACHAT_CREDENTIALS *= *["'"'"']?[A-Za-z0-9+/]{30}' \
+    "$to" 2>/dev/null | sed "s|^$to/||" | head -10 | tr '\n' ' ')" || true
+  [ -z "$sec" ] || said="$said
+похоже на ключи/токены прямо в коде (не показывай эти файлы никому): $sec"
+  # одно и то же на каждой команде не повторяем — только когда что-то поменялось
+  local seen="$DIR/.git/tg-warnings"
+  if [ -n "$said" ] && [ "$said" != "$(cat "$seen" 2>/dev/null)" ]; then
+    printf '%s\n' "$said" | sed '/^$/d; s/^/  /' >&2
+  fi
+  [ ! -d "$DIR/.git" ] || printf '%s' "$said" > "$seen"
+}
+
+# Свежий снимок -> коммит в ветке server. Печатает changed или same.
+snapshot() {
+  local msg="$1" tmp idx tree parent c
+  tmp="$(mktemp -d)"; idx="$(mktemp -u)"
+  fetch_into "$tmp"
+  tree="$(cd "$tmp" && GIT_INDEX_FILE="$idx" git --git-dir="$DIR/.git" --work-tree="$tmp" add -A -f . \
+          && GIT_INDEX_FILE="$idx" git --git-dir="$DIR/.git" write-tree)"
+  rm -rf "$tmp" "$idx"
+  parent="$(git -C "$DIR" rev-parse -q --verify refs/heads/server || true)"
+  if [ -n "$parent" ] && [ "$tree" = "$(git -C "$DIR" rev-parse "$parent^{tree}")" ]; then
+    echo same; return
+  fi
+  c="$(git -C "$DIR" commit-tree "$tree" ${parent:+-p "$parent"} -m "$msg")"
+  git -C "$DIR" update-ref refs/heads/server "$c"
+  echo changed
+}
+
+# Незакоммиченное — в коммит: история правок и есть «отмена» на этой стороне.
+save_local() {
+  [ ! -f "$DIR/.git/MERGE_HEAD" ] || die "не закончено слияние с сервером — сначала разреши конфликт (см. ./tg status)"
+  if [ -n "$(git -C "$DIR" status --porcelain)" ]; then
+    git -C "$DIR" add -A
+    git -C "$DIR" commit -qm "${1:-правки} $(now)"
+  fi
+}
+
+# Свежий код сервера — в main. Конфликт (одни строки правили и тут, и там) — стоп.
+merge_server() {
+  snapshot "сервер $(now)" >/dev/null
+  # снимок мог лечь в server раньше (./tg status) — вливаем всё, чего в main нет
+  if G merge-base --is-ancestor server main; then note "на сервере код не менялся"; return 0; fi
+  local files; files="$(G diff --name-only main server -- | grep -vE "$LOCAL_ONLY" | head -20 | tr '\n' ' ')" || true
+  if ! G merge -q --no-edit -m "свежий код с сервера $(now)" server >/dev/null 2>&1; then
+    die "и ты, и сервер поменяли одни и те же строки:
+$(G diff --name-only --diff-filter=U | sed 's/^/    /')
+  Открой эти файлы (или скажи Claude «разреши конфликт слияния») и потом ./tg ship снова.
+  На сервер ничего не ушло."
+  fi
+  [ -z "$files" ] || note "с сервера пришло: $files"
+}
+
+# ─────────────────────────────── команды ───────────────────────────────
+
+cmd_init() {
+  local to="${1:-$HOME/tg-panel}" from="${2:-}"
+  command -v git >/dev/null || die "нужен git: sudo apt install git"
+  load_lists "${from:+$from/deploy/push.sh}"
+  on true || die "не пускает на сервер по ключу ($HOST). Проверь: ssh $HOST hostname"
+  [ ! -e "$to/.git" ] || die "в $to уже есть рабочая папка — бери её: cd $to && ./tg pull"
+  mkdir -p "$to"; DIR="$(cd "$to" && pwd)"
+  [ -z "$(ls -A "$DIR")" ] || die "$DIR не пустая — укажи другую папку"
+  say "1/3  Забираю код с сервера в $DIR"
+  git -C "$DIR" init -q && git -C "$DIR" symbolic-ref HEAD refs/heads/main
+  git -C "$DIR" config user.name >/dev/null || git -C "$DIR" config user.name "tg-panel"
+  git -C "$DIR" config user.email >/dev/null || git -C "$DIR" config user.email "tg-panel@laptop"
+  printf '%s\n' 'venv*/' 'node_modules/' '__pycache__/' '*.pyc' '.claude/settings.local.json' >> "$DIR/.git/info/exclude"
+  snapshot "сервер $(now)" >/dev/null
+  git -C "$DIR" checkout -q -B main server
+  note "файлов кода: $(G ls-files | wc -l | tr -d ' ')"
+  say "2/3  Кладу инструменты"
+  cp "$ME" "$DIR/tg"; chmod +x "$DIR/tg"
+  if [ -n "$from" ]; then
+    mkdir -p "$DIR/.claude" "$DIR/deploy"
+    cp "$from/deploy/laptop/CLAUDE.md" "$DIR/CLAUDE.md"
+    cp "$from/deploy/laptop/settings.json" "$DIR/.claude/settings.json"
+    mkdir -p "$DIR/.tools" && cp "$from/deploy/laptop/ai.py" "$DIR/.tools/ai.py"
+    cat > "$DIR/ai" <<'AI'
+#!/usr/bin/env bash
+# ./ai — агент на кредиты Console (подробно: .tools/ai.py). Поставить: ./tg agent
+PY="$HOME/.tg-agent/venv/bin/python"
+[ -x "$PY" ] || { echo "агент не поставлен: ./tg agent"; exit 1; }
+exec "$PY" "$(cd "$(dirname "$0")" && pwd)/.tools/ai.py" "$@"
+AI
+    chmod +x "$DIR/ai"
+    cp "$from/deploy/push.sh" "$DIR/deploy/push.sh"       # списки данных и ожидание без пауз
+    [ -d "$from/tests" ] && cp -r "$from/tests" "$DIR/"
+    [ -f "$from/docs/NEXT.md" ] && mkdir -p "$DIR/docs" && cp "$from/docs/NEXT.md" "$DIR/docs/NEXT.md"
+  fi
+  git -C "$DIR" add -A && git -C "$DIR" commit -qm "инструменты для работы с ноутбука"
+  say "3/3  Готово"
+  cat <<TXT
+  Папка: $DIR
+
+    cd $DIR
+    ./tg status      что изменилось
+    ./ai             агент на кредиты Console: пиши, что сделать; выложить — «выложи»
+    claude           то же в Claude Code (платит твоя подписка)
+TXT
+}
+
+cmd_pull() {
+  load_lists
+  say "Забираю код с сервера"
+  save_local "мои правки до синка"
+  merge_server
+  note "готово"
+}
+
+cmd_status() {
+  load_lists
+  local mine; mine="$(G status --short)"
+  say "Твои незакоммиченные правки"
+  [ -n "$mine" ] && printf '%s\n' "$mine" | sed 's/^/  /' || note "нет"
+  say "Ещё не на сервере (main против последнего снимка)"
+  local diff; diff="$(G diff --stat server main -- . ':!tests' ':!.claude' ':!.tools' ':!CLAUDE.md' ':!tg' ':!ai' 2>/dev/null | tail -15)" || true
+  [ -n "$diff" ] && printf '%s\n' "$diff" | sed 's/^/  /' || note "всё выложено"
+  [ -z "$mine" ] || note "(плюс незакоммиченное выше — ship заберёт и его)"
+  say "Новое на сервере с прошлого синка"
+  if [ "$(snapshot "сервер $(now)")" = same ]; then note "ничего"
+  elif G merge-base --is-ancestor server main; then note "ничего"
+  else G diff --stat main...server -- | tail -15 | sed 's/^/  /'
+       note "забрать: ./tg pull"; fi
+  [ ! -f "$DIR/.git/MERGE_HEAD" ] || note "внимание: не закончено слияние — конфликт в $(G diff --name-only --diff-filter=U | tr '\n' ' ')"
+}
+
+cmd_ship() {
+  local restart=auto force=0
+  for a in "$@"; do case "$a" in
+    --restart) restart=yes ;; --no-restart) restart=no ;; --force) force=1 ;;
+    *) die "не знаю ключ: $a" ;; esac; done
+  load_lists
+  say "1/4  Сверяюсь с сервером"
+  save_local "правки"
+  merge_server
+
+  # что везём: файлы, которые в main не такие, как на сервере
+  local ex=() e
+  STAGE="$(mktemp -d)"; UP="$(mktemp)"; LIST="$(mktemp)"
+  trap 'rm -rf "$STAGE" "$UP" "$LIST"' EXIT
+  local stage="$STAGE/a" up="$UP" list="$LIST"; mkdir -p "$stage" "$STAGE/b"
+  G diff --name-only --no-renames --diff-filter=ACMRT server main -- | grep -vE "$LOCAL_ONLY" > "$list" || true
+  if [ ! -s "$list" ]; then say "Выкладывать нечего: на сервере уже то же самое"; return 0; fi
+  tr '\n' '\0' < "$list" | xargs -0 git -C "$DIR" archive --format=tar main -- | tar xf - -C "$stage"
+  for e in "${EXCLUDES[@]}"; do ex+=(--exclude="$e"); done
+  tar -C "$stage" "${ex[@]}" -czf "$up" .
+  tar xzf "$up" -C "$STAGE/b"
+  (cd "$STAGE/b" && find . \( -type f -o -type l \) | sed 's|^\./||' | sort) > "$list"
+  [ -s "$list" ] || { say "Выкладывать нечего: поменялись только файлы, которые на сервер не возим"; return 0; }
+  local bad="" m base pat
+  while IFS= read -r m; do
+    base="${m##*/}"
+    for pat in "${DATA_GUARD[@]}"; do
+      # shellcheck disable=SC2254
+      case "$base" in $pat) bad="$bad $m"; break ;; esac
+    done
+  done < "$list"
+  [ -z "$bad" ] || die "среди правок — файлы данных:$bad
+  Данные живут на сервере, с ноутбука их не возим. Верни их (git checkout server -- <файл>). Ничего не ушло."
+
+  say "2/4  Проверяю код: $(wc -l < "$list" | tr -d ' ') файл(ов)"
+  sed 's/^/    /' "$list" | head -30
+  # Python проверит Python сервера (там 3.14 — новее, чем тут бывает), до замены файлов
+  local js=() sh=()
+  while IFS= read -r m; do case "$m" in
+    web/*) ;; *.mjs|*.js|*.cjs) js+=("$stage/$m") ;; *.sh) sh+=("$stage/$m") ;; esac
+  done < "$list"
+  if [ ${#js[@]} -gt 0 ]; then
+    if command -v node >/dev/null; then
+      for m in "${js[@]}"; do node --check "$m" || die "ошибка в $m — на сервер ничего не ушло"; done
+    else note "node тут не стоит — JS проверит сервер"; fi
+  fi
+  for m in "${sh[@]}"; do bash -n "$m" || die "ошибка в $m — на сервер ничего не ушло"; done
+  local need=no
+  if [ "$restart" = yes ]; then need=yes
+  elif [ "$restart" = auto ] && grep -qvE '\.(py|md|txt|html|css|svg|png|ico|jpg|webp)$|^web/|^docs/|^deploy/|^tests/' "$list"; then need=yes; fi
+
+  say "3/4  Выкладываю"
+  local ts; ts="$(date +%Y%m%d-%H%M%S)"
+  on "cat > /tmp/tg-ship-$ts.tgz" < "$up"
+  # На сервере: проверка тем Python и node, что там стоят (версии бывают
+  # старше здешних), резервная копия заменяемых файлов, потом раскладка.
+  on bash -s -- "$REMOTE" "$ts" "$BACKUPS" <<'REMOTE_SH' || die "на сервере не прошло — файлы панели не тронуты (резерв и проверка выше)"
+set -euo pipefail
+R="$1"; TS="$2"; B="$3"; ARC="/tmp/tg-ship-$TS.tgz"; T="/tmp/tg-ship-$TS"
+trap 'rm -rf "$T" "$ARC" "$T.list" "$T.old"' EXIT
+mkdir -p "$T" && tar xzf "$ARC" -C "$T"
+cd "$T"
+PY="$R/venv-tg/bin/python"; [ -x "$PY" ] || PY=python3
+find . -name '*.py' -print0 | xargs -0 -r "$PY" -c '
+import ast, sys
+for f in sys.argv[1:]:
+    ast.parse(open(f, encoding="utf-8").read(), f)' || { echo "  Python на сервере не принял код"; exit 1; }
+if command -v node >/dev/null; then
+  find . \( -name '*.mjs' -o -name '*.js' \) -not -path './web/*' -print0 | xargs -0 -r -n1 node --check \
+    || { echo "  node на сервере не принял код"; exit 1; }
+fi
+find . -type f | sed 's|^\./||' > "$T.list"
+mkdir -p "$B"
+(cd "$R" && while IFS= read -r f; do [ -e "$f" ] && printf '%s\n' "$f"; done < "$T.list" > "$T.old"
+ while IFS= read -r f; do [ -e "$f" ] || printf '%s\n' "$f"; done < "$T.list" > "$B/$TS.new"
+ tar czf "$B/$TS.tgz" -T "$T.old")
+tar xzf "$ARC" --no-same-owner -C "$R"
+cd "$R"
+ref="$R/router.mjs"; [ -e "$ref" ] || ref="$R"
+while IFS= read -r f; do
+  chown --reference="$ref" "$f"; d="$(dirname "$f")"
+  while [ "$d" != . ]; do chown --reference="$ref" "$d"; d="$(dirname "$d")"; done
+done < "$T.list"
+ls -1t "$B"/*.tgz 2>/dev/null | tail -n +21 | while IFS= read -r x; do rm -f "$x" "${x%.tgz}.new"; done
+echo "  файлы на месте, прежние версии — в $B/$TS.tgz"
+REMOTE_SH
+
+  say "4/4  Панель"
+  if [ "$need" = yes ]; then
+    restart_panel "$force"
+  else
+    note "перезапуск не нужен: менялись Python, страницы или документы — задачи возьмут новый код со следующего запуска"
+    note "(страницу панели обнови с Ctrl+Shift+R)"
+  fi
+  snapshot "выложено $(now)" >/dev/null
+  if ! G merge -q --no-edit -m "выложено $(now)" server >/dev/null 2>&1; then
+    G merge --abort >/dev/null 2>&1 || true
+    note "пока выкладывал, код на сервере ещё кто-то поменял — забери: ./tg pull"
+  fi
+  local gone; gone="$(G diff --name-only --diff-filter=D server main -- | grep -vE "$LOCAL_ONLY" | head -10 | tr '\n' ' ')" || true
+  [ -z "$gone" ] || note "у тебя удалены, а на сервере остались (не мешают): $gone"
+  say "Готово"
+}
+
+# Перезапуск — только когда никто не пишет людям (как в deploy/push.sh).
+restart_panel() {
+  local force="${1:-0}" n waited=0
+  if [ "$force" = 0 ]; then
+    n="$(on "pgrep -u tgpanel -f '[p]ython.*($TOUCHY)\\.py' | wc -l" | tr -d ' ')"
+    [ "$n" = 0 ] || note "сейчас пишут людям ($(on "pgrep -a -u tgpanel -f '[p]ython.*($TOUCHY)\\.py' | grep -oE '($TOUCHY)\\.py' | sort | uniq -c | awk '{printf \"%s ×%s \", \$2, \$1}'")) — жду до 10 минут…"
+    while [ "$n" != 0 ] && [ "$waited" -lt 600 ]; do
+      sleep 10; waited=$((waited + 10))
+      n="$(on "pgrep -u tgpanel -f '[p]ython.*($TOUCHY)\\.py' | wc -l" | tr -d ' ')"
+    done
+    [ "$n" = 0 ] || die "людям так и пишут — код уже на сервере, но панель НЕ перезапущена.
+  Перезапустить потом: ./tg restart   (или ./tg restart --force — оборвёт рассылку)"
+  fi
+  on "systemctl restart tg-panel && sleep 3 && systemctl is-active tg-panel" >/dev/null \
+    || { on "journalctl -u tg-panel -n 30 --no-pager -o cat" || true
+         die "панель не поднялась после перезапуска — журнал выше. Откатить: ./tg undo"; }
+  note "панель перезапущена и работает"
+}
+
+cmd_restart() {
+  load_lists
+  local force=0; [ "${1:-}" = --force ] && force=1
+  restart_panel "$force"
+}
+
+cmd_undo() {
+  load_lists
+  local last
+  last="$(on "ls -1t $BACKUPS/*.tgz 2>/dev/null | head -1")" || true
+  [ -n "$last" ] || die "резервных копий нет — откатывать нечего"
+  say "Возвращаю файлы из $last"
+  local back
+  back="$(on bash -s -- "$REMOTE" "$last" <<'REMOTE_SH'
+set -euo pipefail
+R="$1"; A="$2"; N="${A%.tgz}.new"
+tar tzf "$A" | sed 's|^\./||'
+tar xzf "$A" --no-same-owner -C "$R"
+ref="$R/router.mjs"; [ -e "$ref" ] || ref="$R"
+(cd "$R" && tar tzf "$A" | while IFS= read -r f; do [ -f "$f" ] && chown --reference="$ref" "$f"; done)
+[ -f "$N" ] && (cd "$R" && while IFS= read -r f; do [ -n "$f" ] && rm -f -- "$f" && echo "убран новый: $f"; done < "$N")
+mv "$A" "$A.undone"; rm -f "$N"
+REMOTE_SH
+)" || die "откат не прошёл — пришли вывод"
+  printf '%s\n' "$back" | sed 's/^/    /'
+  if printf '%s\n' "$back" | grep -v '^убран новый: ' | grep -qvE '\.(py|md|txt|html|css|svg|png|ico|jpg|webp)$|^web/|^docs/|^deploy/|^$'; then
+    restart_panel 0
+  else
+    note "файлы возвращены, перезапуск не нужен"
+  fi
+  save_local "правки до отката"
+  merge_server
+}
+
+cmd_agent() {
+  local venv="$HOME/.tg-agent/venv" py="" c
+  for c in python3.13 python3.12 python3.11 python3.10 python3; do
+    if command -v "$c" >/dev/null && "$c" -c 'import sys; sys.exit(sys.version_info < (3, 10))' 2>/dev/null; then
+      py="$c"; break
+    fi
+  done
+  mkdir -p "$HOME/.tg-agent"
+  say "Ставлю агента (Claude Agent SDK) в ~/.tg-agent"
+  if [ -n "$py" ] && "$py" -m venv "$venv" >/dev/null 2>&1 && "$venv/bin/pip" install -q --upgrade claude-agent-sdk; then
+    :
+  else
+    rm -rf "$venv"
+    # нет Python 3.10+ или модуля venv — берём uv: он сам привезёт нужный Python, без sudo
+    command -v uv >/dev/null || [ -x "$HOME/.local/bin/uv" ] || curl -LsSf https://astral.sh/uv/install.sh | sh >/dev/null
+    local uv; uv="$(command -v uv || echo "$HOME/.local/bin/uv")"
+    "$uv" venv -q --python 3.12 "$venv" && "$uv" pip install -q --python "$venv/bin/python" claude-agent-sdk \
+      || die "не поставился claude-agent-sdk — пришли вывод"
+  fi
+  "$venv/bin/python" -c 'import claude_agent_sdk' || die "claude-agent-sdk не импортируется"
+  note "готово: $("$venv/bin/python" -c 'import claude_agent_sdk as s; print("claude-agent-sdk", getattr(s, "__version__", ""))')"
+}
+
+cmd_logs() { on "journalctl -u tg-panel -n ${1:-80} --no-pager -o cat"; }
+cmd_sh() { exec ssh -t "$HOST" "cd $(printf %q "$REMOTE") && exec bash -l"; }
+
+cmd_venv() {
+  local ver
+  ver="$(on "$REMOTE/venv-tg/bin/pip freeze 2>/dev/null | grep -i '^telethon=='" || true)"
+  python3 -m venv "$DIR/venv-tg" || die "нет модуля venv: sudo apt install python3-venv"
+  "$DIR/venv-tg/bin/pip" install -q "${ver:-telethon==1.45.0}" && note "готово: ${ver:-telethon==1.45.0}"
+}
+
+cmd_test() {
+  [ -x "$DIR/venv-tg/bin/python" ] || die "сначала ./tg venv"
+  (cd "$DIR" && venv-tg/bin/python tests/sandbox/enrich_test.py 2>&1 | tail -5)
+  if command -v node >/dev/null; then (cd "$DIR" && node tests/sandbox/enrich_sched_test.mjs 2>&1 | tail -3)
+  else note "node не стоит — JS-тест пропускаю (sudo apt install nodejs)"; fi
+}
+
+case "${1:-}" in
+  init) shift; cmd_init "$@" ;;
+  pull) cmd_pull ;;
+  ship) shift; cmd_ship "$@" ;;
+  status|st) cmd_status ;;
+  undo) cmd_undo ;;
+  restart) shift; cmd_restart "$@" ;;
+  logs|log) cmd_logs "${2:-80}" ;;
+  sh|ssh) cmd_sh ;;
+  venv) cmd_venv ;;
+  test) cmd_test ;;
+  agent) cmd_agent ;;
+  *) sed -n '3,15p' "$ME" | sed 's/^# \{0,1\}//'; exit 1 ;;
+esac

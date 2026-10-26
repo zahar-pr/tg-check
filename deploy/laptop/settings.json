@@ -1,0 +1,32 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(./tg status)",
+      "Bash(./tg st)",
+      "Bash(./tg pull)",
+      "Bash(./tg logs)",
+      "Bash(./tg logs *)",
+      "Bash(./tg test)",
+      "Bash(git status)",
+      "Bash(git status *)",
+      "Bash(git diff)",
+      "Bash(git diff *)",
+      "Bash(git log *)",
+      "Bash(git show *)",
+      "Bash(grep *)",
+      "Bash(rg *)",
+      "Bash(ls *)",
+      "Bash(wc *)",
+      "Bash(node --check *)",
+      "Bash(node tests/*)",
+      "Bash(venv-tg/bin/python tests/*)"
+    ],
+    "deny": [
+      "Bash(git push *)",
+      "Bash(git remote *)",
+      "Read(./.env)",
+      "Read(**/.env)",
+      "Read(**/*.session)"
+    ]
+  }
+}
