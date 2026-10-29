@@ -20,6 +20,7 @@ import json
 import os
 import re
 import secrets
+import shutil
 import signal
 import subprocess
 import sys
@@ -32,6 +33,7 @@ PROJECT = Path(os.environ.get("TG_PROJECT") or HERE.parent.parent).resolve()
 HOME = Path.home() / ".tg-agent"
 KEY, STATE, RUN, LOG = HOME / "key", HOME / "state.json", HOME / "server.json", HOME / "server.log"
 TOKEN = HOME / "token"     # постоянный: перезапуск пульта не выкидывает открытую вкладку
+PANEL = HOME / "panel.json"  # вход в панель на сервере — чтобы агент сам гонял «Лиды» в ночную смену
 PORT = int(os.environ.get("TG_AGENT_PORT", "8765"))
 FAKE = os.environ.get("TG_AGENT_FAKE") == "1"           # для проверки страницы без API
 MODELS = [("opus", "Opus 5.5", "$4 / $20"), ("sonnet", "Sonnet 5.5", "$2 / $10"), ("haiku", "Haiku 5.5", "дешевле всех")]
@@ -61,11 +63,43 @@ STYLE = """Отвечай по-русски, коротко и по делу. Т
 Английский термин — сразу с переводом в скобках. Работаешь за деньги хозяина (API): не читай файлы
 целиком без нужды (grep, диапазоны строк), не запускай лишних субагентов.
 Хозяин смотрит на тебя через пульт в браузере: справа у него кнопки «Выложить», «Забрать код»,
-«Журнал панели», «Обновить данные». Сам ./tg ship|pull|logs|data и ssh не запускай — с VPN у тебя
-нет связи с сервером. Если ты МЕНЯЛ файлы проекта — проверь правку локально и последней строкой
-напиши: «Готово к выкладке: выключи VPN и нажми «Выложить»». Если только читал или отвечал на
-вопрос — этой строки не пиши. Нужен журнал или состояние сервера — попроси нажать «Журнал панели»
-и прислать, что там."""
+«Журнал панели», «Обновить данные».
+Связь с сервером проверяй так: ssh -o ConnectTimeout=8 tg-server true. Нет связи — значит VPN её
+режет (обход ./tg bypass не настроен): тогда ./tg ship|pull|logs и ssh не запускай, проси хозяина
+нажать кнопку и прислать вывод. Есть связь — журнал и состояние сервера смотри сам (./tg logs 200,
+ssh tg-server '…'), а выкладывай (./tg ship) только когда хозяин просит или идёт ночная смена.
+Если ты МЕНЯЛ файлы и сам не выложил — последней строкой: «Готово к выкладке: нажми «Выложить»».
+Только читал или отвечал на вопрос — этой строки не пиши."""
+
+# Ночная смена: пульт сам ведёт агента по кругу, пока задача не готова, не кончились
+# бюджет или время. Агент заканчивает смену одной из этих строк.
+DONE_MARK, HUMAN_MARK = "МИССИЯ ВЫПОЛНЕНА", "НУЖЕН ЧЕЛОВЕК"
+MISSION_FIRST = """НОЧНАЯ СМЕНА. Хозяин спит и до утра не ответит — работай сам, ничего не спрашивай.
+
+Задача: {goal}
+
+Время: до {until} (это {hours}). Бюджет смены: ${budget}. Модель: {model}.
+
+Как работать:
+1. Сначала план (TodoWrite) и журнал смены docs/NIGHT.md: что сделал, что проверил, что выложил,
+   что осталось и что узнал. Обновляй журнал после каждого шага — беседа длинная, её начало
+   сожмётся и забудется, а журнал останется. Потерял нить — перечитай журнал.
+2. Цикл: правка → локальная проверка (./tg test, node --check, python3 -m py_compile) → {deploy}
+3. Сервер: {server}
+{panel}4. Нельзя: --force; писать людям и трогать рассылку, прокси, аккаунты, пароли; править файлы данных
+   на сервере руками; запускать Telegram-задачи на сервере в обход панели (тот же аккаунт сразу из
+   двух мест — Telegram его выкинет).
+5. После каждой выкладки: ./tg logs 80 и ssh tg-server 'systemctl is-active tg-panel'. Панель не
+   active или в журнале новые ошибки — сразу ./tg undo, потом разбирайся.
+6. Застрял на одном месте после трёх попыток — запиши в журнал и бери следующий пункт.
+7. Всё сделано и проверено — итог в docs/NIGHT.md и последней строкой: {done}.
+   Дальше без человека никак — напиши почему и последней строкой: {human}."""
+MISSION_NEXT = """Продолжай ночную смену. Осталось {left_time} и ${left_money}.
+Задача: {goal}
+{notes}Сверься с планом и docs/NIGHT.md и сделай следующий шаг. Готово и проверено — итог в
+docs/NIGHT.md и последней строкой: {done}."""
+MISSION_LAST = """Время ночной смены вышло. Ничего нового не начинай: допиши в docs/NIGHT.md итог —
+что сделано, что выложено и проверено, что осталось и с чего начать утром. Последней строкой: {done}."""
 
 
 def load_json(p, default):
@@ -136,6 +170,12 @@ class Hub:
         self.todos = []
         self.cmd = None
         self.server = {"ok": None, "at": 0, "err": ""}
+        self.last_text = ""           # последний ответ агента (не субагентов)
+        self.last_error = ""
+        self.turn_failed = False
+        self.inhibit = None           # systemd-inhibit: ноутбук не засыпает, пока идёт смена
+        m = self.st.get("mission")
+        self.mission = m if isinstance(m, dict) else None
 
     # ── рассылка в браузер ──
     async def emit(self, ev, keep=True):
@@ -161,7 +201,8 @@ class Hub:
                 "session": self.st.get("session"), "project": str(PROJECT),
                 "cost": {"session": round(self.session_cost, 4), "month": self.month(), "budget": BUDGET},
                 "context": self.context, "todos": self.todos, "server": self.server,
-                "cmd": self.cmd, "fake": FAKE}
+                "cmd": self.cmd, "fake": FAKE, "mission": self.mission,
+                "panel": PANEL.exists()}
 
     async def push_state(self):
         await self.emit(self.state(), keep=False)
@@ -250,6 +291,12 @@ class Hub:
 
     async def prompt(self, text, images):
         if self.busy:
+            if self.running_mission():
+                # посреди смены — указание уйдёт агенту следующим шагом
+                self.mission.setdefault("notes", []).append(text)
+                self.save_mission()
+                await self.emit({"type": "info", "text": f"передам агенту следующим шагом: {text[:200]}"})
+                return
             await self.emit({"type": "error", "text": "агент ещё работает — дождись или нажми «Стоп»"}, keep=False)
             return
         if not self.client:
@@ -262,6 +309,7 @@ class Hub:
 
     async def turn(self, text, images):
         self.busy = True
+        self.turn_failed, self.last_text, self.last_error = False, "", ""
         await self.push_state()
         try:
             if images:
@@ -279,6 +327,7 @@ class Hub:
             raise
         except Exception as e:
             await self.emit({"type": "error", "text": f"{type(e).__name__}: {str(e)[:500]}"})
+            self.turn_failed, self.last_error = True, str(e)
             self.client = None             # следующий запрос поднимет агента заново (с этой же беседой)
         finally:
             self.busy = False
@@ -305,11 +354,14 @@ class Hub:
             sub = m.parent_tool_use_id is not None
             for b in m.content:
                 if isinstance(b, TextBlock) and not sub and b.text.strip():
+                    self.last_text = b.text
                     await self.emit({"type": "assistant", "text": b.text})
                 elif isinstance(b, ToolUseBlock):
                     inp = b.input or {}
                     await self.emit({"type": "tool", "id": b.id, "name": b.name, "summary": short(b.name, inp),
                                      "input": trim(inp, 3000), "sub": sub})
+                    if self.running_mission() and b.name == "Bash" and re.search(r"\./tg\s+ship\b", str(inp.get("command", ""))):
+                        self.mission["ships"] = self.mission.get("ships", 0) + 1
                     if b.name == "TodoWrite" and isinstance(inp.get("todos"), list):
                         self.todos = inp["todos"]
                         await self.push_state()
@@ -328,6 +380,12 @@ class Hub:
             cost = m.total_cost_usd or 0.0
             self.session_cost += cost
             month = self.month(cost)
+            if m.is_error:
+                self.turn_failed = True
+                self.last_error = str(m.result or m.subtype or "")
+            if self.running_mission():
+                self.mission["spent"] = round(self.mission.get("spent", 0) + cost, 4)
+                self.st["mission"] = self.mission
             if m.session_id:
                 self.st["session"] = m.session_id
             save_json(STATE, self.st)
@@ -341,6 +399,166 @@ class Hub:
                              "seconds": round((m.duration_ms or 0) / 1000)})
         elif isinstance(m, SystemMessage) and m.subtype == "compact_boundary":
             await self.emit({"type": "info", "text": "беседа длинная — агент сжал её начало"})
+
+    # ── ночная смена ──
+    def running_mission(self):
+        return bool(self.mission and self.mission.get("status") == "running")
+
+    def save_mission(self):
+        self.st["mission"] = self.mission
+        save_json(STATE, self.st)
+
+    def inhibit_on(self):
+        """Не дать ноутбуку уснуть, пока идёт смена. Сторож сам уходит, если пульт упал."""
+        if self.inhibit or not shutil.which("systemd-inhibit"):
+            return None
+        watch = f"while kill -0 {os.getpid()} 2>/dev/null; do sleep 20; done"
+        for what in ("idle:sleep:handle-lid-switch", "idle:sleep"):
+            p = subprocess.Popen(["systemd-inhibit", f"--what={what}", "--who=Агент tg-panel", "--why=ночная смена",
+                                  "--mode=block", "sh", "-c", watch],
+                                 stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            time.sleep(0.7)
+            if p.poll() is None:
+                self.inhibit = p
+                return what
+        return None
+
+    def inhibit_off(self):
+        if self.inhibit:
+            try:
+                self.inhibit.terminate()
+            except Exception:
+                pass
+            self.inhibit = None
+
+    def mission_text(self, kind):
+        m = self.mission
+        left = max(0, m["until"] - time.time())
+        until = time.strftime("%H:%M", time.localtime(m["until"]))
+        hours = f"{int(left // 3600)} ч {int(left % 3600 // 60)} мин"
+        if kind == "last":
+            return MISSION_LAST.format(done=DONE_MARK)
+        if kind == "next":
+            notes = m.pop("notes", None) or []
+            self.save_mission()
+            note = "".join(f"Указание хозяина: {n}\n" for n in notes)
+            return MISSION_NEXT.format(left_time=hours, left_money=round(m["budget"] - m.get("spent", 0), 2),
+                                       goal=m["goal"], notes=note, done=DONE_MARK)
+        deploy = ("выкладка (./tg ship — уезжают только изменённые файлы) → проверка на сервере → вывод → следующая\n"
+                  "   правка. Выкладывай маленькими шагами и проверяй каждый."
+                  if m.get("deploy") else
+                  "следующая правка. На сервер НЕ выкладывай — хозяин выложит сам утром; сервер можно только смотреть.")
+        server = ("связь есть (ssh tg-server). Журнал — ./tg logs 200, состояние — ssh tg-server '…' (код и данные\n"
+                  "   основного профиля — /opt/tg-panel, Python-задачи руками — только через runuser -u tgpanel)."
+                  if self.server.get("ok") else
+                  "связи сейчас нет (VPN). Работай локально; раз в час проверяй ssh -o ConnectTimeout=8 tg-server true —\n"
+                  "   появится связь, выкладывай накопленное.")
+        panel = ""
+        if PANEL.exists():
+            panel = ("   Панель на сервере — http://127.0.0.1:8787, ходить через ssh tg-server curl. Вход: POST /api/login\n"
+                     "   с JSON {\"user\",\"pass\"} из ~/.tg-agent/panel.json (значения в ответах не печатай), кука в\n"
+                     "   файл. Действия «Лидов» — grep \"/api/enrich/\" admin.mjs; состояние — GET /api/enrich, лиды —\n"
+                     "   /api/enrich/leads.json. Так проверяй «Лиды» вживую: запуск с маленькой целью, журнал, итог.\n")
+        return MISSION_FIRST.format(goal=m["goal"], until=until, hours=hours, budget=m["budget"],
+                                    model=self.st.get("model", "opus"), deploy=deploy, server=server, panel=panel,
+                                    done=DONE_MARK, human=HUMAN_MARK)
+
+    async def mission_start(self, d):
+        if self.running_mission():
+            return await self.emit({"type": "error", "text": "смена уже идёт"}, keep=False)
+        goal = str(d.get("goal") or "").strip()
+        if not goal:
+            return await self.emit({"type": "error", "text": "напиши задачу на смену"}, keep=False)
+        now = time.time()
+        try:
+            hh, mm = [int(x) for x in str(d.get("until") or "08:00").split(":")[:2]]
+            t = time.localtime(now)
+            until = time.mktime((t.tm_year, t.tm_mon, t.tm_mday, hh, mm, 0, 0, 0, -1))
+            if until <= now + 300:
+                until += 86400
+        except Exception:
+            until = now + 8 * 3600
+        budget = max(1.0, min(200.0, float(d.get("budget") or 20)))
+        if d.get("user") and d.get("pass"):
+            save_json(PANEL, {"user": str(d["user"]), "pass": str(d["pass"])}, mode=0o600)
+        self.st["autopilot"] = True               # ночью спрашивать некого
+        self.mission = {"goal": goal, "until": until, "budget": budget, "deploy": bool(d.get("deploy", True)),
+                        "status": "running", "started": now, "spent": 0.0, "turns": 0, "ships": 0, "reason": ""}
+        self.save_mission()
+        await self.check_server()
+        what = self.inhibit_on()
+        await self.emit({"type": "mission_start", "until": until, "budget": budget,
+                         "sleep": "ноутбук не уснёт, пока идёт смена" + (" (и с закрытой крышкой)" if what and "lid" in what else "")
+                         if what else "не смог запретить сон — отключи засыпание в настройках питания"})
+        await self.push_state()
+        asyncio.ensure_future(self.mission_loop(first=True))
+
+    async def mission_loop(self, first=False):
+        m, errors = self.mission, 0
+        while self.mission is m and m.get("status") == "running":
+            if self.busy:
+                await asyncio.sleep(2)
+                continue
+            if m.get("spent", 0) >= m["budget"]:
+                return await self.mission_end("кончился бюджет смены")
+            last = time.time() >= m["until"]
+            text = self.mission_text("first" if first else "last" if last else "next")
+            first = False
+            if not self.client:
+                await self.start(self.st.get("session"))
+                if not self.client:
+                    return await self.mission_end("нет API-ключа")
+            m["turns"] = m.get("turns", 0) + 1
+            self.save_mission()
+            await self.emit({"type": "user", "text": text, "images": [], "auto": True})
+            await self.turn(text, [])
+            if self.mission is not m or m.get("status") != "running":
+                return
+            self.save_mission()
+            if self.turn_failed:
+                errors += 1
+                low = self.last_error.lower()
+                if "credit balance" in low or "billing" in low:
+                    return await self.mission_end("на ключе кончились деньги")
+                if errors >= 12:
+                    return await self.mission_end("агент не отвечает: 12 сбоев подряд")
+                wait = min(600, 30 * 2 ** min(errors - 1, 5))
+                await self.emit({"type": "info", "text": f"сбой ({self.last_error[:120] or 'нет ответа'}) — повторю через {max(1, wait // 60)} мин"})
+                await asyncio.sleep(wait)
+                continue
+            errors = 0
+            tail = self.last_text[-400:]
+            if DONE_MARK in tail:
+                return await self.mission_end("агент закончил задачу" if not last else "время смены вышло", ok=True)
+            if HUMAN_MARK in tail:
+                return await self.mission_end("агенту нужен человек — смотри его последнее сообщение")
+            if last:
+                return await self.mission_end("время смены вышло", ok=True)
+            if m["turns"] >= 400:
+                return await self.mission_end("слишком много шагов за смену")
+            await asyncio.sleep(3)
+
+    async def mission_end(self, reason, ok=False):
+        m = self.mission
+        if not m:
+            return
+        m.update(status="done" if ok else "stopped", reason=reason, ended=time.time())
+        self.save_mission()
+        self.inhibit_off()
+        await self.emit({"type": "mission_end", "ok": ok, "reason": reason, "turns": m.get("turns", 0),
+                         "spent": m.get("spent", 0), "ships": m.get("ships", 0),
+                         "hours": round((m["ended"] - m["started"]) / 3600, 1),
+                         "journal": (PROJECT / "docs" / "NIGHT.md").exists()})
+        await self.push_state()
+
+    async def mission_stop(self):
+        if not self.running_mission():
+            return
+        m = self.mission
+        m["status"] = "stopping"
+        await self.stop_turn()
+        self.mission = m
+        await self.mission_end("остановил хозяин")
 
     def dangerous(self, tool, inp):
         if tool == "Bash":
@@ -459,6 +677,7 @@ class FakeClient:
 
     async def query(self, prompt):
         self.stop = False
+        self.prompt = prompt if isinstance(prompt, str) else ""
         if not isinstance(prompt, str):
             async for _ in prompt:
                 pass
@@ -493,7 +712,9 @@ class FakeClient:
         if not self.stop:
             yield AssistantMessage(content=[TextBlock(
                 "Готово. Что поменял:\n\n| Файл | Что |\n|---|---|\n| `enrich-analyze.py` | сбой куска не отменяет лид |\n\n"
-                "```python\nif fail and not yes:\n    return fail\n```\n\nГотово к выкладке: выключи VPN и нажми «Выложить».")],
+                "```python\nif fail and not yes:\n    return fail\n```\n\nГотово к выкладке: выключи VPN и нажми «Выложить»."
+                + ("\n\n" + DONE_MARK if "Продолжай ночную смену" in getattr(self, "prompt", "")
+                   and (self.hub.mission or {}).get("turns", 0) >= 3 else ""))],
                 model="fake")
         yield ResultMessage(subtype="success", duration_ms=4200, duration_api_ms=4000, is_error=False, num_turns=3,
                             session_id="fake-session", total_cost_usd=0.0123)
@@ -566,9 +787,19 @@ def make_app(hub, token):
                             if not f.done():
                                 f.set_result(("allow", ""))
                     await hub.push_state()
+                elif t == "mission_start":
+                    await hub.mission_start(d)
+                elif t == "mission_stop":
+                    await hub.mission_stop()
                 elif t == "new":
+                    if hub.running_mission():
+                        await hub.emit({"type": "error", "text": "идёт ночная смена — сначала останови её"}, keep=False)
+                        continue
                     await hub.new(None)
                 elif t == "resume":
+                    if hub.running_mission():
+                        await hub.emit({"type": "error", "text": "идёт ночная смена — сначала останови её"}, keep=False)
+                        continue
                     await hub.new(str(d.get("id")))
         finally:
             hub.socks.discard(ws)
@@ -605,6 +836,13 @@ def make_app(hub, token):
         if not out and (PROJECT / f).is_file():
             out = "".join("+" + ln for ln in (PROJECT / f).read_text("utf-8", "replace").splitlines(True))
         return web.json_response({"diff": out[:400000]})
+
+    async def api_file(req):
+        f = req.query.get("f", "")
+        p = (PROJECT / f).resolve()
+        if not f or PROJECT not in p.parents or not p.is_file():
+            return web.json_response({"error": "нет файла"}, status=404)
+        return web.json_response({"text": p.read_text("utf-8", "replace")[:300000]})
 
     async def api_sessions(req):
         try:
@@ -643,6 +881,7 @@ def make_app(hub, token):
     app.router.add_get("/api/changes", api_changes)
     app.router.add_get("/api/diff", api_diff)
     app.router.add_get("/api/sessions", api_sessions)
+    app.router.add_get("/api/file", api_file)
     app.router.add_post("/api/server", api_server)
     app.router.add_post("/api/cmd", api_cmd)
     app.router.add_post("/api/quit", api_quit)
@@ -687,8 +926,14 @@ def serve():
         await hub.start(hub.st.get("session"))
         if hub.st.get("session") and not FAKE:
             await hub.replay(hub.st["session"])
+        if hub.running_mission():             # пульт перезапускали посреди смены — продолжаем
+            await hub.check_server()
+            hub.inhibit_on()
+            await hub.emit({"type": "info", "text": "пульт перезапустился — продолжаю ночную смену"})
+            asyncio.ensure_future(hub.mission_loop())
 
     async def on_stop(_):
+        hub.inhibit_off()
         if hub.client:
             try:
                 await hub.client.disconnect()

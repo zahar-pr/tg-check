@@ -15,6 +15,8 @@
 #     ./tg test            тесты обогащения (нужен ./tg venv)
 #     ./tg agent           поставить (обновить) агента ./ai — он платит ключом Console
 #     ./tg tools [коммит]  обновить эти инструменты и пульт с GitHub
+#     ./tg bypass          связь с сервером мимо VPN (один раз, спросит пароль sudo):
+#                          VPN можно не выключать — ни тебе, ни агенту
 #
 # Как это устроено. Папка — обычный git, только без GitHub. Ветка server —
 # снимки кода с сервера (без данных и секретов), ветка main — твоя работа.
@@ -55,8 +57,8 @@ need_server() {
   printf '%s\n' "$out" | tail -2 | sed 's/^/  /' >&2
   case "$out" in
     *"Permission denied"*) die "сервер не принял ключ ~/.ssh/id_ed25519" ;;
-    *) die "нет связи с сервером. VPN включён? Выключи его на время команды и повтори —
-  сервер адрес VPN не пускает. Потом включи VPN обратно." ;;
+    *) die "нет связи с сервером. VPN включён? Сервер адрес VPN не пускает.
+  Насовсем: один раз ./tg bypass (сервер пойдёт мимо VPN). Сейчас: выключи VPN и повтори." ;;
   esac
 }
 now() { date '+%d.%m %H:%M'; }
@@ -528,6 +530,57 @@ APP
   note "в меню приложений появился «Агент tg-panel» — открывает пульт"
 }
 
+# Сервер — мимо VPN. Своё правило маршрута только для адреса сервера: в него
+# ходим напрямую, через обычный роутер, остальное — как прежде, через VPN.
+# Тогда агенту не нужно выключать VPN (и терять связь с Claude), чтобы выложить.
+# Правило держит хук NetworkManager — переживает перезагрузку и смену Wi-Fi.
+SERVER_IP=46.16.15.238
+VPN_DEV='dev (tun|wg|tap|ppp|utun|xray|sing|happ|nekoray|clash|mihomo|throne|v2ray)'
+cmd_bypass() {
+  local hook=/etc/NetworkManager/dispatcher.d/90-tg-server-bypass
+  if [ "${1:-}" = off ]; then
+    sudo sh -c "rm -f $hook; ip rule del to $SERVER_IP/32 lookup main priority 50 2>/dev/null; ip route del $SERVER_IP/32 2>/dev/null; true"
+    note "обход снят — сервер снова через VPN (то есть с VPN недоступен)"; return 0
+  fi
+  if "${SSH[@]}" -o ConnectTimeout=8 "$HOST" true 2>/dev/null; then
+    note "связь с сервером уже есть"
+    [ -f "$hook" ] && note "обход VPN стоит" || note "(если VPN сейчас выключен — включи его и запусти ./tg bypass ещё раз)"
+    return 0
+  fi
+  local line gw dev
+  line="$(ip -4 route show table main default 2>/dev/null | grep -vE "$VPN_DEV" | head -1)"
+  gw="$(printf '%s' "$line" | sed -n 's/.* via \([0-9.]*\).*/\1/p')"
+  dev="$(printf '%s' "$line" | sed -n 's/.* dev \([^ ]*\).*/\1/p')"
+  [ -n "$gw" ] && [ -n "$dev" ] || die "не нашёл обычный выход в интернет (роутер) — пришли Claude вывод: ip -4 route; ip rule"
+  say "Сервер $SERVER_IP — напрямую через $dev ($gw), остальное — через VPN"
+  note "сейчас спросит пароль от ноутбука (sudo) — один раз"
+  local hook_body
+  hook_body="#!/bin/sh
+# tg-panel: связь с сервером панели мимо VPN (поставил ./tg bypass; снять — ./tg bypass off)
+IP=$SERVER_IP
+L=\$(ip -4 route show table main default | grep -vE '$VPN_DEV' | head -1)
+GW=\$(echo \"\$L\" | sed -n 's/.* via \\([0-9.]*\\).*/\\1/p'); DEV=\$(echo \"\$L\" | sed -n 's/.* dev \\([^ ]*\\).*/\\1/p')
+[ -n \"\$GW\" ] && [ -n \"\$DEV\" ] || exit 0
+ip route replace \$IP/32 via \$GW dev \$DEV
+ip rule show | grep -q \"to \$IP lookup main\" || ip rule add to \$IP/32 lookup main priority 50
+exit 0
+"
+  printf '%s' "$hook_body" | sudo sh -c "
+    ip route replace $SERVER_IP/32 via $gw dev $dev &&
+    { ip rule show | grep -q 'to $SERVER_IP lookup main' || ip rule add to $SERVER_IP/32 lookup main priority 50; } &&
+    if [ -d /etc/NetworkManager/dispatcher.d ]; then cat > $hook && chmod 755 $hook; else cat > /dev/null; fi" \
+    || die "не получилось (sudo?) — пришли вывод Claude"
+  if "${SSH[@]}" -o ConnectTimeout=10 "$HOST" true 2>/dev/null; then
+    note "готово: сервер доступен при включённом VPN"
+    [ -f "$hook" ] && note "правило переживёт перезагрузку и смену Wi-Fi" || note "NetworkManager не нашёл — после перезагрузки запусти ./tg bypass снова"
+  else
+    note "маршрут поставил, но сервер всё равно не отвечает: VPN перехватывает трафик сам (nftables)."
+    note "Тогда в Happ: настройки маршрутизации → прямое подключение (direct) → добавь IP $SERVER_IP/32."
+    note "Проверить: ssh tg-server true && echo OK"
+    return 1
+  fi
+}
+
 cmd_logs() { on "journalctl -u tg-panel -n ${1:-80} --no-pager -o cat"; }
 cmd_sh() { exec ssh -t "$HOST" "cd $(printf %q "$REMOTE") && exec bash -l"; }
 
@@ -561,6 +614,7 @@ case "${1:-}" in
   test) cmd_test ;;
   agent) cmd_agent ;;
   tools) shift; cmd_tools "$@" ;;
+  bypass) shift; cmd_bypass "$@" ;;
   data) shift; cmd_data "$@" ;;
-  *) sed -n '3,18p' "$ME" | sed 's/^# \{0,1\}//'; exit 1 ;;
+  *) sed -n '3,20p' "$ME" | sed 's/^# \{0,1\}//'; exit 1 ;;
 esac

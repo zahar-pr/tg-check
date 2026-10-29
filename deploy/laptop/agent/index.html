@@ -129,6 +129,19 @@ aside { border-left: 1px solid var(--line); background: var(--panel); overflow-y
 #toast { position: fixed; bottom: 18px; left: 50%; transform: translateX(-50%); background: var(--panel2); border: 1px solid var(--line); padding: 9px 16px; border-radius: 10px; display: none; z-index: 30; max-width: 90vw; }
 #toast.on { display: block; }
 .side-toggle { display: none; }
+#night.on { background: #2a2357; border-color: #8b7bff; color: #fff; }
+.msg-auto { align-self: flex-end; max-width: 80%; border: 1px dashed #5b52a8; color: var(--muted); padding: 7px 12px; border-radius: 14px; font-size: 13.5px; white-space: pre-wrap; cursor: pointer; }
+.msg-auto b { color: #b9b1ff; }
+.msg-auto .full { display: none; margin-top: 6px; color: var(--text); }
+.msg-auto.open .full { display: block; }
+.night-end { border: 1px solid #5b52a8; background: rgba(139,123,255,.08); border-radius: 12px; padding: 10px 12px; }
+.night-end.ok { border-color: var(--green); background: rgba(63,207,142,.07); }
+.form { display: grid; gap: 10px; }
+.form label { display: grid; gap: 4px; font-size: 13.5px; color: var(--muted); }
+.form textarea, .form input[type=number], .form input[type=time] { background: var(--bg); border: 1px solid var(--line); color: var(--text); padding: 8px 10px; border-radius: 9px; font: inherit; }
+.form textarea { min-height: 120px; resize: vertical; }
+.form .row2 { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
+.form .chk { display: flex; gap: 8px; align-items: center; color: var(--text); }
 @media (max-width: 980px) {
   .main { grid-template-columns: 1fr; }
   aside { position: fixed; right: 0; top: 0; bottom: 0; width: min(380px, 92vw); z-index: 15; transform: translateX(100%); transition: .2s; box-shadow: -10px 0 30px rgba(0,0,0,.4); }
@@ -151,6 +164,7 @@ aside { border-left: 1px solid var(--line); background: var(--panel); overflow-y
     <div class="grow"></div>
     <span class="pill" id="ctx" title="Сколько памяти беседы занято. Ближе к 100% агент сожмёт начало — лучше начать новую беседу.">контекст —</span>
     <span class="pill" id="cost" title="Оценка по ценам API. Точно — platform.claude.com/usage">$0.00</span>
+    <button class="btn" id="night" title="Агент работает сам до утра: правит, проверяет, выкладывает">🌙 Ночная смена</button>
     <button class="btn" id="history">История</button>
     <button class="btn" id="newchat" title="Начать новую беседу">+ Новая</button>
     <button class="btn side-toggle" id="sidetog">Сервер ▸</button>
@@ -181,7 +195,7 @@ aside { border-left: 1px solid var(--line); background: var(--panel); overflow-y
           <button class="btn" id="c-status">Что отличается</button>
           <button class="btn danger wide" id="c-undo">Откатить последнюю выкладку</button>
         </div>
-        <p class="muted" style="margin:10px 0 0">Сервер пускает только <b>без VPN</b>. Выключи VPN → нажми кнопку → дождись «готово» → включи VPN.</p>
+        <p class="muted" style="margin:10px 0 0">Нет связи — значит VPN её режет. Один раз выполни в терминале <code>cd ~/tg-panel && ./tg bypass</code> — и сервер будет доступен с включённым VPN, тебе и агенту.</p>
       </div>
       <div class="card">
         <h3>Ещё не на сервере <span class="grow"></span><button class="btn" id="refresh" style="padding:2px 9px;font-size:12px">обновить</button></h3>
@@ -218,6 +232,27 @@ aside { border-left: 1px solid var(--line); background: var(--panel); overflow-y
 <div class="modal" id="m-hist"><div class="win small">
   <div class="top"><span class="grow">Прошлые беседы</span><button class="btn" data-close>Закрыть</button></div>
   <div class="cnt list" id="hlist"><span class="muted">загружаю…</span></div>
+</div></div>
+
+<div class="modal" id="m-night"><div class="win">
+  <div class="top"><span class="grow">🌙 Ночная смена — агент работает сам</span><button class="btn" data-close>Закрыть</button></div>
+  <div class="cnt">
+    <div id="night-run" style="display:none"></div>
+    <div class="form" id="night-form">
+      <label>Задача на смену — как поставил бы её человеку: что сделать и как понять, что готово
+        <textarea id="n-goal" placeholder="Например: почини «Лиды» по docs/NEXT.md (пункты 1–4). Готово — когда автопилот на сервере с целью 3 лида находит хотя бы одного настоящего покупателя, а тесты зелёные."></textarea></label>
+      <div class="row2">
+        <label>Работать до<input type="time" id="n-until" value="08:00"></label>
+        <label>Бюджет смены, $<input type="number" id="n-budget" value="20" min="1" max="200" step="1"></label>
+      </div>
+      <label class="chk"><input type="checkbox" id="n-deploy" checked> можно выкладывать на сервер и проверять там (маленькими шагами, с откатом при ошибке)</label>
+      <details id="n-panel"><summary class="muted" style="cursor:pointer">Вход в панель — чтобы агент сам запускал «Лиды» и смотрел результат</summary>
+        <div class="row2" style="margin-top:8px"><input type="text" id="n-user" placeholder="логин" autocomplete="off"><input type="password" id="n-pass" placeholder="пароль" autocomplete="off"></div>
+        <p class="muted" style="margin:6px 0 0">Хранится только на этом ноутбуке: ~/.tg-agent/panel.json.</p></details>
+      <div class="muted" id="n-hints"></div>
+    </div>
+  </div>
+  <div class="bot"><button class="btn danger" id="n-stop" style="display:none">Остановить смену</button><button class="btn primary" id="n-start">Начать смену</button></div>
 </div></div>
 
 <div class="modal" id="m-confirm"><div class="win small">
@@ -317,6 +352,12 @@ function onEvent(e) {
   switch (e.type) {
     case 'reset': feed.innerHTML = ''; tools = {}; live = null; liveText = ''; emptyState(); break;
     case 'user': {
+      if (e.auto) {
+        const first = e.text.startsWith('НОЧНАЯ') ? 'задание на смену' : e.text.startsWith('Время') ? 'смена кончается — итог' : 'продолжай смену';
+        const d = add(div('msg-auto', `🌙 <b>пульт → агенту:</b> ${first} <span class="muted">▸</span><div class="full">${esc(e.text)}</div>`));
+        d.onclick = () => d.classList.toggle('open');
+        break;
+      }
       const d = add(div('msg-user', esc(e.text)));
       (e.images || []).forEach((u) => { const im = document.createElement('img'); im.src = u; d.appendChild(im); });
       chat.scrollTop = chat.scrollHeight; break;
@@ -360,6 +401,13 @@ function onEvent(e) {
       if (/Готово к выкладке/i.test(lastAssistant)) $('#c-ship').classList.add('pulse');
       loadChanges(); break;
     case 'info': add(div('info', esc(e.text))); break;
+    case 'mission_start': add(div('info', `🌙 смена началась — до ${new Date(e.until * 1000).toLocaleTimeString('ru', { hour: '2-digit', minute: '2-digit' })}, бюджет $${e.budget}. ${esc(e.sleep)}`)); break;
+    case 'mission_end': {
+      const c = add(div('night-end' + (e.ok ? ' ok' : ''), `<b>🌙 Смена закончена:</b> ${esc(e.reason)}<br><span class="muted">${e.hours} ч · шагов ${e.turns} · выкладок ${e.ships} · потрачено $${(+e.spent).toFixed(2)}</span>${e.journal ? '<div style="margin-top:8px"><button class="btn">Журнал смены (docs/NIGHT.md)</button></div>' : ''}`));
+      c.querySelector('button')?.addEventListener('click', showJournal);
+      document.title = '🌙 Смена закончена';
+      break;
+    }
     case 'error': add(div('err', esc(e.text))); break;
     case 'thinking': break;
     case 'state': setState(e); break;
@@ -398,6 +446,16 @@ function setState(s) {
   $('#todocard').style.display = td.length ? '' : 'none';
   $('#todos').innerHTML = td.map((x) => `<div class="todo ${esc(x.status)}">${x.status === 'completed' ? '✔' : x.status === 'in_progress' ? '▸' : '○'} ${esc(x.status === 'in_progress' ? (x.activeForm || x.content) : x.content)}</div>`).join('');
   modal('#m-key', !s.key);
+  const m = s.mission, run = m && (m.status === 'running' || m.status === 'stopping');
+  const nb = $('#night');
+  nb.classList.toggle('on', !!run);
+  nb.textContent = run ? `🌙 до ${new Date(m.until * 1000).toLocaleTimeString('ru', { hour: '2-digit', minute: '2-digit' })} · $${(+m.spent).toFixed(2)}/${m.budget} · шаг ${m.turns}` : '🌙 Ночная смена';
+  $('#night-form').style.display = run ? 'none' : '';
+  $('#n-start').style.display = run ? 'none' : '';
+  $('#n-stop').style.display = run ? '' : 'none';
+  $('#night-run').style.display = run ? '' : 'none';
+  if (run) $('#night-run').innerHTML = `<p><b>Идёт смена.</b> До ${new Date(m.until * 1000).toLocaleString('ru')}, потрачено $${(+m.spent).toFixed(2)} из $${m.budget}, шагов ${m.turns}, выкладок ${m.ships || 0}.</p><p class="muted">Задача: ${esc(m.goal)}</p><p class="muted">Можно написать агенту в чат — указание уйдёт ему следующим шагом.</p>`;
+  if (m && !run && m.goal && !$('#n-goal').value) $('#n-goal').value = m.goal;
   if (s.fake) $('.brand small').textContent = '· тест';
 }
 
@@ -450,6 +508,31 @@ document.addEventListener('drop', (e) => { e.preventDefault(); for (const f of e
 // ── шапка ──
 $('#auto').onchange = (e) => { send({ type: 'autopilot', value: e.target.checked }); toast(e.target.checked ? 'Автопилот: агент сам подтверждает всё, ничего не спрашивает' : 'Автопилот выключен: агент спросит про опасное (ssh, sudo, выкладка, удаление вне папки)', 5000); };
 $('#newchat').onclick = () => { if (S.busy && !confirm('Агент ещё работает. Остановить и начать новую беседу?')) return; send({ type: 'new' }); };
+$('#night').onclick = async () => {
+  modal('#m-night');
+  const sv = S.server || {};
+  const hints = [];
+  if (!S.autopilot) hints.push('Автопилот включится сам — ночью спрашивать некого.');
+  if (sv.ok !== true) hints.push('Связь с сервером сейчас не проверена или её нет. Чтобы агент мог выкладывать и проверять с включённым VPN, один раз выполни в терминале: <code>cd ~/tg-panel && ./tg bypass</code>');
+  hints.push('Ноутбук на зарядку. Пульт не даст ему уснуть, пока идёт смена.');
+  hints.push('Модель — та, что выбрана вверху. Sonnet вдвое дешевле Opus: за ночь это заметно.');
+  $('#n-hints').innerHTML = hints.map((h) => '• ' + h).join('<br>');
+  if (S.panel) $('#n-panel summary').textContent = 'Вход в панель сохранён ✓ (можно заменить)';
+  check();
+};
+$('#n-start').onclick = () => {
+  const goal = $('#n-goal').value.trim();
+  if (!goal) return toast('напиши задачу на смену');
+  if (S.busy) return toast('агент ещё отвечает — дождись или нажми «Стоп»');
+  send({ type: 'mission_start', goal, until: $('#n-until').value || '08:00', budget: +$('#n-budget').value || 20, deploy: $('#n-deploy').checked, user: $('#n-user').value.trim(), pass: $('#n-pass').value });
+  $('#n-pass').value = ''; modal('#m-night', false);
+};
+$('#n-stop').onclick = () => { if (confirm('Остановить ночную смену?')) { send({ type: 'mission_stop' }); modal('#m-night', false); } };
+async function showJournal() {
+  $('#dtitle').textContent = 'docs/NIGHT.md'; $('#dbody').textContent = 'загружаю…'; modal('#m-diff');
+  const d = await api('/api/file?f=' + encodeURIComponent('docs/NIGHT.md'));
+  $('#dbody').innerHTML = d.text ? `<div class="msg-ai" style="white-space:normal;font-family:inherit;font-size:14px">${md(d.text)}</div>` : esc(d.error || 'пусто');
+}
 $('#history').onclick = async () => {
   modal('#m-hist'); $('#hlist').innerHTML = '<span class="muted">загружаю…</span>';
   const d = await api('/api/sessions');
@@ -490,7 +573,7 @@ async function runCmd(name, title) {
   if (name === 'undo' && !await confirmBox('Откатить последнюю выкладку', '<p>Файлы на сервере вернутся к виду до последней выкладки.</p>')) return;
   openSide();
   if (!await check()) {
-    if (await confirmBox('Нет связи с сервером', '<p>Скорее всего, включён <b>VPN</b> — сервер его адрес не пускает.</p><p>Выключи VPN и нажми «Поехали». Пульт работает и без VPN.</p>')) return runCmd(name, title);
+    if (await confirmBox('Нет связи с сервером', '<p>Скорее всего, связь режет <b>VPN</b>.</p><p>Насовсем: один раз выполни в терминале <code>cd ~/tg-panel && ./tg bypass</code>.<br>Сейчас: выключи VPN и нажми «Поехали» (пульт работает и без VPN).</p>')) return runCmd(name, title);
     return;
   }
   const d = await api('/api/cmd', { method: 'POST', body: JSON.stringify({ cmd: name }) });
