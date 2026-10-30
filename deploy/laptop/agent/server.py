@@ -1008,9 +1008,70 @@ def serve():
             RUN.unlink(missing_ok=True)
 
     app.on_startup.append(on_start)
+    async def on_shutdown(_):
+        # открытая вкладка держала бы старый пульт (и порт) ещё минуту — закрываем сразу
+        for ws in list(hub.socks):
+            try:
+                await ws.close(code=1001, message=b"restart")
+            except Exception:
+                pass
+
+    app.on_shutdown.append(on_shutdown)
     app.on_cleanup.append(on_stop)
     print(f"пульт: http://127.0.0.1:{PORT}/?t={token}", flush=True)
-    web.run_app(app, host="127.0.0.1", port=PORT, print=None, handle_signals=True)
+    web.run_app(app, host="127.0.0.1", port=PORT, print=None, handle_signals=True, shutdown_timeout=3)
+
+
+def our_servers():
+    """Все запущенные пульты этого пользователя — и те, о ком server.json уже забыл."""
+    pids = set()
+    pid = int(load_json(RUN, {}).get("pid") or 0)
+    if pid > 0:
+        pids.add(pid)
+    proc = Path("/proc")
+    if proc.is_dir():
+        for d in proc.iterdir():
+            if not d.name.isdigit() or int(d.name) == os.getpid():
+                continue
+            try:
+                if d.stat().st_uid != os.getuid():
+                    continue
+                cmd = (d / "cmdline").read_bytes().split(b"\0")
+            except OSError:
+                continue
+            if b"--serve" in cmd and any(c.endswith(b"agent/server.py") for c in cmd):
+                pids.add(int(d.name))
+    return [p for p in pids if alive(p)]
+
+
+def alive(pid):
+    try:
+        os.kill(pid, 0)
+        return True
+    except OSError:
+        return False
+
+
+def stop_all():
+    """Выключить пульт и дождаться, пока он отпустит порт."""
+    pids = our_servers()
+    for p in pids:
+        try:
+            os.kill(p, signal.SIGTERM)
+        except OSError:
+            pass
+    for _ in range(40):
+        if not any(alive(p) for p in pids):
+            break
+        time.sleep(0.25)
+    for p in pids:
+        if alive(p):
+            try:
+                os.kill(p, signal.SIGKILL)
+            except OSError:
+                pass
+    RUN.unlink(missing_ok=True)
+    return len(pids)
 
 
 def main():
@@ -1018,17 +1079,11 @@ def main():
     if arg == "--serve":
         return serve()
     if arg == "stop":
-        pid = int(load_json(RUN, {}).get("pid") or 0)
-        try:
-            if pid <= 0:
-                raise ProcessLookupError
-            os.kill(pid, signal.SIGTERM)
-            print("пульт выключен")
-        except Exception:
-            print("пульт и так не запущен")
+        print("пульт выключен" if stop_all() else "пульт и так не запущен")
         return
     url = running()
     if not url:
+        stop_all()                    # недовыключенный старый пульт держал бы порт
         HOME.mkdir(parents=True, exist_ok=True)
         with open(LOG, "ab") as log:
             subprocess.Popen([sys.executable, __file__, "--serve"], stdin=subprocess.DEVNULL, stdout=log, stderr=log,
@@ -1039,7 +1094,11 @@ def main():
             if url:
                 break
         if not url:
-            sys.exit(f"пульт не запустился — подробности: {LOG}")
+            try:
+                tail = "\n".join(LOG.read_text("utf-8", "replace").splitlines()[-12:])
+            except OSError:
+                tail = ""
+            sys.exit(f"пульт не запустился. Конец журнала ({LOG}):\n{tail}")
     print(f"пульт: {url}\nвыключить: ./ai stop")
     if os.environ.get("TG_AGENT_NO_BROWSER") != "1":
         webbrowser.open(url)
