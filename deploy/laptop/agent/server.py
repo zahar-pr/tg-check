@@ -39,11 +39,11 @@ FAKE = os.environ.get("TG_AGENT_FAKE") == "1"           # для проверк�
 MODELS = [("opus", "Opus 5.5", "$4 / $20"), ("sonnet", "Sonnet 5.5", "$2 / $10"), ("haiku", "Haiku 5.5", "дешевле всех")]
 BUDGET = 200.0
 ANSI = re.compile(r"\x1b\[[0-9;]*m")
-LOCAL_ONLY = re.compile(r"^(tests/|\.claude/|\.tools/|server-data/|CLAUDE\.md$|tg$|ai$|venv|node_modules/)")
+LOCAL_ONLY = re.compile(r"^(tests/|\.claude/|\.tools/|server-data/|CLAUDE\.md$|tg$|ai$|panel$|venv|node_modules/)")
 # Что спрашивать даже в режиме «без вопросов»: сервер, система, история git
 DANGER = re.compile(r"""
     (^|[;&|(`\s])(ssh|scp|rsync|sudo|su|systemctl|reboot|shutdown|mkfs|dd|crontab)\b
-  | \./tg\s+(ship|undo|restart|data|pull|sh|ssh|tools)\b
+  | \./tg\s+(ship|undo|restart|data|pull|sh|ssh|tools)\b | \./panel\s+post\b
   | \bgit\s+(push|remote|reset\s+--hard|clean|filter-branch|rebase|update-ref|branch\s+-[dD])
   | \brm\s+(-\w+\s+)*(/|~|\$HOME|\.\.)
   | (curl|wget)[^|]*\|\s*(ba|z)?sh
@@ -74,6 +74,7 @@ ssh tg-server '…'), а выкладывай (./tg ship) только когд�
 # Ночная смена: пульт сам ведёт агента по кругу, пока задача не готова, не кончились
 # бюджет или время. Агент заканчивает смену одной из этих строк.
 DONE_MARK, HUMAN_MARK = "МИССИЯ ВЫПОЛНЕНА", "НУЖЕН ЧЕЛОВЕК"
+WAIT_MARK = re.compile(r"ЖДУ\s+(\d{1,3})\s*МИН")       # «подожди N минут» — идёт прогон, тратить нечего
 MISSION_FIRST = """НОЧНАЯ СМЕНА. Хозяин спит и до утра не ответит — работай сам, ничего не спрашивай.
 
 Задача: {goal}
@@ -92,9 +93,12 @@ MISSION_FIRST = """НОЧНАЯ СМЕНА. Хозяин спит и до утр
 5. После каждой выкладки: ./tg logs 80 и ssh tg-server 'systemctl is-active tg-panel'. Панель не
    active или в журнале новые ошибки — сразу ./tg undo, потом разбирайся.
 6. Застрял на одном месте после трёх попыток — запиши в журнал и бери следующий пункт.
-7. Всё сделано и проверено — итог в docs/NIGHT.md и последней строкой: {done}.
+7. Нужно подождать (идёт прогон, панель что-то делает) — закончи ответ строкой «ЖДУ N МИН»
+   (N — до 60): пульт разбудит тебя через N минут. Не жди внутри команд (sleep) — это зря тратит
+   время и деньги, а ожидание через пульт бесплатное.
+8. Всё сделано и проверено — итог в docs/NIGHT.md и последней строкой: {done}.
    Дальше без человека никак — напиши почему и последней строкой: {human}."""
-MISSION_NEXT = """Продолжай ночную смену. Осталось {left_time} и ${left_money}.
+MISSION_NEXT = """{waited}Продолжай ночную смену. Осталось {left_time} и ${left_money}.
 Задача: {goal}
 {notes}Сверься с планом и docs/NIGHT.md и сделай следующий шаг. Готово и проверено — итог в
 docs/NIGHT.md и последней строкой: {done}."""
@@ -173,7 +177,12 @@ class Hub:
         self.last_text = ""           # последний ответ агента (не субагентов)
         self.last_error = ""
         self.turn_failed = False
+        # SDK в каждом итоге присылает стоимость всей беседы с начала (и после
+        # продолжения в новом процессе — тоже с накопленной суммы). Цена ответа —
+        # разница с прошлым итогом; складывать сами итоги — считать одно по многу раз
+        self.cost_last = 0.0
         self.inhibit = None           # systemd-inhibit: ноутбук не засыпает, пока идёт смена
+        self.wake = None              # разбудить агента раньше срока («ЖДУ N МИН»)
         m = self.st.get("mission")
         self.mission = m if isinstance(m, dict) else None
 
@@ -238,6 +247,10 @@ class Hub:
         os.environ["ANTHROPIC_API_KEY"] = "fake" if FAKE else KEY.read_text("utf-8").strip()
         for k in ("ANTHROPIC_AUTH_TOKEN", "CLAUDE_CODE_OAUTH_TOKEN", "CLAUDE_CODE_USE_BEDROCK", "CLAUDE_CODE_USE_VERTEX"):
             os.environ.pop(k, None)
+        seen = self.st.get("cost_seen") or {}
+        # продолжаем беседу, о которой итога не знаем (например, первую после обновления
+        # пульта): её прошлую сумму не угадать — первый ответ не считаем, чем завысить в разы
+        self.cost_last = (float(seen[resume]) if resume in seen else None) if resume else 0.0
         if FAKE:
             self.client = FakeClient(self)
         else:
@@ -377,7 +390,17 @@ class Hub:
                     await self.emit({"type": "tool_result", "id": b.tool_use_id, "error": bool(b.is_error),
                                      "text": trim(str(c or ""), 6000)})
         elif isinstance(m, ResultMessage):
-            cost = m.total_cost_usd or 0.0
+            total = float(m.total_cost_usd or 0.0)
+            if self.cost_last is None:
+                cost = 0.0
+            else:
+                cost = total - self.cost_last if total >= self.cost_last else total
+            self.cost_last = total
+            if m.session_id:
+                seen = self.st.setdefault("cost_seen", {})
+                seen[m.session_id] = total
+                for k in list(seen)[:-40]:
+                    seen.pop(k, None)
             self.session_cost += cost
             month = self.month(cost)
             if m.is_error:
@@ -442,7 +465,9 @@ class Hub:
             notes = m.pop("notes", None) or []
             self.save_mission()
             note = "".join(f"Указание хозяина: {n}\n" for n in notes)
-            return MISSION_NEXT.format(left_time=hours, left_money=round(m["budget"] - m.get("spent", 0), 2),
+            waited = m.pop("waited", 0)
+            return MISSION_NEXT.format(waited=f"Прошло {waited} мин — проверь, что изменилось. " if waited else "",
+                                       left_time=hours, left_money=round(m["budget"] - m.get("spent", 0), 2),
                                        goal=m["goal"], notes=note, done=DONE_MARK)
         deploy = ("выкладка (./tg ship — уезжают только изменённые файлы) → проверка на сервере → вывод → следующая\n"
                   "   правка. Выкладывай маленькими шагами и проверяй каждый."
@@ -455,10 +480,10 @@ class Hub:
                   "   появится связь, выкладывай накопленное.")
         panel = ""
         if PANEL.exists():
-            panel = ("   Панель на сервере — http://127.0.0.1:8787, ходить через ssh tg-server curl. Вход: POST /api/login\n"
-                     "   с JSON {\"user\",\"pass\"} из ~/.tg-agent/panel.json (значения в ответах не печатай), кука в\n"
-                     "   файл. Действия «Лидов» — grep \"/api/enrich/\" admin.mjs; состояние — GET /api/enrich, лиды —\n"
-                     "   /api/enrich/leads.json. Так проверяй «Лиды» вживую: запуск с маленькой целью, журнал, итог.\n")
+            panel = ("   Панель на сервере — через ./panel (сам входит): ./panel get /api/enrich — состояние «Лидов»,\n"
+                     "   ./panel log — журнал панели, ./panel leads — лиды последнего захода, ./panel readers —\n"
+                     "   читатели, ./panel post /api/enrich/auto '{json}' — запуск и остановка автопилота\n"
+                     "   (подробно: grep -n \"what === 'auto'\" -A20 admin.mjs).\n")
         return MISSION_FIRST.format(goal=m["goal"], until=until, hours=hours, budget=m["budget"],
                                     model=self.st.get("model", "opus"), deploy=deploy, server=server, panel=panel,
                                     done=DONE_MARK, human=HUMAN_MARK)
@@ -528,6 +553,27 @@ class Hub:
                 continue
             errors = 0
             tail = self.last_text[-400:]
+            w = WAIT_MARK.search(tail)
+            if w and not last and DONE_MARK not in tail and HUMAN_MARK not in tail:
+                mins = max(1, min(60, int(w.group(1))))
+                wake = min(time.time() + mins * 60, m["until"])
+                m["wait_until"] = wake
+                self.save_mission()
+                await self.push_state()
+                await self.emit({"type": "info", "text": "агент ждёт — проверит в "
+                                 + time.strftime("%H:%M", time.localtime(wake))})
+                self.wake = asyncio.Event()
+                try:
+                    await asyncio.wait_for(self.wake.wait(), max(1, wake - time.time()))
+                except asyncio.TimeoutError:
+                    pass
+                if self.mission is not m or m.get("status") != "running":
+                    return
+                m["waited"] = max(1, round((time.time() - (wake - mins * 60)) / 60))
+                m.pop("wait_until", None)
+                self.save_mission()
+                await self.push_state()
+                continue
             if DONE_MARK in tail:
                 return await self.mission_end("агент закончил задачу" if not last else "время смены вышло", ok=True)
             if HUMAN_MARK in tail:
@@ -556,6 +602,8 @@ class Hub:
             return
         m = self.mission
         m["status"] = "stopping"
+        if self.wake:
+            self.wake.set()
         await self.stop_turn()
         self.mission = m
         await self.mission_end("остановил хозяин")
@@ -658,7 +706,7 @@ class FakeClient:
     """Агент-понарошку (TG_AGENT_FAKE=1): проверить страницу, не тратя деньги."""
 
     def __init__(self, hub):
-        self.hub, self.stop = hub, False
+        self.hub, self.stop, self.total = hub, False, hub.cost_last or 0.0
 
     async def connect(self):
         pass
@@ -714,10 +762,15 @@ class FakeClient:
                 "Готово. Что поменял:\n\n| Файл | Что |\n|---|---|\n| `enrich-analyze.py` | сбой куска не отменяет лид |\n\n"
                 "```python\nif fail and not yes:\n    return fail\n```\n\nГотово к выкладке: выключи VPN и нажми «Выложить»."
                 + ("\n\n" + DONE_MARK if "Продолжай ночную смену" in getattr(self, "prompt", "")
-                   and (self.hub.mission or {}).get("turns", 0) >= 3 else ""))],
+                   and (self.hub.mission or {}).get("turns", 0) >= 3 else
+                   "\n\nПрогон запущен.\nЖДУ 1 МИН" if getattr(self, "prompt", "").startswith("НОЧНАЯ") else ""))],
                 model="fake")
         yield ResultMessage(subtype="success", duration_ms=4200, duration_api_ms=4000, is_error=False, num_turns=3,
-                            session_id="fake-session", total_cost_usd=0.0123)
+                            session_id="fake-session", total_cost_usd=self._add(0.0123))
+
+    def _add(self, x):
+        self.total = round(self.total + x, 6)
+        return self.total
 
 
 # ─────────────────────────────── веб ───────────────────────────────
@@ -779,6 +832,15 @@ def make_app(hub, token):
                             except Exception:
                                 hub.client = None
                         await hub.push_state()
+                elif t == "spent":
+                    # поправить счётчик месяца по Console (platform.claude.com/usage)
+                    try:
+                        v = max(0.0, float(d.get("value")))
+                    except (TypeError, ValueError):
+                        continue
+                    hub.st.setdefault("spent", {})[time.strftime("%Y-%m")] = round(v, 2)
+                    save_json(STATE, hub.st)
+                    await hub.push_state()
                 elif t == "autopilot":
                     hub.st["autopilot"] = bool(d.get("value"))
                     save_json(STATE, hub.st)
@@ -791,6 +853,9 @@ def make_app(hub, token):
                     await hub.mission_start(d)
                 elif t == "mission_stop":
                     await hub.mission_stop()
+                elif t == "wake":
+                    if hub.wake:
+                        hub.wake.set()
                 elif t == "new":
                     if hub.running_mission():
                         await hub.emit({"type": "error", "text": "идёт ночная смена — сначала останови её"}, keep=False)

@@ -40,7 +40,7 @@ BACKUPS="${TG_BACKUPS:-/root/tg-ship-backups}"
 ME="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/$(basename "${BASH_SOURCE[0]}")"
 DIR="$(dirname "$ME")"
 # эти файлы нужны только тут: на сервер их не возим
-LOCAL_ONLY='^(tests/|\.claude/|\.tools/|server-data/|CLAUDE\.md$|tg$|ai$|venv|node_modules/)'
+LOCAL_ONLY='^(tests/|\.claude/|\.tools/|server-data/|CLAUDE\.md$|tg$|ai$|panel$|venv|node_modules/)'
 
 say() { printf '\n\033[1m%s\033[0m\n' "$*"; }
 note() { printf '  %s\n' "$*"; }
@@ -283,7 +283,7 @@ cmd_status() {
   say "Твои незакоммиченные правки"
   [ -n "$mine" ] && printf '%s\n' "$mine" | sed 's/^/  /' || note "нет"
   say "Ещё не на сервере (main против последнего снимка)"
-  local diff; diff="$(G diff --stat server main -- . ':!tests' ':!.claude' ':!.tools' ':!CLAUDE.md' ':!tg' ':!ai' 2>/dev/null | tail -15)" || true
+  local diff; diff="$(G diff --stat server main -- . ':!tests' ':!.claude' ':!.tools' ':!CLAUDE.md' ':!tg' ':!ai' ':!panel' 2>/dev/null | tail -15)" || true
   [ -n "$diff" ] && printf '%s\n' "$diff" | sed 's/^/  /' || note "всё выложено"
   [ -z "$mine" ] || note "(плюс незакоммиченное выше — ship заберёт и его)"
   say "Новое на сервере с прошлого синка"
@@ -461,6 +461,7 @@ install_tools() {
   # дочитывает скрипт по ходу — запись поверх сломала бы ему остаток
   cp "$from/deploy/laptop/tg" "$DIR/.tg.new" && chmod +x "$DIR/.tg.new" && mv -f "$DIR/.tg.new" "$DIR/tg"
   cp "$from/deploy/laptop/ai" "$DIR/ai" && chmod +x "$DIR/ai"
+  cp "$from/deploy/laptop/panel" "$DIR/panel" && chmod +x "$DIR/panel"
   cp "$from/deploy/laptop/ai.py" "$DIR/.tools/ai.py"
   cp "$from/deploy/laptop/agent/server.py" "$from/deploy/laptop/agent/index.html" "$DIR/.tools/agent/"
   cp "$from/deploy/laptop/CLAUDE.md" "$DIR/CLAUDE.md"
@@ -478,7 +479,7 @@ cmd_tools() {
   install_tools "$tmp"
   rm -rf "$tmp"
   # .claude/ у сервера в .gitignore — его в git не кладём (явный путь к нему git add счёл бы ошибкой)
-  local paths=(tg ai .tools CLAUDE.md tests)
+  local paths=(tg ai panel .tools CLAUDE.md tests)
   if [ -n "$(G status --porcelain -- "${paths[@]}")" ]; then
     G add -A -- "${paths[@]}" && G commit -qm "инструменты обновлены ($ref)" -- "${paths[@]}" \
       || note "инструменты положил, но не закоммитил — не страшно, закоммитит ./tg ship"

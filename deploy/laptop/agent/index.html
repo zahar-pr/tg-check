@@ -163,7 +163,7 @@ aside { border-left: 1px solid var(--line); background: var(--panel); overflow-y
     <label class="sw" title="Агент сам подтверждает все свои действия и ничего не спрашивает. Выключен — спрашивает только про опасное: ssh, sudo, выкладку, удаление и чтение вне папки проекта. Стереть корень или домашнюю папку и выложить с --force нельзя даже на автопилоте."><input type="checkbox" id="auto"><span class="t"></span>Автопилот</label>
     <div class="grow"></div>
     <span class="pill" id="ctx" title="Сколько памяти беседы занято. Ближе к 100% агент сожмёт начало — лучше начать новую беседу.">контекст —</span>
-    <span class="pill" id="cost" title="Оценка по ценам API. Точно — platform.claude.com/usage">$0.00</span>
+    <span class="pill" id="cost" style="cursor:pointer" title="Оценка по ценам API. Точно — platform.claude.com/usage. Нажми, чтобы поправить счётчик месяца по Console.">$0.00</span>
     <button class="btn" id="night" title="Агент работает сам до утра: правит, проверяет, выкладывает">🌙 Ночная смена</button>
     <button class="btn" id="history">История</button>
     <button class="btn" id="newchat" title="Начать новую беседу">+ Новая</button>
@@ -239,6 +239,7 @@ aside { border-left: 1px solid var(--line); background: var(--panel); overflow-y
   <div class="cnt">
     <div id="night-run" style="display:none"></div>
     <div class="form" id="night-form">
+      <div><button class="btn" id="n-tpl" type="button">Шаблон: «Лиды» — часовые прогоны до 1+ релевантного лида в час</button></div>
       <label>Задача на смену — как поставил бы её человеку: что сделать и как понять, что готово
         <textarea id="n-goal" placeholder="Например: почини «Лиды» по docs/NEXT.md (пункты 1–4). Готово — когда автопилот на сервере с целью 3 лида находит хотя бы одного настоящего покупателя, а тесты зелёные."></textarea></label>
       <div class="row2">
@@ -454,7 +455,9 @@ function setState(s) {
   $('#n-start').style.display = run ? 'none' : '';
   $('#n-stop').style.display = run ? '' : 'none';
   $('#night-run').style.display = run ? '' : 'none';
-  if (run) $('#night-run').innerHTML = `<p><b>Идёт смена.</b> До ${new Date(m.until * 1000).toLocaleString('ru')}, потрачено $${(+m.spent).toFixed(2)} из $${m.budget}, шагов ${m.turns}, выкладок ${m.ships || 0}.</p><p class="muted">Задача: ${esc(m.goal)}</p><p class="muted">Можно написать агенту в чат — указание уйдёт ему следующим шагом.</p>`;
+  const waitTxt = run && m.wait_until ? ` · ждёт до ${new Date(m.wait_until * 1000).toLocaleTimeString('ru', { hour: '2-digit', minute: '2-digit' })}` : '';
+  if (run) nb.textContent += waitTxt;
+  if (run) $('#night-run').innerHTML = (m.wait_until ? `<p>Агент ждёт прогон${waitTxt}. <button class="btn" id="n-wake">Разбудить сейчас</button></p>` : '') + `<p><b>Идёт смена.</b> До ${new Date(m.until * 1000).toLocaleString('ru')}, потрачено $${(+m.spent).toFixed(2)} из $${m.budget}, шагов ${m.turns}, выкладок ${m.ships || 0}.</p><p class="muted">Задача: ${esc(m.goal)}</p><p class="muted">Можно написать агенту в чат — указание уйдёт ему следующим шагом.</p>`;
   if (m && !run && m.goal && !$('#n-goal').value) $('#n-goal').value = m.goal;
   if (s.fake) $('.brand small').textContent = '· тест';
 }
@@ -508,6 +511,13 @@ document.addEventListener('drop', (e) => { e.preventDefault(); for (const f of e
 // ── шапка ──
 $('#auto').onchange = (e) => { send({ type: 'autopilot', value: e.target.checked }); toast(e.target.checked ? 'Автопилот: агент сам подтверждает всё, ничего не спрашивает' : 'Автопилот выключен: агент спросит про опасное (ssh, sudo, выкладка, удаление вне папки)', 5000); };
 $('#newchat').onclick = () => { if (S.busy && !confirm('Агент ещё работает. Остановить и начать новую беседу?')) return; send({ type: 'new' }); };
+$('#cost').onclick = () => {
+  const v = prompt('Сколько на самом деле потрачено за этот месяц, $? Точная цифра — в Console: platform.claude.com/usage', (S.cost?.month ?? 0).toFixed(2));
+  if (v === null) return;
+  const n = parseFloat(String(v).replace(',', '.'));
+  if (!isFinite(n) || n < 0) return toast('нужно число, например 70');
+  send({ type: 'spent', value: n }); toast('Счётчик месяца: $' + n.toFixed(2));
+};
 $('#night').onclick = async () => {
   modal('#m-night');
   const sv = S.server || {};
@@ -520,6 +530,18 @@ $('#night').onclick = async () => {
   if (S.panel) $('#n-panel summary').textContent = 'Вход в панель сохранён ✓ (можно заменить)';
   check();
 };
+$('#night-run').addEventListener('click', (e) => { if (e.target.id === 'n-wake') { send({ type: 'wake' }); toast('Бужу агента'); } });
+const TPL = `Цель: «Лиды» на сервере находят от 1 релевантного лида в час. Релевантный — человек, который САМ хочет купить квартиру (или другое жильё) в Екатеринбурге; риелторы, продавцы, застройщики, аренда, «спросил за знакомого», боты — не в счёт. Сначала почини то, что в docs/NEXT.md (пункты 1–4).
+
+Проверяем только часовым прогоном на сервере:
+1. Выложи код (./tg ship). Панель active, в журнале (./tg logs 80) нет новых ошибок.
+2. Останови прошлый автопилот: ./panel post /api/enrich/auto '{"on":false}'. Читатели: ./panel readers — бери отмеченных читателей, что вошли и свободны; роли, прокси и аккаунты сам не меняй. Нет ни одного — НУЖЕН ЧЕЛОВЕК.
+3. Запусти: ./panel post /api/enrich/auto '{"query":"хочет купить квартиру в Екатеринбурге","accounts":["id читателей"],"queue":"keep","target":0}'. Запиши время старта и номер строки журнала (./panel log).
+4. Каждые 10 минут смотри ./panel log <с прошлой строки> и ./panel get /api/enrich: ищет ли чаты, читает ли, разбирает ли, нет ли ошибок, 429, зависаний. Между проверками заканчивай ответ строкой «ЖДУ 10 МИН». Явно сломано или бессмысленно (ничего не находит, читает мусор, отсеивает всех) — останови прогон, исправь код, выложи и начни новый прогон с шага 2.
+5. Через 60 минут: ./panel leads — лиды этого прогона. Оцени КАЖДОГО сам по сообщениям-триггерам: релевантен или нет и почему. Добавь строку в таблицу docs/RUNS.md: начало, длительность, коммит (git log -1 --format=%h), чатов найдено/прочитано/разобрано, лидов всего, релевантных, точность, главная проблема.
+6. Релевантных 1+ за час — прогон пройден, дальше поднимай точность (меньше мусора при тех же находках). Не пройден — найди причину, исправь, новый прогон. Не обрывай прогон раньше 60 минут без явной поломки — иначе показатель не узнать.
+Готово: два прогона подряд по 1+ релевантному в час, и релевантна хотя бы половина лидов — тогда итог в docs/NIGHT.md и МИССИЯ ВЫПОЛНЕНА.`;
+$('#n-tpl').onclick = () => { $('#n-goal').value = TPL; $('#n-goal').focus(); };
 $('#n-start').onclick = () => {
   const goal = $('#n-goal').value.trim();
   if (!goal) return toast('напиши задачу на смену');

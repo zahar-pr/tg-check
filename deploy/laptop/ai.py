@@ -113,6 +113,7 @@ class Agent:
         self.busy = False
         self.allowed = set()          # «всегда» в этом разговоре: (инструмент, команда)
         self.session_cost = 0.0
+        self.cost_last = 0.0
         self.streamed = False
 
     async def ask_user(self, tool, inp, ctx):
@@ -184,7 +185,10 @@ class Agent:
                     text = b.content if isinstance(b.content, str) else json.dumps(b.content, ensure_ascii=False)
                     print(f"{DIM}{RED}    ✗ {str(text).strip().splitlines()[0][:200] if text else 'ошибка'}{OFF}")
         elif isinstance(m, ResultMessage):
-            cost = m.total_cost_usd or 0.0
+            # итог SDK — стоимость всей беседы с начала; цена ответа — разница с прошлым
+            total = float(m.total_cost_usd or 0.0)
+            cost = total - self.cost_last if total >= self.cost_last else total
+            self.cost_last = total
             self.session_cost += cost
             month = month_spent(self.st, cost)
             save_state(self.st)

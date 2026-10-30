@@ -1,0 +1,78 @@
+#!/usr/bin/env bash
+#
+# ./panel — HTTP API панели на сервере: так агент сам запускает «Лиды» и смотрит итог.
+# Панель слушает только 127.0.0.1:8787 на сервере, поэтому ходим через ssh tg-server.
+# Вход — логин и пароль из ~/.tg-agent/panel.json (их сохраняет пульт); в выводе их нет,
+# кука живёт на сервере в /root/.tg-agent-panel.cookie.
+#
+#   ./panel get /api/enrich                        состояние «Лидов» (JSON)
+#   ./panel post /api/enrich/auto '{"on":false}'   POST с JSON
+#   ./panel log [с какой строки]                   журнал панели (без числа — последние 80 строк);
+#                                                  последней строкой — номер, с которого читать дальше
+#   ./panel leads                                  лиды последнего захода автопилота (JSON)
+#   ./panel readers                                аккаунты-читатели: id, имя, вошёл ли, чем занят
+#
+set -euo pipefail
+JAR=${TG_PANEL_JAR:-/root/.tg-agent-panel.cookie}
+BASE=http://127.0.0.1:8787
+SSH=(ssh -o BatchMode=yes -o ConnectTimeout=10 -o ServerAliveInterval=30 tg-server)
+die() { echo "$*" >&2; exit 1; }
+
+# метод путь [тело] -> тело ответа и последней строкой HTTP-код
+raw() {
+  local m="$1" p="$2" b="${3:-}"
+  if [ "$m" = POST ]; then
+    printf '%s' "$b" | "${SSH[@]}" "curl -s -m 90 -b $JAR -c $JAR -X POST -H 'content-type: application/json' --data-binary @- -w '\n%{http_code}' '$BASE$p'"
+  else
+    "${SSH[@]}" "curl -s -m 90 -b $JAR -c $JAR -w '\n%{http_code}' '$BASE$p'" < /dev/null
+  fi
+}
+
+login() {
+  [ -f "$HOME/.tg-agent/panel.json" ] \
+    || die "нет входа в панель: хозяин вписывает логин и пароль в пульте (Ночная смена → Вход в панель)"
+  # пароль идёт через stdin, не в командной строке: так его не видно в списке процессов
+  python3 -c 'import json, os; d = json.load(open(os.path.expanduser("~/.tg-agent/panel.json")))
+print(json.dumps({"user": d["user"], "pass": d["pass"]}))' \
+    | "${SSH[@]}" "umask 077; curl -s -m 30 -c $JAR -H 'content-type: application/json' --data-binary @- -w '\n%{http_code}' '$BASE/api/login'" \
+    | tail -1
+}
+
+call() {
+  local out code
+  out="$(raw "$@")" || die "нет связи с сервером (ssh tg-server)"
+  code="${out##*$'\n'}"
+  if [ "$code" = 401 ]; then
+    [ "$(login)" = 200 ] || die "панель не пустила: логин или пароль не подходят (~/.tg-agent/panel.json)"
+    out="$(raw "$@")"; code="${out##*$'\n'}"
+  fi
+  printf '%s\n' "${out%$'\n'*}"
+  [ "${code:-0}" -lt 400 ] 2>/dev/null || { echo "(HTTP $code)" >&2; return 1; }
+}
+
+case "${1:-}" in
+  get) call GET "${2:?путь, например /api/enrich}" ;;
+  post) call POST "${2:?путь}" "${3:-{\}}" ;;
+  log)
+    from="${2:-}"
+    if [ -z "$from" ]; then
+      total="$(call GET '/api/log?from=999999999' | python3 -c 'import json, sys; print(json.load(sys.stdin).get("total", 0))')"
+      from=$(( total > 80 ? total - 80 : 0 ))
+    fi
+    call GET "/api/log?from=$from" | python3 -c 'import json, sys
+d = json.load(sys.stdin)
+for l in d.get("lines", []):
+    print(l)
+n = d.get("total", 0)
+print("— дальше читать: ./panel log", n)' ;;
+  leads) call GET '/api/enrich/leads.json?run=1' ;;
+  readers)
+    call GET /api/accounts | python3 -c 'import json, sys
+d = json.load(sys.stdin)
+rows = d if isinstance(d, list) else d.get("accounts", [])
+for a in rows:
+    if a.get("role") == "read":
+        print(a.get("id"), "|", a.get("title") or a.get("name") or "", "| вошёл" if a.get("session") else "| НЕ вошёл",
+              "|", a.get("busy") or "свободен")' ;;
+  *) sed -n '3,15p' "$0" | sed 's/^# \{0,1\}//'; exit 1 ;;
+esac
